@@ -1,0 +1,63 @@
+.TH jed 1 "16 Dec 2025" "jedjmon" "User Commands"
+.SH NAME
+jed \- JEDJMON Hans Editor
+.SH SYNOPSIS
+.B jed
+.RI [ file ]
+.SH DESCRIPTION
+JED is a small modal terminal text editor inspired by vim features.
+It supports VIEW and EDIT modes, an inline command buffer (e.g. `fn file`, `fn add file`, `fn del file`, `s`, `q`, `qs`, `jl <N>`, `jel <N>`, `jfl <N>`, `jml <N>`),
+a basic undo/redo, and simple swap-file based crash recovery.
+.SH COMMANDS
+.TP
+fn <file>
+Open or create <file> (swap recovery is offered if a swap exists).
+.TP
+s
+Save current buffer to the current filename (or default file if none).
+.TP
+q
+Quit (prompts to save if there are unsaved changes).
+.TP
+qs
+Save and quit.
+.TP
+browse
+Open the interactive file browser overlay: press a number to open a file or enter a directory. Use PageUp/PageDown (page) to change pages. Backspace (Back) deletes the currently-typed selection and acts as "go back" when the selection is empty; when used at the initial directory it shows a hint—use q or Esc to cancel. Selecting a file opens it into the current editor buffer (non-destructive). The `:browse` command has a single-letter alias `:b`.
+You may choose to open the file in the current tab (unsaved changes will be lost unless you save first), open it in a new tab, or cancel.
+
+Additionally, while browsing you can press (d) to delete the selected file or directory; a confirmation is required and the browser refreshes after a deletion.
+
+While in the browser, selecting a file initially prompts: (t) New Tab / (o) Current Tab / (c) Cancel. If you choose Current Tab and the current file has unsaved changes, you will be prompted to either save or discard:
+
+(s) Save changes and open file
+
+(d) Discard unsaved changes and open file
+
+(c) Cancel
+
+.TP
+tabs
+List open tabs with their numeric indices.
+
+.TP
+tab <N>
+Switch to tab N (1-based). Compact forms without a space are accepted (e.g. "tab1" or "tab 1").
+
+.TP
+tabc <N>
+Close tab N (1-based). Compact forms without a space are accepted (e.g. "tabc1" or "tabc 1").
+
+.TP
+tabc
+Close the current tab (equivalent to `tabc<current index>`).
+
+.TP
+?
+Open the help page in its own tab. The help page shows section headers (colored in the UI) and can be closed with the `tabc` command (e.g. `tabc1`).
+
+.SH EXAMPLES
+.B jed test.c
+Open or create test.c in JED.
+.SH AUTHOR
+Written by the JED project.

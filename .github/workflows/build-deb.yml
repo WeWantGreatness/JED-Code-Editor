@@ -1,0 +1,26 @@
+name: Build .deb
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-deb:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential devscripts debhelper dh-make fakeroot lintian
+      - name: Build package
+        run: |
+          dpkg-buildpackage -b -us -uc
+      - name: Upload deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: debs
+          path: ../*.deb

@@ -1,0 +1,18 @@
+#!/bin/sh
+set -e
+# Optional test prefix for safe local testing (set JED_TEST_ROOT to a temp dir)
+prefix=${JED_TEST_ROOT:-}
+
+case "$1" in
+  purge)
+    # remove system-level package data (only package-owned locations)
+    if [ -d "${prefix}/var/lib/jed" ]; then
+        rm -rf "${prefix}/var/lib/jed"
+    fi
+    if [ -d "${prefix}/var/log/jed" ]; then
+        rm -rf "${prefix}/var/log/jed"
+    fi
+    ;;
+esac
+
+exit 0

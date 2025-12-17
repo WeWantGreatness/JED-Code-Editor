@@ -1,0 +1,9 @@
+Package: jed
+Version: 0.1-1
+Architecture: amd64
+Maintainer: wewantgreatness <wewantgreatness@example.com>
+Installed-Size: 40
+Section: editors
+Priority: optional
+Description: JEDJMON Hans Editor - minimal modal terminal editor
+ A small terminal modal editor with simple commands and swap-file recovery.

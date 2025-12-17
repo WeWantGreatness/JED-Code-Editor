@@ -1,0 +1,7 @@
+# Simple .jedrc example
+# key = value (whitespace around = is ignored)
+
+indent_size = 4
+use_tabs = false
+show_line_numbers = true
+auto_save_interval = 0 # seconds, 0 = disabled

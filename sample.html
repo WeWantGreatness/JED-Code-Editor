@@ -1,0 +1,736 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Modal Code Editor</title>
+<style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: 'Courier New', monospace; background: #1e1e1e; color: #d4d4d4; overflow: hidden; }
+    #container { display: flex; flex-direction: column; height: 100vh; position: relative; }
+    
+    #status { 
+        background: #007acc; 
+        color: white; 
+        padding: 8px 16px; 
+        font-weight: bold; 
+        font-size: 14px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        flex-shrink: 0;
+    }
+
+    #help-btn {
+        background: rgba(255,255,255,0.2);
+        border: none;
+        color: white;
+        width: 24px;
+        height: 24px;
+        border-radius: 50%;
+        cursor: pointer;
+        font-weight: bold;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+    }
+    #help-btn:hover { background: rgba(255,255,255,0.4); }
+    
+    #command-bar { 
+        background: #252526; 
+        padding: 8px 16px; 
+        color: #ffd700; 
+        min-height: 30px; 
+        font-size: 14px;
+        border-bottom: 1px solid #333;
+        flex-shrink: 0;
+    }
+
+    #editor-wrapper {
+        display: flex;
+        flex: 1;
+        overflow: hidden;
+        position: relative;
+    }
+    
+    #gutter {
+        width: 45px;
+        background: #1e1e1e;
+        color: #858585;
+        text-align: right;
+        padding: 20px 5px;
+        font-size: 16px;
+        line-height: 1.6;
+        border-right: 1px solid #333;
+        user-select: none;
+        overflow: hidden;
+        flex-shrink: 0;
+    }
+
+    #editor { 
+        flex: 1; 
+        padding: 20px; 
+        font-size: 16px; 
+        line-height: 1.6; 
+        outline: none; 
+        overflow: auto;
+        white-space: pre; 
+        word-wrap: normal;
+        tab-size: 2;
+    }
+
+    #editor:focus {
+        background-color: #1e1e1e;
+    }
+
+    /* Cursor Styling */
+    #editor.view-mode { caret-color: #ffd700; }
+    #editor.edit-mode { caret-color: #4ec9b0; }
+
+    .help-text {
+        font-size: 12px;
+        font-weight: normal;
+        opacity: 0.8;
+    }
+
+    /* Help Overlay */
+    #help-overlay {
+        position: absolute;
+        top: 0; left: 0; width: 100%; height: 100%;
+        background: rgba(0,0,0,0.85);
+        z-index: 100;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity 0.2s;
+    }
+    #help-overlay.visible {
+        opacity: 1;
+        pointer-events: all;
+    }
+    .help-modal {
+        background: #252526;
+        border: 1px solid #007acc;
+        padding: 20px;
+        width: 600px;
+        max-width: 90%;
+        max-height: 90vh;
+        overflow-y: auto;
+        box-shadow: 0 10px 30px rgba(0,0,0,0.5);
+    }
+    .help-modal h2 { color: #007acc; border-bottom: 1px solid #333; padding-bottom: 10px; margin-bottom: 15px; }
+    .help-section { margin-bottom: 20px; }
+    .help-section h3 { color: #ffd700; font-size: 14px; margin-bottom: 8px; text-transform: uppercase; }
+    .cmd-row { display: flex; justify-content: space-between; border-bottom: 1px solid #333; padding: 4px 0; font-size: 13px; }
+    .cmd-key { font-family: monospace; color: #4ec9b0; font-weight: bold; }
+    .cmd-desc { color: #ccc; }
+    .close-help { margin-top: 15px; text-align: center; color: #858585; font-size: 12px; cursor: pointer; }
+    .close-help:hover { color: white; }
+</style>
+</head>
+<body>
+<div id="container">
+  <div id="status">
+    <div>
+        <span id="mode-indicator">VIEW MODE</span>
+        <span class="help-text" style="margin-left: 10px">Press ESC to Toggle</span>
+    </div>
+    <button id="help-btn" onclick="toggleHelp()">?</button>
+  </div>
+  <div id="command-bar"></div>
+  <div id="editor-wrapper">
+    <div id="gutter">1</div>
+    <div id="editor" contenteditable="true" class="view-mode">function example() {
+  console.log("Hello World");
+  return 42;
+}
+
+const arr = [1, 2, 3, 4, 5];
+arr.forEach(n => console.log(n * 2));
+
+// TRY COMMAND CHAINING:
+// 1. Enter View Mode (ESC)
+// 2. Type: cl3p (Copies line 3, Pastes it)
+// 3. Type: cl1jel5p (Copies line 1, Jumps end of 5, Pastes)
+// 4. Type: s (Save)</div>
+  </div>
+
+  <!-- Help Overlay -->
+  <div id="help-overlay">
+      <div class="help-modal">
+          <h2>Command Cheat Sheet</h2>
+          
+          <div class="help-section">
+              <h3>General</h3>
+              <div class="cmd-row"><span class="cmd-key">ESC</span> <span class="cmd-desc">Toggle View/Edit Mode</span></div>
+              <div class="cmd-row"><span class="cmd-key">?</span> <span class="cmd-desc">Toggle this Help Menu (View Mode)</span></div>
+          </div>
+
+          <div class="help-section">
+              <h3>System / File</h3>
+              <div class="cmd-row"><span class="cmd-key">s</span> <span class="cmd-desc">Save</span></div>
+              <div class="cmd-row"><span class="cmd-key">q</span> <span class="cmd-desc">Quit</span></div>
+              <div class="cmd-row"><span class="cmd-key">qs</span> <span class="cmd-desc">Quit & Save</span></div>
+              <div class="cmd-row"><span class="cmd-key">ot</span> <span class="cmd-desc">Open Terminal</span></div>
+          </div>
+
+          <div class="help-section">
+              <h3>Navigation (View Mode)</h3>
+              <div class="cmd-row"><span class="cmd-key">jl&lt;N&gt;</span> <span class="cmd-desc">Jump to Line N (e.g., jl12)</span></div>
+              <div class="cmd-row"><span class="cmd-key">jfl / jfl&lt;N&gt;</span> <span class="cmd-desc">Jump to Front of Line (Curr or N)</span></div>
+              <div class="cmd-row"><span class="cmd-key">jel / jel&lt;N&gt;</span> <span class="cmd-desc">Jump to End of Line (Curr or N)</span></div>
+              <div class="cmd-row"><span class="cmd-key">Arrows</span> <span class="cmd-desc">Standard Navigation</span></div>
+          </div>
+
+          <div class="help-section">
+              <h3>Editing & Copying</h3>
+              <div class="cmd-row"><span class="cmd-key">c</span> <span class="cmd-desc">Copy Selection</span></div>
+              <div class="cmd-row"><span class="cmd-key">cwl</span> <span class="cmd-desc">Copy Whole Line</span></div>
+              <div class="cmd-row"><span class="cmd-key">cl&lt;N&gt;</span> <span class="cmd-desc">Copy Specific Line N</span></div>
+              <div class="cmd-row"><span class="cmd-key">p</span> <span class="cmd-desc">Paste at Cursor</span></div>
+              <div class="cmd-row"><span class="cmd-key">pl&lt;N&gt;</span> <span class="cmd-desc">Paste at Line N</span></div>
+              <div class="cmd-row"><span class="cmd-key">dl / dl&lt;Range&gt;</span> <span class="cmd-desc">Delete Line / Range (dl1-5)</span></div>
+              <div class="cmd-row"><span class="cmd-key">u / r</span> <span class="cmd-desc">Undo / Redo</span></div>
+          </div>
+          
+          <div class="help-section">
+              <h3>Chaining</h3>
+              <div class="cmd-row"><span class="cmd-key">Example</span> <span class="cmd-desc">cl3jel5p (Copy Ln3, Jump End Ln5, Paste)</span></div>
+          </div>
+
+          <div class="close-help" onclick="toggleHelp()">[ Click here or Press ESC to Close ]</div>
+      </div>
+  </div>
+</div>
+
+<script>
+const editor = document.getElementById('editor');
+const gutter = document.getElementById('gutter');
+const statusDiv = document.getElementById('status');
+const modeIndicator = document.getElementById('mode-indicator');
+const commandBar = document.getElementById('command-bar');
+const helpOverlay = document.getElementById('help-overlay');
+
+let mode = 'view';
+let commandBuffer = '';
+let internalClipboard = '';
+let historyStack = [];
+let historyIndex = -1;
+
+function toggleHelp() {
+    helpOverlay.classList.toggle('visible');
+}
+
+// --- History Management (Undo/Redo) ---
+function saveState() {
+    if (historyIndex < historyStack.length - 1) {
+        historyStack = historyStack.slice(0, historyIndex + 1);
+    }
+    // Using innerText to preserve structure
+    historyStack.push(editor.innerText);
+    historyIndex++;
+    if (historyStack.length > 50) {
+        historyStack.shift();
+        historyIndex--;
+    }
+}
+
+// Initial state
+saveState();
+
+function undo() {
+    if (historyIndex > 0) {
+        historyIndex--;
+        editor.innerText = historyStack[historyIndex];
+        updateLineNumbers();
+        commandBar.textContent = 'Undo';
+    } else {
+        commandBar.textContent = 'Already at oldest change';
+    }
+}
+
+function redo() {
+    if (historyIndex < historyStack.length - 1) {
+        historyIndex++;
+        editor.innerText = historyStack[historyIndex];
+        updateLineNumbers();
+        commandBar.textContent = 'Redo';
+    } else {
+        commandBar.textContent = 'Already at newest change';
+    }
+}
+
+// --- Editor Utilities ---
+
+function updateLineNumbers() {
+    // innerText ensures we count visual lines (newlines) correctly
+    const text = editor.innerText; 
+    const lines = text.split('\n').length;
+    gutter.innerHTML = Array.from({length: lines}, (_, i) => i + 1).join('<br>');
+}
+
+editor.addEventListener('scroll', () => { gutter.scrollTop = editor.scrollTop; });
+editor.addEventListener('input', updateLineNumbers);
+editor.addEventListener('keyup', updateLineNumbers);
+
+function getLineContent(lineNum) {
+    const lines = editor.innerText.split('\n');
+    if (lineNum < 1 || lineNum > lines.length) return null;
+    return lines[lineNum - 1];
+}
+
+function setContentKeepingCursor(newText) {
+    editor.innerText = newText;
+    updateLineNumbers();
+}
+
+function getGlobalCursorOffset() {
+    const sel = window.getSelection();
+    if (!sel.rangeCount) return 0;
+    const range = sel.getRangeAt(0);
+    const preCaretRange = range.cloneRange();
+    preCaretRange.selectNodeContents(editor);
+    preCaretRange.setEnd(range.startContainer, range.startOffset);
+    return preCaretRange.toString().length;
+}
+
+function getCurrentLineNumber() {
+    const textBefore = editor.innerText.substring(0, getGlobalCursorOffset());
+    return (textBefore.match(/\n/g) || []).length + 1;
+}
+
+// --- Modes ---
+
+function toggleMode() {
+    if (mode === 'view') setMode('edit');
+    else setMode('view');
+}
+
+function setMode(newMode) {
+  mode = newMode;
+  
+  editor.contentEditable = 'true';
+  editor.focus();
+
+  if (mode === 'view') {
+    modeIndicator.textContent = 'VIEW MODE';
+    statusDiv.style.background = '#007acc';
+    statusDiv.style.color = '#fff';
+    editor.classList.add('view-mode');
+    editor.classList.remove('edit-mode');
+    commandBuffer = '';
+    commandBar.textContent = '';
+  } else if (mode === 'edit') {
+    modeIndicator.textContent = 'EDIT MODE';
+    statusDiv.style.background = '#4ec9b0';
+    statusDiv.style.color = '#000';
+    editor.classList.add('edit-mode');
+    editor.classList.remove('view-mode');
+    commandBuffer = '';
+    commandBar.textContent = '';
+    saveState();
+  }
+}
+
+// --- Command Logic ---
+
+// Helper: Jump to line N (approximate via text calculation)
+function jumpToLineN(n) {
+    const text = editor.innerText;
+    const lines = text.split('\n');
+    if (n < 1 || n > lines.length) {
+        commandBar.textContent = `Line ${n} out of bounds`;
+        return false;
+    }
+    let charCount = 0;
+    for(let i = 0; i < n - 1; i++) {
+        charCount += (lines[i] ? lines[i].length : 0) + 1;
+    }
+    setCursorToOffset(charCount);
+    return true;
+}
+
+function jumpToStartOfLine(lineNum = null) {
+    if (lineNum !== null) {
+        jumpToLineN(lineNum);
+        // Ensure we are at start (jumpToLineN places at start usually)
+        return;
+    }
+
+    // Current line: use native selection modify
+    try {
+        const sel = window.getSelection();
+        sel.modify('move', 'backward', 'lineboundary');
+    } catch(e) {
+        // Fallback
+        const n = getCurrentLineNumber();
+        jumpToLineN(n);
+    }
+}
+
+function jumpToEndOfLine(lineNum = null) {
+    if (lineNum !== null) {
+        const success = jumpToLineN(lineNum);
+        if(success) {
+            // Once at start of line N, move to end
+            try {
+                const sel = window.getSelection();
+                sel.modify('move', 'forward', 'lineboundary');
+            } catch(e) {}
+        }
+        return;
+    }
+
+    // Current line: use native selection modify
+    try {
+        const sel = window.getSelection();
+        sel.modify('move', 'forward', 'lineboundary');
+    } catch(e) {
+        // Fallback logic
+        const n = getCurrentLineNumber();
+        jumpToLineN(n); // go to start
+        // finding end is hard manually without offset bugs, 
+        // relying on modify is best.
+    }
+}
+
+function setCursorToOffset(offset) {
+    const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT, null, false);
+    let currentNode = walker.nextNode();
+    let currentLength = 0;
+
+    if (offset === 0 && currentNode) {
+        const range = document.createRange();
+        const sel = window.getSelection();
+        range.setStart(currentNode, 0);
+        range.collapse(true);
+        sel.removeAllRanges();
+        sel.addRange(range);
+        return;
+    }
+    
+    if (!currentNode && offset === 0) {
+         editor.focus();
+         return;
+    }
+
+    while (currentNode) {
+        const nodeLength = currentNode.textContent.length;
+        if (currentLength + nodeLength >= offset) {
+            const range = document.createRange();
+            const sel = window.getSelection();
+            try {
+                const split = offset - currentLength;
+                range.setStart(currentNode, split);
+                range.collapse(true);
+                sel.removeAllRanges();
+                sel.addRange(range);
+                const rect = range.getBoundingClientRect();
+                if (rect.top < 0 || rect.bottom > window.innerHeight) {
+                    currentNode.parentElement.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+                }
+            } catch(e) {
+                range.setStart(currentNode, nodeLength);
+                range.collapse(true);
+                sel.removeAllRanges();
+                sel.addRange(range);
+            }
+            return;
+        }
+        currentLength += nodeLength;
+        currentNode = walker.nextNode();
+    }
+}
+
+function deleteCurrentLine() {
+    saveState();
+    const lineNum = getCurrentLineNumber();
+    const lines = editor.innerText.split('\n');
+    lines.splice(lineNum - 1, 1);
+    setContentKeepingCursor(lines.join('\n'));
+    saveState();
+    commandBar.textContent = `Deleted line ${lineNum}`;
+}
+
+function deleteLineNumbers(nums) {
+    if (!nums || nums.length === 0) return;
+    saveState();
+    let lines = editor.innerText.split('\n');
+    const uniqueNums = [...new Set(nums)].sort((a, b) => b - a);
+    let deletedCount = 0;
+    uniqueNums.forEach(n => {
+        if (n >= 1 && n <= lines.length) {
+            lines.splice(n - 1, 1);
+            deletedCount++;
+        }
+    });
+    setContentKeepingCursor(lines.join('\n'));
+    saveState();
+    commandBar.textContent = `Deleted ${deletedCount} lines`;
+}
+
+function copyCurrentLine() {
+    const lineNum = getCurrentLineNumber();
+    const content = getLineContent(lineNum);
+    if (content !== null) {
+        internalClipboard = content;
+        commandBar.textContent = `Copied Line ${lineNum}`;
+    }
+}
+
+function copySpecificLine(n) {
+    const content = getLineContent(n);
+    if (content !== null) {
+        internalClipboard = content;
+        commandBar.textContent = `Copied Line ${n}`;
+    } else {
+        commandBar.textContent = `Line ${n} not found`;
+    }
+}
+
+function pasteAtCursor() {
+    if (!internalClipboard) {
+        commandBar.textContent = "Clipboard empty";
+        return;
+    }
+    saveState();
+    const sel = window.getSelection();
+    if (sel.rangeCount) {
+        const range = sel.getRangeAt(0);
+        const textNode = document.createTextNode(internalClipboard);
+        range.insertNode(textNode);
+        range.setStartAfter(textNode);
+        range.collapse(true);
+        sel.removeAllRanges();
+        sel.addRange(range);
+    }
+    updateLineNumbers();
+    saveState();
+    commandBar.textContent = "Pasted";
+}
+
+function pasteAtLine(n) {
+    if (!internalClipboard) {
+        commandBar.textContent = "Clipboard empty";
+        return;
+    }
+    saveState();
+    const lines = editor.innerText.split('\n');
+    if (n < 1 || n > lines.length) {
+        commandBar.textContent = `Line ${n} invalid`;
+        return;
+    }
+    lines[n-1] += internalClipboard;
+    setContentKeepingCursor(lines.join('\n'));
+    saveState();
+    commandBar.textContent = `Pasted to Line ${n}`;
+}
+
+// System Command Stubs
+function msg(text) {
+    commandBar.textContent = text;
+    // Clear message after 2s
+    setTimeout(() => { if(commandBar.textContent === text) commandBar.textContent = ''; }, 2000);
+}
+
+// --- NEW CHAINING EXECUTOR ---
+function executeCommand(inputCmd) {
+    let remaining = inputCmd;
+    let loopCount = 0;
+    const MAX_LOOPS = 50; 
+
+    const patterns = [
+        // System
+        { regex: /^qs/, action: () => msg("Quit and Save (Stub)") },
+        { regex: /^q/, action: () => msg("Quit (Stub)") },
+        { regex: /^s/, action: () => msg("Saved (Stub)") },
+        { regex: /^ot/, action: () => msg("Terminal Opened (Stub)") },
+        
+        // Edit Ops
+        { regex: /^u/, action: undo },
+        { regex: /^r/, action: redo },
+        
+        // Copy / Paste
+        { regex: /^cwl/, action: () => { copyCurrentLine(); msg("Copied line"); } },
+        { regex: /^cl(\d+)/, action: (m) => copySpecificLine(parseInt(m[1])) },
+        { regex: /^c/, action: () => { 
+            const sel = window.getSelection().toString();
+            if(sel) { internalClipboard = sel; msg("Copied Selection"); }
+            else msg("No selection");
+        }},
+        { regex: /^pl(\d+)/, action: (m) => pasteAtLine(parseInt(m[1])) },
+        { regex: /^p/, action: pasteAtCursor },
+
+        // Delete
+        { regex: /^dl([0-9\-,]+)/, action: (m) => {
+             const rangeStr = m[1];
+             const lines = [];
+             rangeStr.split(',').forEach(part => {
+                if (part.includes('-')) {
+                    const [s, e] = part.split('-').map(Number);
+                    if (!isNaN(s) && !isNaN(e)) for(let i=s; i<=e; i++) lines.push(i);
+                } else {
+                    const n = Number(part);
+                    if(!isNaN(n)) lines.push(n);
+                }
+             });
+             deleteLineNumbers(lines);
+        }},
+        { regex: /^dl/, action: deleteCurrentLine },
+
+        // Navigation
+        // 'jl' to specific line
+        { regex: /^jl(\d+)/, action: (m) => jumpToStartOfLine(parseInt(m[1])) },
+        // 'jfl' logic
+        { regex: /^jfl(\d+)/, action: (m) => jumpToStartOfLine(parseInt(m[1])) },
+        { regex: /^jfl/, action: () => jumpToStartOfLine() },
+        // 'jel' logic
+        { regex: /^jel(\d+)/, action: (m) => jumpToEndOfLine(parseInt(m[1])) },
+        { regex: /^jel/, action: () => jumpToEndOfLine() },
+    ];
+
+    while (remaining.length > 0 && loopCount < MAX_LOOPS) {
+        let matched = false;
+        
+        for (const p of patterns) {
+            const m = remaining.match(p.regex);
+            if (m) {
+                p.action(m);
+                remaining = remaining.substring(m[0].length);
+                matched = true;
+                break;
+            }
+        }
+
+        if (!matched) {
+            commandBar.textContent = `Unknown token: ${remaining}`;
+            break;
+        }
+        loopCount++;
+    }
+    
+    if (loopCount >= MAX_LOOPS) {
+        commandBar.textContent = "Command chain too long.";
+    }
+}
+
+// Block paste/cut in view mode
+editor.addEventListener('paste', (e) => {
+    if (mode === 'view') e.preventDefault();
+});
+editor.addEventListener('cut', (e) => {
+    if (mode === 'view') e.preventDefault();
+});
+
+document.addEventListener('keydown', (e) => {
+  // Global Toggle and Help
+  if (e.key === 'Escape') {
+      e.preventDefault();
+      if (helpOverlay.classList.contains('visible')) {
+          toggleHelp();
+          return;
+      }
+      toggleMode();
+      return;
+  }
+  
+  if (mode === 'edit') {
+      // 1. Tab Key Support
+      if (e.key === 'Tab') {
+          e.preventDefault();
+          document.execCommand('insertText', false, '  '); // 2 spaces
+          return;
+      }
+
+      // 2. Auto-Indent on Enter
+      if (e.key === 'Enter') {
+          e.preventDefault();
+          const offset = getGlobalCursorOffset();
+          const fullText = editor.innerText;
+          const beforeCursor = fullText.substring(0, offset);
+          const afterCursor = fullText.substring(offset);
+          const lines = beforeCursor.split('\n');
+          const lastLine = lines[lines.length - 1];
+          const match = lastLine.match(/^\s*/);
+          let indent = match ? match[0] : '';
+          const trimmedLastLine = lastLine.trimEnd();
+          const lastChar = trimmedLastLine[trimmedLastLine.length - 1];
+          const opens = ['{', '[', '('];
+          const isOpening = opens.includes(lastChar);
+          const nextChar = afterCursor.trimStart()[0];
+          const pairs = { '{': '}', '[': ']', '(': ')' };
+          const isSplittingPair = isOpening && nextChar === pairs[lastChar];
+
+          if (isSplittingPair) {
+              const extraIndent = '  '; 
+              document.execCommand('insertText', false, '\n' + indent + extraIndent);
+          } else if (isOpening) {
+              indent += '  ';
+              document.execCommand('insertText', false, '\n' + indent);
+          } else {
+              document.execCommand('insertText', false, '\n' + indent);
+          }
+          updateLineNumbers();
+          return;
+      }
+
+      // 3. Auto-close pairs
+      const pairs = { '(': ')', '{': '}', '[': ']', '"': '"', "'": "'" };
+      if (pairs[e.key]) {
+          e.preventDefault();
+          const open = e.key;
+          const close = pairs[e.key];
+          document.execCommand('insertText', false, open + close);
+          const sel = window.getSelection();
+          const range = sel.getRangeAt(0);
+          range.setStart(range.startContainer, range.startOffset - 1);
+          range.collapse(true);
+          sel.removeAllRanges();
+          sel.addRange(range);
+          updateLineNumbers();
+          return;
+      }
+  }
+  
+  if (mode === 'view') {
+    const navKeys = ['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Home', 'End', 'PageUp', 'PageDown'];
+    if (navKeys.includes(e.key)) return;
+    
+    // Help Command
+    if (e.key === '?') {
+        e.preventDefault();
+        toggleHelp();
+        return;
+    }
+    
+    if (e.key === 'v') { e.preventDefault(); return; }
+    
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      executeCommand(commandBuffer);
+      commandBuffer = '';
+      commandBar.textContent = '';
+      return;
+    }
+    
+    if (e.key === 'Backspace') {
+      e.preventDefault();
+      commandBuffer = commandBuffer.slice(0, -1);
+      commandBar.textContent = commandBuffer;
+      return;
+    }
+    
+    if (e.key.length === 1 && !e.ctrlKey && !e.altKey && !e.metaKey) {
+      e.preventDefault();
+      commandBuffer += e.key;
+      commandBar.textContent = commandBuffer;
+    }
+  }
+});
+
+setMode('view');
+</script>
+</body>
+</html>

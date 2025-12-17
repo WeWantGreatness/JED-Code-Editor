@@ -1,0 +1,2767 @@
+#define _DEFAULT_SOURCE
+#include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <termios.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <sys/select.h>
+#include <time.h>
+#include <sys/time.h>
+#include <pty.h>
+#include <signal.h>
+#include <dirent.h>
+
+#define EDIT_KIND_NONE 0
+#define EDIT_KIND_INSERT 1
+#define EDIT_KIND_DELETE 2
+#define EDIT_KIND_NEWLINE 3
+#define EDIT_GROUP_MS 1200
+
+#include <sys/stat.h>
+#include <unistd.h>
+
+// Special keys
+#define ARROW_LEFT 1000
+#define ARROW_RIGHT 1001
+#define ARROW_UP 1002
+#define ARROW_DOWN 1003
+#define HOME_KEY 1004
+#define END_KEY 1005
+#define PAGE_UP 1006
+#define PAGE_DOWN 1007
+#define DEL_KEY 1008
+
+/* Minimal, robust line-based editor: typing characters, Enter to newline,
+ * backspace, cursor, safe allocations. Designed to be small and easy to
+ * reason about (no mappings/undo/history). */
+
+typedef enum { MODE_VIEW = 0, MODE_EDIT = 1 } EditorMode;
+
+#define HISTORY_LIMIT 100
+
+struct Editor {
+    int cx, cy;         // cursor column, row
+    int numrows;
+    char **rows;        // dynamic array of NUL-terminated strings
+    struct termios orig_termios;
+    int screenrows, screencols;
+    int row_offset;     // first row shown in the window (for vertical scrolling)
+    int col_offset;     // first column shown for horizontal scrolling
+
+    EditorMode mode;    // view/edit
+    char command_buf[256]; // command buffer for view mode
+    int command_len;
+    int help_visible;   // help overlay flag
+
+    // history snapshots
+    char **history;
+    int history_count;
+    int history_idx;
+
+    // clipboard
+    char *clipboard;
+    // batch mode counter: when >0, mutating ops shouldn't create snapshots per-char
+    int batching;
+    // last saved snapshot (for detecting unsaved changes)
+    char *saved_snapshot;
+
+    // filename (if any)
+    char *filename;
+
+    // last edit grouping
+    int last_edit_kind;            // EDIT_KIND_*
+    long long last_edit_time_ms;   // monotonic ms timestamp
+
+
+    // transient message
+    char msg[128];
+    time_t msg_time;
+} E;
+
+// Simple tab abstraction: each tab stores a serialized snapshot of the buffer and cursor/filename
+struct Tab {
+    char *name; // filename or empty
+    char *snapshot; // serialized buffer (caller must free)
+    char *saved_snapshot; // serialized saved snapshot for this tab (NULL if unsaved/unknown)
+    int cx, cy, row_offset, col_offset;
+};
+static struct Tab *Tabs = NULL;
+static int NumTabs = 0;
+static int CurTab = -1; // index of currently loaded tab (-1 == "home" / current buffer)
+
+// Home tab snapshot: stores the "current buffer" state when the user switches away
+static struct Tab HomeTab = {0};
+static int HaveHomeTab = 0;
+
+// Forward declarations for functions used by tab code (declared later)
+static char *serialize_buffer(void);
+static void editorFreeRows(void);
+static void load_buffer_from_string(const char *s);
+static void editorScroll(void);
+static void getWindowSize(void);
+static volatile sig_atomic_t winch_received = 0;
+
+static void free_tab(struct Tab *t) {
+    if (!t) return;
+    free(t->name); free(t->snapshot); free(t->saved_snapshot);
+    t->name = NULL; t->snapshot = NULL; t->saved_snapshot = NULL;
+}
+
+// Save current editor state into a tab structure (caller must manage append)
+static struct Tab make_tab_from_editor(void) {
+    struct Tab t = {0};
+    t.name = E.filename ? strdup(E.filename) : strdup("");
+    t.snapshot = serialize_buffer();
+    t.saved_snapshot = E.saved_snapshot ? strdup(E.saved_snapshot) : NULL;
+    t.cx = E.cx; t.cy = E.cy; t.row_offset = E.row_offset; t.col_offset = E.col_offset;
+    return t;
+}
+
+static int append_tab(struct Tab t) {
+    struct Tab *newtabs = realloc(Tabs, sizeof(struct Tab) * (NumTabs + 1));
+    if (!newtabs) { free_tab(&t); return -1; }
+    Tabs = newtabs; Tabs[NumTabs] = t; NumTabs++; return NumTabs - 1;
+}
+
+// Save current editor into the tabs list as a new tab and return its index
+static int push_current_to_tab_list(void) {
+    struct Tab t = make_tab_from_editor();
+    return append_tab(t);
+}
+
+// Load tab at index into the editor (saving current into its slot first)
+static int switch_to_tab(int idx) {
+    if (idx < 0 || idx >= NumTabs) return -1;
+    // save current into current slot if CurTab >=0
+    if (CurTab >= 0 && CurTab < NumTabs) {
+        free(Tabs[CurTab].snapshot);
+        Tabs[CurTab].snapshot = serialize_buffer();
+        free(Tabs[CurTab].name); Tabs[CurTab].name = E.filename ? strdup(E.filename) : strdup("");
+        free(Tabs[CurTab].saved_snapshot);
+        Tabs[CurTab].saved_snapshot = E.saved_snapshot ? strdup(E.saved_snapshot) : NULL;
+        Tabs[CurTab].cx = E.cx; Tabs[CurTab].cy = E.cy; Tabs[CurTab].row_offset = E.row_offset; Tabs[CurTab].col_offset = E.col_offset;
+    } else if (CurTab == -1) {
+        // when leaving the home buffer, capture its state so "tab 1" can restore it
+        free_tab(&HomeTab);
+        HomeTab = make_tab_from_editor();
+        HaveHomeTab = 1;
+    }
+    // load target
+    free(E.filename); E.filename = NULL;
+    editorFreeRows();
+    if (Tabs[idx].snapshot) load_buffer_from_string(Tabs[idx].snapshot);
+    if (Tabs[idx].name && Tabs[idx].name[0]) E.filename = strdup(Tabs[idx].name);
+    free(E.saved_snapshot);
+    E.saved_snapshot = Tabs[idx].saved_snapshot ? strdup(Tabs[idx].saved_snapshot) : NULL;
+    E.cx = Tabs[idx].cx; E.cy = Tabs[idx].cy; E.row_offset = Tabs[idx].row_offset; E.col_offset = Tabs[idx].col_offset;
+    CurTab = idx;
+    editorScroll(); return 0;
+}
+
+// forward-declare small helpers used by close_tab
+static void editorAppendRow(const char *s);
+static void save_snapshot(void);
+
+// Close tab at index; if closing the currently-visible tab, load a neighboring tab
+static int close_tab(int idx) {
+    if (idx < 0 || idx >= NumTabs) return -1;
+    int was_current = (CurTab == idx);
+    // free the tab resources
+    free_tab(&Tabs[idx]);
+    // compact array
+    for (int j = idx; j < NumTabs - 1; j++) Tabs[j] = Tabs[j+1];
+    NumTabs--;
+    if (NumTabs == 0) {
+        free(Tabs); Tabs = NULL; CurTab = -1;
+        if (was_current) {
+            free(E.filename); E.filename = NULL;
+            editorFreeRows(); editorAppendRow(""); save_snapshot(); free(E.saved_snapshot); E.saved_snapshot = serialize_buffer();
+        }
+        return 0;
+    }
+    if (was_current) {
+        int newidx = idx; if (newidx >= NumTabs) newidx = NumTabs - 1;
+        switch_to_tab(newidx);
+    } else {
+        if (CurTab > idx) CurTab--; // shifted left
+    }
+    return 0;
+}
+
+// Switch to the saved "home" (current buffer) state; if none captured, load empty buffer
+static int switch_to_home(void) {
+    // save current visible tab into its slot if necessary
+    if (CurTab >= 0 && CurTab < NumTabs) {
+        free(Tabs[CurTab].snapshot);
+        Tabs[CurTab].snapshot = serialize_buffer();
+        free(Tabs[CurTab].name); Tabs[CurTab].name = E.filename ? strdup(E.filename) : strdup("");
+        free(Tabs[CurTab].saved_snapshot);
+        Tabs[CurTab].saved_snapshot = E.saved_snapshot ? strdup(E.saved_snapshot) : NULL;
+        Tabs[CurTab].cx = E.cx; Tabs[CurTab].cy = E.cy; Tabs[CurTab].row_offset = E.row_offset; Tabs[CurTab].col_offset = E.col_offset;
+    }
+    // load home snapshot
+    free(E.filename); E.filename = NULL;
+    editorFreeRows();
+    if (HaveHomeTab && HomeTab.snapshot) {
+        load_buffer_from_string(HomeTab.snapshot);
+        if (HomeTab.name && HomeTab.name[0]) E.filename = strdup(HomeTab.name);
+        free(E.saved_snapshot);
+        E.saved_snapshot = HomeTab.saved_snapshot ? strdup(HomeTab.saved_snapshot) : NULL;
+        E.cx = HomeTab.cx; E.cy = HomeTab.cy; E.row_offset = HomeTab.row_offset; E.col_offset = HomeTab.col_offset;
+    } else {
+        // no saved home state: create an empty buffer
+        editorAppendRow(""); save_snapshot(); free(E.saved_snapshot); E.saved_snapshot = serialize_buffer();
+    }
+    CurTab = -1; editorScroll(); return 0;
+}
+
+
+static void die(const char *s) {
+    perror(s);
+    exit(1);
+}
+
+// Forward declarations used by embedded terminal
+static void editorRefreshScreen(void);
+static void show_file_browser(void);
+static int alphasort_entries(const void *a, const void *b);
+static void open_file_in_current_window(const char *fname);
+static void open_file_in_new_tab(const char *fname);
+static void open_help_tab(void);
+static void disableRawMode(void);
+static void enableRawMode(void);
+static int switch_to_home(void);
+
+// Forward declarations for functions referenced by tab code
+static void editorFreeRows(void);
+static char *serialize_buffer(void);
+static void load_buffer_from_string(const char *s);
+static void editorScroll(void);
+
+// Run an embedded shell using forkpty; temporarily restore terminal mode so shell behaves normally
+static void run_embedded_terminal(void) {
+    const char *shell = getenv("SHELL"); if (!shell) shell = "/bin/sh";
+
+    // ensure terminal is in raw mode so we can forward keystrokes to the PTY master
+    enableRawMode();
+
+    int masterfd; pid_t pid = forkpty(&masterfd, NULL, NULL, NULL);
+    if (pid == -1) {
+        snprintf(E.msg, sizeof(E.msg), "forkpty failed: %s", strerror(errno)); E.msg_time = time(NULL);
+        enableRawMode();
+        return;
+    }
+    if (pid == 0) {
+        // child: exec shell (this replaces the child)
+        execlp(shell, shell, (char *)NULL);
+        _exit(127);
+    }
+
+    // parent: mirror window size to pty
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) ioctl(masterfd, TIOCSWINSZ, &ws);
+
+    // we'll forward control bytes (Ctrl-C, Ctrl-Z, Ctrl-]) to the child directly
+
+    // forwarding loop: stdin -> masterfd, masterfd -> stdout
+    int flags_master = fcntl(masterfd, F_GETFL, 0);
+    fcntl(masterfd, F_SETFL, flags_master | O_NONBLOCK);
+    int flags_stdin = fcntl(STDIN_FILENO, F_GETFL, 0);
+    fcntl(STDIN_FILENO, F_SETFL, flags_stdin & ~O_NONBLOCK);
+
+    char ibuf[4096], obuf[4096];
+    int child_exited = 0;
+    while (!child_exited) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        if (winch_received) {
+            struct winsize _ws;
+            if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &_ws) == 0) ioctl(masterfd, TIOCSWINSZ, &_ws);
+            getWindowSize();
+            winch_received = 0;
+        }
+        FD_SET(masterfd, &rfds);
+        FD_SET(STDIN_FILENO, &rfds);
+        int maxfd = (masterfd > STDIN_FILENO) ? masterfd : STDIN_FILENO;
+        int rv = select(maxfd + 1, &rfds, NULL, NULL, NULL);
+        if (rv < 0) {
+            if (errno == EINTR) {
+                // check child status
+                int st;
+                pid_t w = waitpid(pid, &st, WNOHANG);
+                if (w == pid) { child_exited = 1; break; }
+                continue;
+            }
+            break;
+        }
+        if (FD_ISSET(masterfd, &rfds)) {
+            ssize_t r = read(masterfd, obuf, sizeof(obuf));
+            if (r > 0) write(STDOUT_FILENO, obuf, (size_t)r);
+            else if (r == 0) { // EOF from child pty
+                int st; waitpid(pid, &st, 0); child_exited = 1; break;
+            }
+        }
+        if (FD_ISSET(STDIN_FILENO, &rfds)) {
+            ssize_t r = read(STDIN_FILENO, ibuf, sizeof(ibuf));
+            if (r > 0) {
+                // handle special control bytes individually, forward others
+                for (ssize_t bi = 0; bi < r; bi++) {
+                    unsigned char b = (unsigned char)ibuf[bi];
+                    if (b == 29) { // Ctrl-] escape: kill child and return
+                        kill(pid, SIGTERM);
+                        int st; waitpid(pid, &st, 0); child_exited = 1; break;
+                    } else if (b == 3) { // Ctrl-C
+                        kill(pid, SIGINT);
+                    } else if (b == 26) { // Ctrl-Z
+                        kill(pid, SIGTSTP);
+                    } else {
+                        ssize_t w = write(masterfd, &b, 1);
+                        (void)w;
+                    }
+                }
+                if (child_exited) break;
+            } else if (r == 0) {
+                // EOF on real stdin (Ctrl-D at start): close master to send EOF to child
+                close(masterfd);
+                int st; waitpid(pid, &st, 0); child_exited = 1; break;
+            }
+        }
+        // check if child exited without us noticing
+        int st; pid_t w = waitpid(pid, &st, WNOHANG);
+        if (w == pid) { child_exited = 1; break; }
+    }
+
+    // ensure child is reaped
+    waitpid(pid, NULL, 0);
+
+    // restore editor raw mode and redraw
+    enableRawMode();
+    editorRefreshScreen();
+    snprintf(E.msg, sizeof(E.msg), "Returned from embedded terminal"); E.msg_time = time(NULL);
+}
+
+static int __raw_inited = 0;
+
+static void disableRawMode(void) {
+    /* restore primary screen buffer so previous terminal scrollback isn't visible */
+    write(STDOUT_FILENO, "\x1b[?1049l", 8);
+    if (__raw_inited) {
+        tcsetattr(STDIN_FILENO, TCSAFLUSH, &E.orig_termios);
+        __raw_inited = 0;
+    }
+}
+
+/*
+ * handle_terminate_signal
+ * -----------------------
+ * Purpose: Ensure the editor restores the terminal to a sane state when
+ * the process is terminated by signals (SIGINT, SIGTERM, SIGHUP, SIGQUIT).
+ * Rationale: Without restoring the terminal (disabling raw mode and
+ * switching back from the alternate screen buffer), the user's shell can
+ * be left unable to echo or display text properly after the editor exits.
+ *
+ * IMPORTANT: Do not remove or change this handler unless you understand
+ * the terminal state machine and have a clear reason (and tests) proving
+ * that the new approach restores the terminal reliably in all expected
+ * termination scenarios (including signals and abrupt exits).
+ */
+static void handle_terminate_signal(int sig) {
+    disableRawMode();
+    /* restore default handler and re-raise so process terminates as usual */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = SIG_DFL;
+    sigaction(sig, &sa, NULL);
+    raise(sig);
+}
+
+/* SIGWINCH handler: mark that the window has been resized */
+static void handle_sigwinch(int sig) { (void)sig; winch_received = 1; }
+
+static void enableRawMode(void) {
+    if (!__raw_inited) {
+        if (tcgetattr(STDIN_FILENO, &E.orig_termios) == -1) die("tcgetattr");
+        atexit(disableRawMode);
+        __raw_inited = 1;
+    }
+
+    struct termios raw = E.orig_termios;
+    raw.c_iflag &= ~(ICRNL | IXON | ISTRIP | INPCK | BRKINT);
+    raw.c_oflag &= ~(OPOST);
+    raw.c_lflag &= ~(ECHO | ICANON | ISIG | IEXTEN);
+    raw.c_cflag |= (CS8);
+    raw.c_cc[VMIN] = 1;
+    raw.c_cc[VTIME] = 0;
+
+    if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1) die("tcsetattr");
+    /* switch to alternate screen buffer so editor session doesn't pollute scrollback */
+    write(STDOUT_FILENO, "\x1b[?1049h", 8);
+}
+
+static void getWindowSize(void) {
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == -1 || ws.ws_col == 0) {
+        E.screenrows = 24;
+        E.screencols = 80;
+    } else {
+        E.screenrows = ws.ws_row;
+        E.screencols = ws.ws_col;
+    }
+}
+
+static void editorAppendRow(const char *s) {
+    char *line = strdup(s ? s : "");
+    if (!line) die("strdup");
+    char **newrows = realloc(E.rows, sizeof(char*) * (E.numrows + 1));
+    if (!newrows) die("realloc");
+    E.rows = newrows;
+    E.rows[E.numrows] = line;
+    E.numrows++;
+}
+
+static void editorInsertRow(int at, const char *s) {
+    if (at < 0 || at > E.numrows) return; // guard
+    char *line = strdup(s ? s : "");
+    if (!line) die("strdup");
+    char **newrows = realloc(E.rows, sizeof(char*) * (E.numrows + 1));
+    if (!newrows) die("realloc");
+    E.rows = newrows;
+    memmove(&E.rows[at+1], &E.rows[at], sizeof(char*) * (E.numrows - at));
+    E.rows[at] = line;
+    E.numrows++;
+}
+
+static void editorFreeRows(void) {
+    for (int i = 0; i < E.numrows; i++) free(E.rows[i]);
+    free(E.rows);
+    E.rows = NULL;
+    E.numrows = 0;
+}
+
+// Serialize buffer to a single string (caller must free)
+static char *serialize_buffer(void) {
+    size_t total = 0;
+    for (int i = 0; i < E.numrows; i++) total += strlen(E.rows[i]) + 1; // +1 for newline
+    char *s = malloc(total + 1);
+    if (!s) return NULL;
+    char *p = s;
+    for (int i = 0; i < E.numrows; i++) {
+        size_t len = strlen(E.rows[i]);
+        memcpy(p, E.rows[i], len);
+        p += len;
+        *p++ = '\n';
+    }
+    if (p != s) p[-1] = '\0'; else *p = '\0';
+    return s;
+}
+
+// Simple runtime config (parsed from ~/.jedrc or $XDG_CONFIG_HOME/jed/config)
+struct JedConfig {
+    int indent_size;
+    int use_tabs; // 0 = false, 1 = true
+    int show_line_numbers;
+    int auto_save_interval; // seconds, 0 = disabled
+    int show_tab_bar; // 0 = hide tab bar, 1 = show tab bar
+} conf = { .indent_size = 4, .use_tabs = 0, .show_line_numbers = 1, .auto_save_interval = 0, .show_tab_bar = 1 };
+
+static void load_config(void) {
+    const char *xdg = getenv("XDG_CONFIG_HOME");
+    char path[512];
+    if (xdg && *xdg) snprintf(path, sizeof(path), "%s/jed/config", xdg);
+    else {
+        const char *home = getenv("HOME");
+        if (!home) return;
+        snprintf(path, sizeof(path), "%s/.jedrc", home);
+    }
+    FILE *f = fopen(path, "r");
+    if (!f) return; // no config is fine
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        // strip leading spaces
+        char *p = line; while (*p && isspace((unsigned char)*p)) p++;
+        if (*p == '\0' || *p == '#' || *p == ';') continue; // comment or empty
+        // find '='
+        char *eq = strchr(p, '=');
+        if (!eq) continue;
+        *eq = '\0';
+        char *key = p; char *val = eq + 1;
+        // trim trailing spaces from key
+        char *kend = key + strlen(key) - 1; while (kend > key && isspace((unsigned char)*kend)) *kend-- = '\0';
+        // trim leading spaces from val
+        while (*val && isspace((unsigned char)*val)) val++;
+        // trim trailing newline/spaces
+        char *vend = val + strlen(val) - 1; while (vend > val && isspace((unsigned char)*vend)) *vend-- = '\0';
+        if (strcasecmp(key, "indent_size") == 0) conf.indent_size = atoi(val);
+        else if (strcasecmp(key, "use_tabs") == 0) conf.use_tabs = (strcasecmp(val, "true") == 0 || strcmp(val, "1") == 0);
+        else if (strcasecmp(key, "show_line_numbers") == 0) conf.show_line_numbers = (strcasecmp(val, "true") == 0 || strcmp(val, "1") == 0);
+        else if (strcasecmp(key, "auto_save_interval") == 0) conf.auto_save_interval = atoi(val);
+        else if (strcasecmp(key, "show_tab_bar") == 0) conf.show_tab_bar = (strcasecmp(val, "true") == 0 || strcmp(val, "1") == 0);
+    }
+    fclose(f);
+}
+
+
+// Compute leading indentation in spaces (tabs count as conf.indent_size)
+static int compute_leading_spaces(const char *s) {
+    int i = 0; int width = 0;
+    while (s[i]) {
+        if (s[i] == ' ') { width += 1; i++; }
+        else if (s[i] == '\t') { width += conf.indent_size; i++; }
+        else break;
+    }
+    return width;
+}
+
+// Create indentation string for a given space width, respecting conf.use_tabs
+static char *make_indent_string(int indent_spaces) {
+    if (indent_spaces <= 0) return strdup("");
+    if (conf.use_tabs) {
+        int tabs = indent_spaces / conf.indent_size;
+        int spaces = indent_spaces % conf.indent_size;
+        int need = tabs + spaces;
+        char *s = malloc(need + 1);
+        if (!s) return NULL;
+        int p = 0;
+        for (int i = 0; i < tabs; i++) s[p++] = '\t';
+        for (int i = 0; i < spaces; i++) s[p++] = ' ';
+        s[p] = '\0';
+        return s;
+    } else {
+        char *s = malloc(indent_spaces + 1);
+        if (!s) return NULL;
+        for (int i = 0; i < indent_spaces; i++) s[i] = ' ';
+        s[indent_spaces] = '\0';
+        return s;
+    }
+}
+
+static void load_buffer_from_string(const char *s) {
+    editorFreeRows();
+    if (!s || *s == '\0') {
+        editorAppendRow("");
+        return;
+    }
+    const char *p = s;
+    const char *line_start = p;
+    while (*p) {
+        if (*p == '\n') {
+            size_t len = p - line_start;
+            char *row = malloc(len + 1);
+            if (!row) die("malloc");
+            memcpy(row, line_start, len);
+            row[len] = '\0';
+            char **newrows = realloc(E.rows, sizeof(char*) * (E.numrows + 1));
+            if (!newrows) die("realloc");
+            E.rows = newrows;
+            E.rows[E.numrows++] = row;
+            p++;
+            line_start = p;
+        } else {
+            p++;
+        }
+    }
+    // last line if not terminated by newline
+    if (p > line_start) {
+        size_t len = p - line_start;
+        char *row = malloc(len + 1);
+        if (!row) die("malloc");
+        memcpy(row, line_start, len);
+        row[len] = '\0';
+        char **newrows = realloc(E.rows, sizeof(char*) * (E.numrows + 1));
+        if (!newrows) die("realloc");
+        E.rows = newrows;
+        E.rows[E.numrows++] = row;
+    }
+}
+
+// History
+static int readKey(void);
+static void editorRefreshScreen(void);
+
+static void save_snapshot(void) {
+    char *snapshot = serialize_buffer();
+    if (!snapshot) return;
+    // truncate future redo history
+    for (int i = E.history_idx + 1; i < E.history_count; i++) {
+        free(E.history[i]);
+    }
+    E.history_count = E.history_idx + 1;
+    char **newhist = realloc(E.history, sizeof(char*) * (E.history_count + 1));
+    if (!newhist) { free(snapshot); return; }
+    E.history = newhist;
+    E.history[E.history_count++] = snapshot;
+    E.history_idx = E.history_count - 1;
+    // cap history
+    if (E.history_count > HISTORY_LIMIT) {
+        // drop oldest
+        free(E.history[0]);
+        memmove(&E.history[0], &E.history[1], sizeof(char*) * (E.history_count - 1));
+        E.history_count--;
+        E.history_idx--;
+        char **shrink = realloc(E.history, sizeof(char*) * E.history_count);
+        if (shrink) E.history = shrink;
+    }
+}
+
+static long long now_ms(void) {
+    struct timeval tv; gettimeofday(&tv, NULL);
+    return (long long)tv.tv_sec * 1000LL + tv.tv_usec / 1000;
+}
+
+static void begin_batch(void) { E.batching++; }
+static void end_batch(void) { if (E.batching > 0) E.batching--; }
+
+static void maybe_snapshot(int kind) {
+    if (E.batching) return;
+    long long now = now_ms();
+    if (E.last_edit_kind == kind && (now - E.last_edit_time_ms) < EDIT_GROUP_MS) {
+        E.last_edit_time_ms = now;
+        return;
+    }
+    save_snapshot();
+    // also write swap for crash recovery if we have a filename
+    if (E.filename) {
+        // write swap file using current buffer
+        char *s = serialize_buffer();
+        if (s) {
+            char *sw = NULL;
+            // build swap path
+            char *base = strrchr(E.filename, '/');
+            const char *b = base ? base + 1 : E.filename;
+            if (base) {
+                size_t dlen = base - E.filename;
+                size_t need = dlen + 1 + 1 + strlen(b) + 5 + 1; // dir + '/' + '.' + base + '.swp' + NUL
+                sw = malloc(need);
+                if (sw) snprintf(sw, need, "%.*s/.%s.swp", (int)dlen, E.filename, b);
+            } else {
+                size_t need = 1 + strlen(b) + 4 + 1; // '.' + base + '.swp' + NUL
+                sw = malloc(need);
+                if (sw) snprintf(sw, need, ".%s.swp", b);
+            }
+            if (sw) {
+                FILE *f = fopen(sw, "w");
+                if (f) {
+                    fwrite(s, 1, strlen(s), f);
+                    fclose(f);
+                    // attempt to set restrictive perms
+                    chmod(sw, S_IRUSR | S_IWUSR);
+                }
+                free(sw);
+            }
+            free(s);
+        }
+    }
+    E.last_edit_kind = kind;
+    E.last_edit_time_ms = now;
+}
+
+
+static void load_snapshot(int idx) {
+    if (idx < 0 || idx >= E.history_count) return;
+    load_buffer_from_string(E.history[idx]);
+    if (E.cy >= E.numrows) E.cy = E.numrows - 1;
+    if (E.cy < 0) E.cy = 0;
+    if (E.cx > (int)strlen(E.rows[E.cy])) E.cx = strlen(E.rows[E.cy]);
+}
+
+static void undo_cmd(void) {
+    if (E.history_idx > 0) {
+        E.history_idx--;
+        load_snapshot(E.history_idx);
+        // set message
+        snprintf(E.msg, sizeof(E.msg), "Undo"); E.msg_time = time(NULL);
+    } else {
+        snprintf(E.msg, sizeof(E.msg), "No more undo"); E.msg_time = time(NULL);
+    }
+}
+
+static void redo_cmd(void) {
+    if (E.history_idx + 1 < E.history_count) {
+        E.history_idx++;
+        load_snapshot(E.history_idx);
+        snprintf(E.msg, sizeof(E.msg), "Redo"); E.msg_time = time(NULL);
+    } else {
+        snprintf(E.msg, sizeof(E.msg), "No more redo"); E.msg_time = time(NULL);
+    }
+}
+
+/* forward declarations for functions used by the executor */
+static void execute_command(const char *cmd);
+static void editorInsertChar(int c);
+static void editorInsertNewline(void);
+static void editorScroll(void);
+
+// helper: delete line at index (0-based)
+static void delete_line_at(int idx) {
+    if (idx < 0 || idx >= E.numrows) return;
+    free(E.rows[idx]);
+    memmove(&E.rows[idx], &E.rows[idx+1], sizeof(char*) * (E.numrows - idx - 1));
+    E.numrows--;
+    if (E.numrows == 0) editorAppendRow("");
+    if (E.cy >= E.numrows) E.cy = E.numrows - 1;
+    if (E.cy < 0) E.cy = 0;
+}
+
+static void copy_whole_line(void) {
+    if (E.cy < 0 || E.cy >= E.numrows) return;
+    free(E.clipboard);
+    E.clipboard = strdup(E.rows[E.cy]);
+    snprintf(E.msg, sizeof(E.msg), "Copied line %d", E.cy + 1); E.msg_time = time(NULL);
+}
+
+static void copy_line_n(int n) {
+    if (n < 1 || n > E.numrows) {
+        snprintf(E.msg, sizeof(E.msg), "Bad line %d", n); E.msg_time = time(NULL); return;
+    }
+    free(E.clipboard);
+    E.clipboard = strdup(E.rows[n - 1]);
+    snprintf(E.msg, sizeof(E.msg), "Copied line %d", n); E.msg_time = time(NULL);
+}
+
+static void paste_at_line_n(int n) {
+    if (!E.clipboard) { snprintf(E.msg, sizeof(E.msg), "Clipboard empty"); E.msg_time = time(NULL); return; }
+    int at = n;
+    if (at < 1) at = 1;
+    if (at > E.numrows) at = E.numrows + 1;
+    // If the target line exists and is blank (empty or only whitespace), replace it instead of inserting.
+    save_snapshot();
+    int target_idx = at - 1;
+    if (target_idx >= 0 && target_idx < E.numrows) {
+        char *t = E.rows[target_idx];
+        int j = 0; int onlyws = 1;
+        while (t[j]) { if (t[j] != ' ' && t[j] != '\t' && t[j] != '\r' && t[j] != '\n') { onlyws = 0; break; } j++; }
+        if (onlyws) {
+            // replace existing blank row
+            free(E.rows[target_idx]);
+            E.rows[target_idx] = strdup(E.clipboard);
+            if (!E.rows[target_idx]) die("strdup");
+            E.cy = target_idx;
+            E.cx = (int)strlen(E.rows[target_idx]);
+            editorScroll();
+            snprintf(E.msg, sizeof(E.msg), "Pasted into line %d", at); E.msg_time = time(NULL);
+            return;
+        }
+    }
+    // otherwise insert at position at-1 (0-based)
+    begin_batch();
+    editorInsertRow(at - 1, E.clipboard);
+    end_batch();
+    snprintf(E.msg, sizeof(E.msg), "Pasted at line %d", at); E.msg_time = time(NULL);
+}
+
+// parse a positive integer from s[pos], update pos via *pidx; return -1 if no digits
+static int parse_number_at(const char *s, int *pidx) {
+    int i = *pidx;
+    int val = 0;
+    int found = 0;
+    while (s[i] && isdigit((unsigned char)s[i])) {
+        found = 1;
+        val = val * 10 + (s[i] - '0');
+        i++;
+    }
+    if (!found) return -1;
+    *pidx = i;
+    return val;
+}
+
+// parse a list like "1-5,7,9" starting at s[pos]; returns a malloc'd array of ints in *out (1-based indices), count in *outc
+// updates *pidx to new position; returns 0 on success, -1 on error
+static int parse_line_list(const char *s, int *pidx, int **out, int *outc) {
+    int i = *pidx;
+    int *arr = NULL; int cnt = 0;
+    while (s[i]) {
+        if (!isdigit((unsigned char)s[i])) break;
+        // parse first number
+        int a = 0; int b = 0;
+        while (s[i] && isdigit((unsigned char)s[i])) { a = a*10 + (s[i]-'0'); i++; }
+        if (s[i] == '-') {
+            i++;
+            if (!isdigit((unsigned char)s[i])) { free(arr); return -1; }
+            while (s[i] && isdigit((unsigned char)s[i])) { b = b*10 + (s[i]-'0'); i++; }
+        } else {
+            b = a;
+        }
+        // add range a..b
+        if (b < a) { int tmp = a; a = b; b = tmp; }
+        for (int v = a; v <= b; v++) {
+            int *narr = realloc(arr, sizeof(int) * (cnt + 1));
+            if (!narr) { free(arr); return -1; }
+            arr = narr; arr[cnt++] = v;
+        }
+        if (s[i] == ',') { i++; continue; }
+        break;
+    }
+    *pidx = i;
+    *out = arr; *outc = cnt;
+    return 0;
+}
+
+static void save_to_file(const char *fname) {
+    const char *use = fname;
+    if (!use) use = (E.filename ? E.filename : "editor_save.txt");
+    FILE *f = fopen(use, "w");
+    if (!f) { snprintf(E.msg, sizeof(E.msg), "Save failed: %s", strerror(errno)); E.msg_time = time(NULL); return; }
+    for (int i = 0; i < E.numrows; i++) {
+        fprintf(f, "%s\n", E.rows[i]);
+    }
+    fclose(f);
+    // update saved snapshot so we can detect unsaved changes
+    free(E.saved_snapshot);
+    E.saved_snapshot = serialize_buffer();
+    // if we're in a tab, update that tab's saved snapshot too
+    if (CurTab >= 0 && CurTab < NumTabs) {
+        free(Tabs[CurTab].saved_snapshot);
+        Tabs[CurTab].saved_snapshot = E.saved_snapshot ? strdup(E.saved_snapshot) : NULL;
+    }
+    // record filename if given
+    if (fname) {
+        free(E.filename);
+        E.filename = strdup(fname);
+    }
+    snprintf(E.msg, sizeof(E.msg), "Saved %s", use); E.msg_time = time(NULL);
+    // remove swap file after a successful save
+    if (E.filename) {
+        char *base = strrchr(E.filename, '/');
+        const char *b = base ? base + 1 : E.filename;
+        char swapbuf[1024];
+        if (base) snprintf(swapbuf, sizeof(swapbuf), "%.*s/.%s.swp", (int)(base - E.filename), E.filename, b);
+        else snprintf(swapbuf, sizeof(swapbuf), ".%s.swp", b);
+        unlink(swapbuf);
+    }
+}
+
+static void execute_command(const char *cmd) {
+    int i = 0; int L = strlen(cmd);
+    // be forgiving: allow commands prefixed with ':' and optional space
+    while (i < L && (cmd[i] == ':' || cmd[i] == ' ')) i++;
+    while (i < L) {
+        // md <dirname> -> make directory (allow top-level placement)
+        if (i + 1 < L && cmd[i] == 'm' && cmd[i+1] == 'd') {
+            i += 2; while (i < L && cmd[i] == ' ') i++;
+            int recursive = 0;
+            // accept optional '-p' flag
+            if (i + 1 < L && cmd[i] == '-') {
+                int fstart = i; while (i < L && cmd[i] != ' ') i++; int flen = i - fstart;
+                if (flen == 2 && cmd[fstart] == '-' && cmd[fstart+1] == 'p') recursive = 1;
+                while (i < L && cmd[i] == ' ') i++;
+            }
+            int start = i; while (i < L && cmd[i] != ' ') i++; int tlen = i - start;
+            if (tlen <= 0) { snprintf(E.msg, sizeof(E.msg), "Directory name required"); E.msg_time = time(NULL); continue; }
+            char dname[512]; int sl = (tlen < (int)sizeof(dname) - 1) ? tlen : (int)sizeof(dname) - 1;
+            memcpy(dname, &cmd[start], sl); dname[sl] = '\0';
+            if (!recursive) {
+                if (mkdir(dname, 0755) == 0) snprintf(E.msg, sizeof(E.msg), "Created directory %s", dname);
+                else snprintf(E.msg, sizeof(E.msg), "mkdir failed: %s", strerror(errno));
+                E.msg_time = time(NULL);
+                continue;
+            }
+            // recursive (-p) behavior: create each component
+            {
+                char accum[1024] = {0};
+                const char *s = dname;
+                // preserve leading slash for absolute paths
+                if (s[0] == '/') { strcpy(accum, "/"); }
+                int failed = 0;
+                while (*s) {
+                    // skip any '/' separators
+                    while (*s == '/') s++;
+                    if (!*s) break;
+                    const char *e = s; while (*e && *e != '/') e++;
+                    int len = (int)(e - s);
+                    if ((int)strlen(accum) + len + 2 >= (int)sizeof(accum)) { snprintf(E.msg, sizeof(E.msg), "Path too long"); failed = 1; break; }
+                    if (!(strlen(accum) == 1 && accum[0] == '/')) strcat(accum, "/");
+                    strncat(accum, s, len);
+                    if (mkdir(accum, 0755) != 0) {
+                        if (errno == EEXIST) { /* ok */ }
+                        else { snprintf(E.msg, sizeof(E.msg), "mkdir failed: %s", strerror(errno)); failed = 1; break; }
+                    }
+                    s = e;
+                }
+                if (!failed) snprintf(E.msg, sizeof(E.msg), "Created directory %s", dname);
+                E.msg_time = time(NULL);
+                continue;
+            }
+        }
+        // open file or manage files: fn <filename> | fn add <filename> | fn del <filename>
+        if (i + 1 < L && cmd[i] == 'f' && cmd[i+1] == 'n') { i += 2;
+            while (i < L && cmd[i] == ' ') i++;
+            int start = i;
+            // capture next token into tokenbuf
+            while (i < L && cmd[i] != ' ') i++;
+            int token_len = i - start;
+            char token[64] = {0};
+            if (token_len > 0) {
+                int sl = (token_len < (int)sizeof(token) - 1) ? token_len : (int)sizeof(token) - 1;
+                memcpy(token, &cmd[start], sl);
+                token[sl] = '\0';
+            }
+            // if token is 'add' or 'del', parse next token as filename
+            if (token_len > 0 && (strcmp(token, "add") == 0 || strcmp(token, "del") == 0)) {
+                while (i < L && cmd[i] == ' ') i++;
+                int fname_start = i;
+                while (i < L && cmd[i] != ' ') i++;
+                int flen = i - fname_start;
+                if (flen > 0) {
+                    char fname[512];
+                    int sl = (flen < (int)sizeof(fname) - 1) ? flen : (int)sizeof(fname) - 1;
+                    memcpy(fname, &cmd[fname_start], sl);
+                    fname[sl] = '\0';
+                    if (strcmp(token, "add") == 0) {
+                        // create file on disk without opening it
+                        FILE *cf = fopen(fname, "w");
+                        if (cf) { fclose(cf); snprintf(E.msg, sizeof(E.msg), "Created %s", fname); E.msg_time = time(NULL); }
+                        else { snprintf(E.msg, sizeof(E.msg), "Create failed: %s", strerror(errno)); E.msg_time = time(NULL); }
+                    } else {
+                        // del
+                        if (access(fname, F_OK) == 0) {
+                            if (unlink(fname) == 0) {
+                    // if we deleted the currently open file, switch to last tab if available
+                    if (E.filename && strcmp(E.filename, fname) == 0) {
+                        if (NumTabs > 0) {
+                            int target = NumTabs - 1;
+                            if (switch_to_tab(target) == 0) {
+                                snprintf(E.msg, sizeof(E.msg), "Deleted %s; switched to tab %d", fname, target+2);
+                            } else {
+                                // fallback: clear buffer
+                                free(E.filename); E.filename = NULL; editorFreeRows(); editorAppendRow(""); save_snapshot(); free(E.saved_snapshot); E.saved_snapshot = serialize_buffer(); snprintf(E.msg, sizeof(E.msg), "Deleted %s; opened empty buffer", fname);
+                            }
+                        } else {
+                            free(E.filename); E.filename = NULL; editorFreeRows(); editorAppendRow(""); save_snapshot(); free(E.saved_snapshot); E.saved_snapshot = serialize_buffer(); snprintf(E.msg, sizeof(E.msg), "Deleted %s; opened empty buffer", fname);
+                        }
+                    } else {
+                        snprintf(E.msg, sizeof(E.msg), "Deleted %s", fname);
+                    }
+                    E.msg_time = time(NULL);
+                } else { snprintf(E.msg, sizeof(E.msg), "Delete failed: %s", strerror(errno)); E.msg_time = time(NULL); }
+                        } else {
+                            snprintf(E.msg, sizeof(E.msg), "No such file %s", fname); E.msg_time = time(NULL);
+                        }
+                    }
+                } else {
+                    snprintf(E.msg, sizeof(E.msg), "Filename required"); E.msg_time = time(NULL);
+                }
+                continue;
+            }
+
+            
+
+            // otherwise treat token as a filename (fall back to old behavior)
+            if (token_len > 0) {
+                char fname[512];
+                int sl = (token_len < (int)sizeof(fname) - 1) ? token_len : (int)sizeof(fname) - 1;
+                memcpy(fname, &cmd[start], sl);
+                fname[sl] = '\0';
+                // try open file (existing behavior: load file or create new buffer)
+                FILE *f = fopen(fname, "r");
+                if (!f) {
+                    // file doesn't exist — check for swap file and offer recovery
+                    char swapbuf[1024];
+                    char *base = strrchr(fname, '/');
+                    const char *b = base ? base + 1 : fname;
+                    if (base) snprintf(swapbuf, sizeof(swapbuf), "%.*s/.%s.swp", (int)(base - fname), fname, b);
+                    else snprintf(swapbuf, sizeof(swapbuf), ".%s.swp", b);
+                    if (access(swapbuf, F_OK) == 0) {
+                        // prompt user: recover/delete/cancel (clear prompt line first and show at bottom)
+                        char __tmpbuf[64]; int __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
+                        if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
+                        write(STDOUT_FILENO, "Swap found. (r)ecover/(d)elete/(c)ancel: ", 41);
+                        int resp = 0;
+                        while (1) {
+                            int k = readKey(); if (k == -1) continue;
+                            if (k == 'r' || k == 'R') { resp = 'r'; break; }
+                            if (k == 'd' || k == 'D') { resp = 'd'; break; }
+                            if (k == 'c' || k == 'C' || k == 27) { resp = 0; break; }
+                        }
+                        __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
+                        if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
+                        if (resp == 'r') {
+                            // load swap
+                            FILE *sf = fopen(swapbuf, "r");
+                            if (sf) {
+                                fseek(sf, 0, SEEK_END);
+                                long ssz = ftell(sf); fseek(sf, 0, SEEK_SET);
+                                char *sbuf = malloc(ssz + 1);
+                                if (sbuf) { fread(sbuf, 1, ssz, sf); sbuf[ssz] = '\0'; load_buffer_from_string(sbuf); free(sbuf); }
+                                fclose(sf);
+                                free(E.filename); E.filename = strdup(fname);
+                                // mark as unsaved (swap recovery)
+                                free(E.saved_snapshot); E.saved_snapshot = NULL;
+                                save_snapshot();
+                                snprintf(E.msg, sizeof(E.msg), "Recovered from swap %s", swapbuf); E.msg_time = time(NULL);
+                            } else {
+                                snprintf(E.msg, sizeof(E.msg), "Swap read failed"); E.msg_time = time(NULL);
+                            }
+                        } else if (resp == 'd') {
+                            unlink(swapbuf);
+                            // create empty buffer
+                            free(E.filename); E.filename = strdup(fname);
+                            free(E.saved_snapshot); E.saved_snapshot = NULL;
+                            editorFreeRows(); editorAppendRow(""); save_snapshot();
+                            snprintf(E.msg, sizeof(E.msg), "New file %s", fname); E.msg_time = time(NULL);
+                        } else {
+                            // cancel
+                            snprintf(E.msg, sizeof(E.msg), "Open cancelled"); E.msg_time = time(NULL);
+                        }
+                    } else {
+                        // no swap — just create buffer and set filename (do NOT create file on disk yet)
+                        free(E.filename);
+                        E.filename = strdup(fname);
+                        // mark as unsaved (no saved snapshot)
+                        free(E.saved_snapshot); E.saved_snapshot = NULL;
+                        // reset buffer to empty
+                        editorFreeRows();
+                        editorAppendRow("");
+                        save_snapshot();
+                        snprintf(E.msg, sizeof(E.msg), "New file %s", fname); E.msg_time = time(NULL);
+                    }
+                } else {
+                    // read file into buffer
+                    fseek(f, 0, SEEK_END);
+                    long sz = ftell(f); fseek(f, 0, SEEK_SET);
+                    char *buf = malloc(sz + 1);
+                    if (buf) {
+                        fread(buf, 1, sz, f);
+                        buf[sz] = '\0';
+                        load_buffer_from_string(buf);
+                        free(buf);
+                        free(E.filename);
+                        E.filename = strdup(fname);
+                        save_snapshot();
+                        // mark as saved
+                        free(E.saved_snapshot); E.saved_snapshot = serialize_buffer();
+                        snprintf(E.msg, sizeof(E.msg), "Opened %s", fname); E.msg_time = time(NULL);
+                    }
+                    fclose(f);
+                }
+            }
+            continue;
+        }
+
+        // opent <file> -> open file in a new tab (create if missing)
+        if (i + 4 < L && strncmp(&cmd[i], "opent", 5) == 0) {
+            char next = (i + 5 < L) ? cmd[i+5] : '\0';
+            if (!(next == '\0' || next == ' ')) { i++; continue; }
+            i += 5; while (i < L && cmd[i] == ' ') i++;
+            int start = i; while (i < L && cmd[i] != ' ') i++; int tlen = i - start;
+            if (tlen <= 0) { snprintf(E.msg, sizeof(E.msg), "Filename required"); E.msg_time = time(NULL); continue; }
+            char fname[512]; int sl = (tlen < (int)sizeof(fname)-1) ? tlen : (int)sizeof(fname)-1; memcpy(fname, &cmd[start], sl); fname[sl] = '\0';
+            // debug: show parsed filename and existence
+            snprintf(E.msg, sizeof(E.msg), "opent -> '%s' (exists=%d)", fname, access(fname, F_OK) == 0); E.msg_time = time(NULL);
+            // if file exists or user agrees to create, create new tab and switch to it
+            if (access(fname, F_OK) != 0) {
+                // ask to create
+                char __tmpbuf[64]; int __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
+                if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
+                write(STDOUT_FILENO, "File not found. Create? (y/n) ", 28);
+                int resp = 0; while (1) { int k = readKey(); if (k == -1) continue; if (k=='y'||k=='Y') { resp='y'; break; } if (k=='n'||k=='N'||k==27) { resp='n'; break; } }
+                __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows); if (__tmpn>0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
+                if (resp != 'y') { snprintf(E.msg, sizeof(E.msg), "Open cancelled"); E.msg_time = time(NULL); continue; }
+            }
+            // push current buffer to tabs and create new tab with the file
+            push_current_to_tab_list();
+            // load file into editor
+            // reuse execute 'fn' by temporarily constructing it: call open file logic inline
+            FILE *f = fopen(fname, "r");
+            if (!f) {
+                free(E.filename); E.filename = strdup(fname); free(E.saved_snapshot); E.saved_snapshot = NULL; editorFreeRows(); editorAppendRow(""); save_snapshot(); snprintf(E.msg, sizeof(E.msg), "New file %s", fname); E.msg_time = time(NULL);
+            } else {
+                fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+                char *buf = malloc(sz + 1); if (buf) { fread(buf, 1, sz, f); buf[sz] = '\0'; load_buffer_from_string(buf); free(buf); free(E.filename); E.filename = strdup(fname); save_snapshot(); free(E.saved_snapshot); E.saved_snapshot = serialize_buffer(); snprintf(E.msg, sizeof(E.msg), "Opened %s", fname); E.msg_time = time(NULL); }
+                fclose(f);
+            }
+            // append the newly opened file as a tab and switch to it
+            struct Tab t = make_tab_from_editor(); int idx = append_tab(t);
+            if (idx >= 0) {
+                int sret = switch_to_tab(idx);
+                if (sret == 0) { snprintf(E.msg, sizeof(E.msg), "opent: opened %s (tab %d)", fname, idx+2); E.msg_time = time(NULL); }
+                else { snprintf(E.msg, sizeof(E.msg), "opent: switch failed %d", sret); E.msg_time = time(NULL); }
+            } else { snprintf(E.msg, sizeof(E.msg), "opent: append failed"); E.msg_time = time(NULL); }
+            continue;
+        }
+
+        // open <file> -> open in current window but move current file to a new tab
+        if (i + 3 < L && strncmp(&cmd[i], "open", 4) == 0) {
+            char next = (i + 4 < L) ? cmd[i+4] : '\0'; if (!(next == '\0' || next == ' ')) { i++; continue; }
+            i += 4; while (i < L && cmd[i] == ' ') i++;
+            int start = i; while (i < L && cmd[i] != ' ') i++; int tlen = i - start;
+            if (tlen <= 0) { snprintf(E.msg, sizeof(E.msg), "Filename required"); E.msg_time = time(NULL); continue; }
+            char fname[512]; int sl = (tlen < (int)sizeof(fname)-1) ? tlen : (int)sizeof(fname)-1; memcpy(fname, &cmd[start], sl); fname[sl] = '\0';
+            // debug: show parsed filename and existence
+            snprintf(E.msg, sizeof(E.msg), "open -> '%s' (exists=%d)", fname, access(fname, F_OK) == 0); E.msg_time = time(NULL);
+            // push current file to new tab
+            push_current_to_tab_list();
+            // then open requested file into current editor (create if missing)
+            FILE *f = fopen(fname, "r");
+            if (!f) {
+                char __tmpbuf[64]; int __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
+                if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
+                write(STDOUT_FILENO, "File not found. Create? (y/n) ", 28);
+                int resp = 0; while (1) { int k = readKey(); if (k == -1) continue; if (k=='y'||k=='Y') { resp='y'; break; } if (k=='n'||k=='N'||k==27) { resp='n'; break; } }
+                __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows); if (__tmpn>0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
+                if (resp != 'y') { snprintf(E.msg, sizeof(E.msg), "Open cancelled"); E.msg_time = time(NULL); continue; }
+                free(E.filename); E.filename = strdup(fname); free(E.saved_snapshot); E.saved_snapshot = NULL; editorFreeRows(); editorAppendRow(""); save_snapshot(); snprintf(E.msg, sizeof(E.msg), "New file %s", fname); E.msg_time = time(NULL);
+            } else {
+                fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+                char *buf = malloc(sz + 1); if (buf) { fread(buf, 1, sz, f); buf[sz] = '\0'; load_buffer_from_string(buf); free(buf); free(E.filename); E.filename = strdup(fname); save_snapshot(); free(E.saved_snapshot); E.saved_snapshot = serialize_buffer(); snprintf(E.msg, sizeof(E.msg), "Opened %s", fname); E.msg_time = time(NULL); }
+                fclose(f);
+            }
+            // debug: confirm push succeeded (num tabs)
+            snprintf(E.msg, sizeof(E.msg), "open: pushed (tabs=%d)", NumTabs); E.msg_time = time(NULL);
+            continue;
+        }
+        if (i + 2 < L && strncmp(&cmd[i], "cwl", 3) == 0) {
+            copy_whole_line(); i += 3; continue;
+        }
+        if (i + 1 < L && strncmp(&cmd[i], "cl", 2) == 0) {
+            i += 2; int num = parse_number_at(cmd, &i); if (num > 0) copy_line_n(num); continue;
+        }
+        if (i + 1 < L && strncmp(&cmd[i], "pl", 2) == 0) {
+            i += 2; int num = parse_number_at(cmd, &i); if (num > 0) { save_snapshot(); paste_at_line_n(num); } continue;
+        }
+        if (i + 1 < L && strncmp(&cmd[i], "dl", 2) == 0) {
+            i += 2;
+            if (!isdigit((unsigned char)cmd[i])) {
+                // delete current line
+                save_snapshot(); delete_line_at(E.cy); continue;
+            } else {
+                int *list = NULL; int cnt = 0;
+                int starti = i;
+                if (parse_line_list(cmd, &i, &list, &cnt) == 0 && cnt > 0) {
+                    save_snapshot();
+                    // deduplicate and sort descending
+                    // simple approach: mark valid ones and delete highest first
+                    for (int k = 0; k < cnt; k++) {
+                        int v = list[k]; if (v < 1 || v > E.numrows) list[k] = -1;
+                    }
+                    // sort (descending)
+                    for (int a = 0; a < cnt; a++) for (int b = a+1; b < cnt; b++) if (list[a] < list[b]) { int t = list[a]; list[a] = list[b]; list[b] = t; }
+                    for (int k = 0; k < cnt; k++) {
+                        if (list[k] <= 0) continue;
+                        delete_line_at(list[k] - 1);
+                    }
+                    free(list);
+                } else {
+                    i = starti; // rollback
+                }
+                continue;
+            }
+        }
+        if (i + 1 < L && strncmp(&cmd[i], "jl", 2) == 0) {
+            char next = (i + 2 < L) ? cmd[i+2] : '\0';
+            if (!(next == '\0' || next == ' ' || isdigit((unsigned char)next))) { i++; continue; }
+            i += 2; int starti = i; int num = parse_number_at(cmd, &i);
+            if (num >= 1 && num <= E.numrows) {
+                /* ensure strict: after number must be end or space */
+                if (i == starti || cmd[i] == '\0' || cmd[i] == ' ') {
+                        E.cy = num - 1;
+                        // move to first non-whitespace on the target line (front of statement)
+                        {
+                            char *trow = E.rows[E.cy];
+                            int first_non = 0; while (trow[first_non] && (trow[first_non] == ' ' || trow[first_non] == '\t')) first_non++;
+                            int rowlen = (int)strlen(trow);
+                            if (first_non > rowlen) first_non = rowlen;
+                            E.cx = first_non;
+                        }
+                        editorScroll(); snprintf(E.msg, sizeof(E.msg), "Jumped to line %d", num); E.msg_time = time(NULL);
+                }
+            }
+            continue;
+        }
+
+        // tabs - list tabs
+        if (i + 3 < L && strncmp(&cmd[i], "tabs", 4) == 0) {
+            i += 4;
+            // build a small list into E.msg (truncate if needed). Include current buffer as tab 1, then stored tabs 2..N+1
+            char buf[256]; buf[0] = '\0'; int p = 0;
+            // current buffer
+            const char *cname = E.filename ? E.filename : "(No Name)";
+            int n = snprintf(buf + p, sizeof(buf) - p, "1:%s ", cname); if (n > 0) p += n;
+            for (int t = 0; t < NumTabs; t++) {
+                int n2 = snprintf(buf + p, sizeof(buf) - p, "%d:%s ", t+2, Tabs[t].name ? Tabs[t].name : "");
+                if (n2 <= 0) break; p += n2; if (p >= (int)sizeof(buf)-20) break;
+            }
+            if (p == 0) { snprintf(E.msg, sizeof(E.msg), "No tabs"); }
+            else { snprintf(E.msg, sizeof(E.msg), "%s", buf); }
+            E.msg_time = time(NULL);
+            continue;
+        }
+
+        // browse - open file browser overlay. Allow single-letter 'b' as alias (e.g. ':b')
+        if ((i + 4 < L && strncmp(&cmd[i], "browse", 6) == 0) || (cmd[i] == 'b' && (i+1 >= L || cmd[i+1] == ' '))) {
+            if (cmd[i] == 'b') i += 1; else i += 6; show_file_browser(); continue;
+        }
+
+        // help - open help page as a dedicated tab
+        if (i + 3 < L && strncmp(&cmd[i], "help", 4) == 0) { i += 4; open_help_tab(); continue; }
+
+        // tabc <N> - close tab N (1-based). Allow compact forms like "tabc1" or "tabc 1" etc.
+        if (i + 3 < L && strncmp(&cmd[i], "tabc", 4) == 0) {
+            char next = (i + 4 < L) ? cmd[i+4] : '\0'; if (!(next == '\0' || next == ' ' || isdigit((unsigned char)next))) { i++; continue; }
+            i += 4; while (i < L && cmd[i] == ' ') i++; int start = i; while (i < L && isdigit((unsigned char)cmd[i])) i++; int tlen = i - start;
+            if (tlen <= 0) {
+                // no number: close the currently-displayed tab (home==1 or stored)
+                if (CurTab >= 0) {
+                    int val = CurTab + 2; // displayed number
+                    if (close_tab(CurTab) == 0) snprintf(E.msg, sizeof(E.msg), "Closed current tab %d", val);
+                    else snprintf(E.msg, sizeof(E.msg), "Close failed for current tab %d", val);
+                } else {
+                    // closing home buffer
+                    if (NumTabs > 0) {
+                        int target = NumTabs - 1; // switch to last stored tab
+                        if (switch_to_tab(target) == 0) {
+                            // clear saved home
+                            free_tab(&HomeTab); HaveHomeTab = 0;
+                            snprintf(E.msg, sizeof(E.msg), "Closed current buffer; switched to tab %d", target + 2);
+                        } else {
+                            snprintf(E.msg, sizeof(E.msg), "Close failed for current buffer");
+                        }
+                    } else {
+                        // no other tabs: clear to empty buffer
+                        free(E.filename); E.filename = NULL; editorFreeRows(); editorAppendRow(""); save_snapshot(); free(E.saved_snapshot); E.saved_snapshot = serialize_buffer();
+                        free_tab(&HomeTab); HaveHomeTab = 0;
+                        snprintf(E.msg, sizeof(E.msg), "Closed current buffer");
+                    }
+                }
+                E.msg_time = time(NULL);
+                continue;
+            }
+            int val = 0; for (int k = 0; k < tlen; k++) val = val * 10 + (cmd[start + k] - '0');
+            if (val < 1 || val > NumTabs + 1) { snprintf(E.msg, sizeof(E.msg), "Bad tab %d", val); E.msg_time = time(NULL); continue; }
+            if (val == 1) {
+                // close home explicitly
+                if (CurTab == -1) {
+                    // same as no-number close above
+                    if (NumTabs > 0) {
+                        int target = NumTabs - 1; if (switch_to_tab(target) == 0) { free_tab(&HomeTab); HaveHomeTab = 0; snprintf(E.msg, sizeof(E.msg), "Closed current buffer; switched to tab %d", target + 2); }
+                        else snprintf(E.msg, sizeof(E.msg), "Close failed for current buffer");
+                    } else { free(E.filename); E.filename = NULL; editorFreeRows(); editorAppendRow(""); save_snapshot(); free(E.saved_snapshot); E.saved_snapshot = serialize_buffer(); free_tab(&HomeTab); HaveHomeTab = 0; snprintf(E.msg, sizeof(E.msg), "Closed current buffer"); }
+                } else {
+                    // home not visible: just clear saved home
+                    free_tab(&HomeTab); HaveHomeTab = 0; snprintf(E.msg, sizeof(E.msg), "Closed buffer 1 (home)");
+                }
+                E.msg_time = time(NULL); continue;
+            }
+            // val > 1 -> stored tab index = val - 2
+            if (close_tab(val - 2) == 0) snprintf(E.msg, sizeof(E.msg), "Closed tab %d", val);
+            else snprintf(E.msg, sizeof(E.msg), "Close failed for tab %d", val);
+            E.msg_time = time(NULL);
+            continue;
+        }
+
+        // tab <N> - switch to tab N (1-based). Allow compact forms like "tab1" or "tab  1" etc.
+        if (i + 2 < L && strncmp(&cmd[i], "tab", 3) == 0) {
+            char next = (i + 3 < L) ? cmd[i+3] : '\0'; if (!(next == '\0' || next == ' ' || isdigit((unsigned char)next))) { i++; continue; }
+            i += 3; while (i < L && cmd[i] == ' ') i++; int start = i; while (i < L && isdigit((unsigned char)cmd[i])) i++; int tlen = i - start;
+            if (tlen <= 0) { snprintf(E.msg, sizeof(E.msg), "Tab number required"); E.msg_time = time(NULL); continue; }
+            int val = 0; for (int k = 0; k < tlen; k++) val = val * 10 + (cmd[start + k] - '0');
+            if (val < 1 || val > NumTabs + 1) { snprintf(E.msg, sizeof(E.msg), "Bad tab %d", val); E.msg_time = time(NULL); continue; }
+            if (val == 1) {
+                switch_to_home();
+            } else {
+                switch_to_tab(val - 2);
+            }
+            snprintf(E.msg, sizeof(E.msg), "Switched to tab %d", val); E.msg_time = time(NULL);
+            continue;
+        }
+        if (i + 2 < L && strncmp(&cmd[i], "jfl", 3) == 0) {
+            char next = (i + 3 < L) ? cmd[i+3] : '\0';
+            if (next == '\0' || next == ' ' || isdigit((unsigned char)next)) {
+                int idx = i + 3; while (idx < L && cmd[idx] == ' ') idx++;
+                int num = parse_number_at(cmd, &idx);
+                /* if there was a number, require that it be followed by space or end */
+                if (num != -1 && !(idx == i+3 || cmd[idx] == '\0' || cmd[idx] == ' ')) { i++; continue; }
+                int target = (num >= 1 && num <= E.numrows) ? num - 1 : E.cy;
+                if (target < 0) target = 0;
+                if (target >= E.numrows) target = E.numrows - 1;
+                E.cy = target;
+                // move to first non-whitespace on the target line (front)
+                {
+                    char *trow = E.rows[E.cy];
+                    int first_non = 0; while (trow[first_non] && (trow[first_non] == ' ' || trow[first_non] == '\t')) first_non++;
+                    int rowlen = (int)strlen(trow);
+                    if (first_non > rowlen) first_non = rowlen;
+                    E.cx = first_non;
+                }
+                editorScroll();
+                snprintf(E.msg, sizeof(E.msg), "Jumped to line %d front", target + 1); E.msg_time = time(NULL);
+                i = idx; continue;
+            }
+        }
+        if (i + 2 < L && strncmp(&cmd[i], "jel", 3) == 0) {
+            char next = (i + 3 < L) ? cmd[i+3] : '\0';
+            if (next == '\0' || next == ' ' || isdigit((unsigned char)next)) {
+                int idx = i + 3; while (idx < L && cmd[idx] == ' ') idx++;
+                int num = parse_number_at(cmd, &idx);
+                /* if there was a number, require that it be followed by space or end */
+                if (num != -1 && !(idx == i+3 || cmd[idx] == '\0' || cmd[idx] == ' ')) { i++; continue; }
+                int target = (num >= 1 && num <= E.numrows) ? num - 1 : E.cy;
+                if (target < 0) target = 0;
+                if (target >= E.numrows) target = E.numrows - 1;
+                E.cy = target;
+                E.cx = strlen(E.rows[target]);
+                editorScroll();
+                snprintf(E.msg, sizeof(E.msg), "Jumped to line %d end", target + 1); E.msg_time = time(NULL);
+                i = idx; continue;
+            }
+        }
+        if (i + 2 < L && strncmp(&cmd[i], "jml", 3) == 0) {
+            char next = (i + 3 < L) ? cmd[i+3] : '\0';
+            if (next == '\0' || next == ' ' || isdigit((unsigned char)next)) {
+                int idx = i + 3;
+                while (idx < L && cmd[idx] == ' ') idx++;
+                int num = parse_number_at(cmd, &idx);
+                int target = (num >= 1 && num <= E.numrows) ? num - 1 : E.cy;
+                if (target < 0) target = 0;
+                if (target >= E.numrows) target = E.numrows - 1;
+                E.cy = target;
+                E.cx = (int)(strlen(E.rows[target]) / 2);
+                editorScroll();
+                snprintf(E.msg, sizeof(E.msg), "Jumped to line %d middle", target + 1); E.msg_time = time(NULL);
+                i = idx; continue;
+            }
+        }
+        if (i + 1 < L && strncmp(&cmd[i], "ot", 2) == 0) {
+            char next = (i + 2 < L) ? cmd[i+2] : '\0';
+            if (!(next == '\0' || next == ' ')) { i++; continue; }
+            i += 2;
+            // Open embedded PTY terminal inside the editor
+            run_embedded_terminal();
+            continue;
+        }
+        // single-char tokens (strict: only trigger when followed by end or space)
+        if (cmd[i] == 'u') {
+            char next = (i + 1 < L) ? cmd[i+1] : '\0';
+            if (next == '\0' || next == ' ') { undo_cmd(); i++; continue; } else { i++; continue; }
+        }
+        if (cmd[i] == 'r') {
+            char next = (i + 1 < L) ? cmd[i+1] : '\0';
+            if (next == '\0' || next == ' ') { redo_cmd(); i++; continue; } else { i++; continue; }
+        }
+        if (cmd[i] == 'p') {
+            char next = (i + 1 < L) ? cmd[i+1] : '\0';
+            if (next == '\0' || next == ' ') {
+                // paste at cursor
+                if (E.clipboard) {
+                    save_snapshot();
+                    begin_batch();
+                    for (char *pc = E.clipboard; *pc; pc++) {
+                        if (*pc == '\n') editorInsertNewline(); else editorInsertChar((unsigned char)*pc);
+                    }
+                    end_batch();
+                    snprintf(E.msg, sizeof(E.msg), "Pasted"); E.msg_time = time(NULL);
+                } else {
+                    snprintf(E.msg, sizeof(E.msg), "Clipboard empty"); E.msg_time = time(NULL);
+                }
+                i++; continue;
+            } else { i++; continue; }
+        }
+        if (cmd[i] == 's') {
+            char next = (i + 1 < L) ? cmd[i+1] : '\0';
+            if (next == '\0' || next == ' ') { save_to_file(NULL); i++; continue; } else { i++; continue; }
+        }
+        if (cmd[i] == 'q') {
+            char next = (i + 1 < L) ? cmd[i+1] : '\0';
+            if (!(next == '\0' || next == ' ')) { i++; continue; }
+            // quit
+            // if unsaved changes, prompt to save
+            char *cur = serialize_buffer();
+            int needs_save = 1;
+            if (E.saved_snapshot) {
+                if (strcmp(cur ? cur : "", E.saved_snapshot ? E.saved_snapshot : "") == 0) needs_save = 0;
+            }
+            free(cur);
+            if (needs_save) {
+                // prompt: Save before quit? (y/n) — displayed at bottom row (clear line first)
+                char __tmpbuf[64]; int __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
+                if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
+                write(STDOUT_FILENO, "Save before quit? (y/n) ", 24);
+                // read response
+                int resp = 0;
+                while (1) {
+                    int k = readKey();
+                    if (k == -1) continue;
+                    if (k == 'y' || k == 'Y') { resp = 'y'; break; }
+                    if (k == 'n' || k == 'N') { resp = 'n'; break; }
+                    if (k == 27) { resp = 0; break; }
+                }
+                // clear prompt line
+                __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
+                if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
+                if (resp == 'y') { save_to_file(NULL); write(STDOUT_FILENO, "\x1b[2J", 4); write(STDOUT_FILENO, "\x1b[H", 3); disableRawMode(); exit(0); }
+                if (resp == 'n') {
+                    // remove swap file before exiting without saving
+                    if (E.filename) {
+                        char *base = strrchr(E.filename, '/');
+                        const char *b = base ? base + 1 : E.filename;
+                        char swapbuf[1024];
+                        if (base) snprintf(swapbuf, sizeof(swapbuf), "%.*s/.%s.swp", (int)(base - E.filename), E.filename, b);
+                        else snprintf(swapbuf, sizeof(swapbuf), ".%s.swp", b);
+                        unlink(swapbuf);
+                    }
+                    write(STDOUT_FILENO, "\x1b[2J", 4); write(STDOUT_FILENO, "\x1b[H", 3); disableRawMode(); exit(0);
+                }
+                // otherwise cancel and continue
+                i++; continue;
+            } else {
+                // no unsaved changes — remove swap if present, clear screen and exit
+                if (E.filename) {
+                    char *base = strrchr(E.filename, '/');
+                    const char *b = base ? base + 1 : E.filename;
+                    char swapbuf[1024];
+                    if (base) snprintf(swapbuf, sizeof(swapbuf), "%.*s/.%s.swp", (int)(base - E.filename), E.filename, b);
+                    else snprintf(swapbuf, sizeof(swapbuf), ".%s.swp", b);
+                    unlink(swapbuf);
+                }
+                write(STDOUT_FILENO, "\x1b[2J", 4); write(STDOUT_FILENO, "\x1b[H", 3); disableRawMode(); exit(0);
+            }
+        }
+
+        // unknown token: skip
+        i++;
+    }
+}
+
+static void editorInsertChar(int c) {
+    maybe_snapshot(EDIT_KIND_INSERT);
+
+    if (E.cy < 0) E.cy = 0;
+    if (E.cy >= E.numrows) {
+        // create missing rows up to cy
+        while (E.numrows <= E.cy) editorAppendRow("");
+    }
+
+    char *row = E.rows[E.cy];
+    int len = strlen(row);
+    if (E.cx < 0) E.cx = 0;
+    if (E.cx > len) E.cx = len;
+
+    char *newrow = malloc(len + 2 + 1); // +1 for new char, +1 for NUL
+    if (!newrow) die("malloc");
+    memcpy(newrow, row, E.cx);
+    newrow[E.cx] = (char)c;
+    memcpy(newrow + E.cx + 1, row + E.cx, len - E.cx + 1);
+
+    free(E.rows[E.cy]);
+    E.rows[E.cy] = newrow;
+    E.cx++;
+    editorScroll();
+}
+
+static void editorInsertNewline(void) {
+    maybe_snapshot(EDIT_KIND_NEWLINE);
+
+    if (E.cy < 0) E.cy = 0;
+    if (E.cy >= E.numrows) {
+        editorAppendRow("");
+        E.cy = E.numrows - 1;
+        E.cx = 0;
+        editorScroll();
+        return;
+    }
+    char *row = E.rows[E.cy];
+    int len = strlen(row);
+    if (E.cx < 0) E.cx = 0;
+    if (E.cx > len) E.cx = len;
+
+    // current row becomes left part
+    char *left = strndup(row, E.cx);
+    if (!left) die("strndup");
+    // new row is right part
+    char *right = strdup(row + E.cx);
+    if (!right) die("strdup");
+
+    free(E.rows[E.cy]);
+    E.rows[E.cy] = left;
+    editorInsertRow(E.cy + 1, right);
+    free(right);
+
+    E.cy++;
+    // compute indentation for new row based on current (left) row
+    int base_indent = compute_leading_spaces(E.rows[E.cy - 1]);
+    int lasti = (int)strlen(E.rows[E.cy - 1]) - 1;
+    while (lasti >= 0 && isspace((unsigned char)E.rows[E.cy - 1][lasti])) lasti--;
+    char lastch = (lasti >= 0) ? E.rows[E.cy - 1][lasti] : '\0';
+    int add = 0;
+    if (lastch == '{' || lastch == ':') add = conf.indent_size;
+    int new_indent = base_indent + add;
+    if (new_indent < 0) new_indent = 0;
+    char *ind = make_indent_string(new_indent);
+    if (ind && *ind) {
+        char *orig = E.rows[E.cy];
+        int origlen = strlen(orig);
+        int indlen = (int)strlen(ind);
+        char *newrow = malloc(indlen + origlen + 1);
+        if (newrow) {
+            memcpy(newrow, ind, indlen);
+            memcpy(newrow + indlen, orig, origlen + 1);
+            free(E.rows[E.cy]);
+            E.rows[E.cy] = newrow;
+            E.cx = indlen;
+        }
+        free(ind);
+    } else {
+        E.cx = 0;
+    }
+    editorScroll();
+}
+
+static void editorDelChar(void) {
+    maybe_snapshot(EDIT_KIND_DELETE);
+
+    if (E.cy < 0 || E.cy >= E.numrows) return;
+    char *row = E.rows[E.cy];
+    int len = strlen(row);
+    if (E.cx > 0) {
+        // remove char to left
+        memmove(row + E.cx - 1, row + E.cx, len - E.cx + 1);
+        E.cx--;
+    } else if (E.cx == 0 && E.cy > 0) {
+        // join with previous row
+        int prevlen = strlen(E.rows[E.cy - 1]);
+        char *newrow = malloc(prevlen + len + 1);
+        if (!newrow) die("malloc");
+        memcpy(newrow, E.rows[E.cy - 1], prevlen);
+        memcpy(newrow + prevlen, row, len + 1);
+        free(E.rows[E.cy - 1]);
+        E.rows[E.cy - 1] = newrow;
+        // remove current row
+        free(E.rows[E.cy]);
+        memmove(&E.rows[E.cy], &E.rows[E.cy + 1], sizeof(char*) * (E.numrows - E.cy - 1));
+        E.numrows--;
+        E.cy--;
+        E.cx = prevlen;
+    }
+    editorScroll();
+}
+
+static int readKey(void) {
+    char c;
+    ssize_t nread = read(STDIN_FILENO, &c, 1);
+    if (nread <= 0) return -1;
+    if (c == 27) { // escape sequence
+        // Wait briefly to see if there's more bytes (CSI sequence)
+        fd_set rdset;
+        struct timeval tv;
+        FD_ZERO(&rdset);
+        FD_SET(STDIN_FILENO, &rdset);
+        tv.tv_sec = 0;
+        tv.tv_usec = 100000; // 100ms
+        int r = select(STDIN_FILENO + 1, &rdset, NULL, NULL, &tv);
+        if (r <= 0) {
+            return 27; // lone ESC
+        }
+        char seq[3];
+        if (read(STDIN_FILENO, &seq[0], 1) <= 0) return 27;
+        if (read(STDIN_FILENO, &seq[1], 1) <= 0) seq[1] = '\0';
+
+        if (seq[0] == '[') {
+            if (seq[1] >= '0' && seq[1] <= '9') {
+                // Extended escape, read another
+                if (read(STDIN_FILENO, &seq[2], 1) <= 0) seq[2] = '\0';
+                if (seq[2] == '~') {
+                    switch (seq[1]) {
+                        case '1': return HOME_KEY;
+                        case '3': return DEL_KEY;
+                        case '4': return END_KEY;
+                        case '5': return PAGE_UP;
+                        case '6': return PAGE_DOWN;
+                        case '7': return HOME_KEY;
+                        case '8': return END_KEY;
+                    }
+                }
+            } else {
+                switch (seq[1]) {
+                    case 'A': return ARROW_UP;
+                    case 'B': return ARROW_DOWN;
+                    case 'C': return ARROW_RIGHT;
+                    case 'D': return ARROW_LEFT;
+                }
+            }
+        } else if (seq[0] == 'O') {
+            switch (seq[1]) {
+                case 'H': return HOME_KEY;
+                case 'F': return END_KEY;
+            }
+        }
+        return 27;
+    }
+    return (int)(unsigned char)c;
+}
+
+static void editorScroll(void) {
+    int content_rows = E.screenrows - 1; // status reserved
+    if (content_rows < 1) content_rows = 1;
+    if (E.cy < E.row_offset) {
+        E.row_offset = E.cy;
+    } else if (E.cy >= E.row_offset + content_rows) {
+        E.row_offset = E.cy - content_rows + 1;
+    }
+
+    // Horizontal scrolling: ensure E.cx is within [col_offset, col_offset + avail - 1]
+    int total_lines = (E.numrows > content_rows) ? E.numrows : content_rows;
+    int ln_width = snprintf(NULL, 0, "%d", total_lines);
+    if (ln_width < 1) ln_width = 1;
+    int prefix_len = ln_width + 3;
+    int avail = E.screencols - prefix_len;
+    if (avail < 1) avail = 1;
+
+    if (E.cx < E.col_offset) {
+        E.col_offset = E.cx;
+    } else if (E.cx >= E.col_offset + avail) {
+        E.col_offset = E.cx - avail + 1;
+    }
+}
+
+static void draw_help_overlay(void) {
+    // build a more compact, nicely padded help box (similar look to the file browser)
+    const char *lines[] = {
+        "Help: Commands (press ? or ESC to close):",
+        "",
+        "File & Tab management:",
+        "  fn <file>        - open/create file",
+        "  open <file>      - open in current window (push current to tab)",
+        "  opent <file>     - open in new tab",
+        "  tabs             - list tabs",
+        "  tab1 / tab 1     - switch to tab 1 (space optional)",
+        "  tabc1 / tabc 1   - close tab 1 (space optional)",
+        "",
+        "Editing:",
+        "  s     - Save",
+        "  q     - Quit",
+        "  qs    - Quit & Save",
+        "  u / r - Undo / Redo",
+        "  cwl   - copy whole line, cl<N> copy line N",
+        "  c     - copy selection (if any), p - paste",
+        "",
+        "File browser:",
+        "  browse - File browser (press number to open / enter dir)  (alias: :b)",
+        "    PgUp/PgDn (page), Backspace (Back) deletes digits and goes back when empty, q/ESC (cancel)",
+        "    (d) Delete selected file/directory (confirmation; browser refreshes)",
+        "  ot - Open Terminal (Ctrl-] to exit)",
+        "",
+        "Press ? or ESC to close help"
+    };
+    int n = sizeof(lines) / sizeof(lines[0]);
+
+    // compute required width based on longest line
+    int maxlen = 0; for (int i = 0; i < n; i++) { int l = (int)strlen(lines[i]); if (l > maxlen) maxlen = l; }
+    int boxw = maxlen + 6; if (boxw > E.screencols - 4) boxw = E.screencols - 4; if (boxw < 40) boxw = 40;
+    int boxh = n + 2;
+    int sx = (E.screencols - boxw) / 2;
+    int sy = (E.screenrows - boxh) / 2;
+
+    // draw box background (clear whole region)
+    for (int y = 0; y < boxh; y++) {
+        char buf[128]; int ln = sy + y + 1; int written = snprintf(buf, sizeof(buf), "\x1b[%d;%dH", ln, sx + 1);
+        if (written > 0) write(STDOUT_FILENO, buf, (size_t)written);
+        for (int x = 0; x < boxw; x++) write(STDOUT_FILENO, " ", 1);
+    }
+
+    // draw text lines and pad to width to avoid artifacts; color section headers (ending with ':')
+    for (int i = 0; i < n; i++) {
+        int ln = sy + 1 + i + 1;
+        int col = sx + 3;
+        char buf[128]; int written = snprintf(buf, sizeof(buf), "\x1b[%d;%dH", ln, col);
+        if (written > 0) write(STDOUT_FILENO, buf, (size_t)written);
+        const char *line = lines[i]; int len = (int)strlen(line);
+        int avail = boxw - (col - sx) - 2; if (avail < 0) avail = 0;
+        int towrite = (len > avail) ? avail : len;
+        // if this line looks like a section header (ends with ':' and not empty), color it cyan
+        int is_header = (len > 0 && line[len-1] == ':');
+        if (is_header) write(STDOUT_FILENO, "\x1b[36m", 5);
+        if (towrite > 0) write(STDOUT_FILENO, line, (size_t)towrite);
+        if (is_header) write(STDOUT_FILENO, "\x1b[39m", 5);
+        // pad remainder of the line
+        int pad = avail - towrite; for (int p = 0; p < pad; p++) write(STDOUT_FILENO, " ", 1);
+    }
+}
+
+// Open the help text as its own tab (so it appears as a full page). Closes when user uses 'tabc' on the help tab.
+static void open_help_tab(void) {
+    const char *lines[] = {
+        "Help: Commands (press :tabcN to close):",
+        "",
+        "File & Tab management:",
+        "fn <file>        - open/create file",
+        "open <file>      - open in current window (push current to tab)",
+        "opent <file>     - open in new tab",
+        "tabs             - list tabs",
+        "tab1 / tab 1     - switch to tab 1 (space optional)",
+        "tabc1 / tabc 1   - close tab 1 (space optional)",
+        "",
+        "Editing:",
+        "s     - Save",
+        "q     - Quit",
+        "qs    - Quit & Save",
+        "u / r - Undo / Redo",
+        "cwl   - copy whole line, cl<N> copy line N",
+        "c     - copy selection (if any), p - paste",
+        "",
+        "File browser:",
+        "browse - File browser (press number to open / enter dir)  (alias: :b)",
+        "  PgUp/PgDn (page), Backspace (Back) deletes digits and goes back when empty, q/ESC (cancel)",
+        "  (d) Delete a selected file or directory (confirmation required); the browser reloads after deletion.",
+        "ot - Open Terminal (Ctrl-] to exit)",
+    };
+    int n = sizeof(lines)/sizeof(lines[0]);
+    // join lines into a single snapshot string
+    int tot = 0; for (int i = 0; i < n; i++) tot += (int)strlen(lines[i]) + 1; // +1 for newline
+    char *s = malloc(tot + 1); if (!s) return; s[0] = '\0';
+    for (int i = 0; i < n; i++) { strcat(s, lines[i]); strcat(s, "\n"); }
+    struct Tab t = {0};
+    t.name = strdup("[Help]");
+    t.snapshot = strdup(s);
+    t.saved_snapshot = t.snapshot ? strdup(t.snapshot) : NULL;
+    t.cx = 0; t.cy = 0; t.row_offset = 0; t.col_offset = 0;
+    int idx = append_tab(t);
+    if (idx >= 0) switch_to_tab(idx);
+    free(s);
+}
+
+// Helper: case-insensitive directory-first sort for entries
+static int alphasort_entries(const void *a, const void *b) {
+    const char **pa = (const char **)a;
+    const char **pb = (const char **)b;
+    const char *A = *pa;
+    const char *B = *pb;
+    // put directories (ending with '/') before files
+    int da = (A[strlen(A)-1] == '/');
+    int db = (B[strlen(B)-1] == '/');
+    if (da != db) return db - da; // directories first
+    // case-insensitive compare
+    return strcasecmp(A, B);
+}
+
+// helper: open a file into the current editor window (push current buffer to a new tab)
+static void open_file_in_current_window(const char *fname) {
+    // push current file to new tab
+    push_current_to_tab_list();
+    // then open requested file into current editor (create if missing)
+    FILE *f = fopen(fname, "r");
+    if (!f) {
+        // prompt to create
+        char __tmpbuf[64]; int __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
+        if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
+        write(STDOUT_FILENO, "File not found. Create? (y/n) ", 28);
+        int resp = 0; while (1) { int k = readKey(); if (k == -1) continue; if (k=='y'||k=='Y') { resp='y'; break; } if (k=='n'||k=='N'||k==27) { resp='n'; break; } }
+        __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows); if (__tmpn>0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
+        if (resp != 'y') { snprintf(E.msg, sizeof(E.msg), "Open cancelled"); E.msg_time = time(NULL); return; }
+        free(E.filename); E.filename = strdup(fname); free(E.saved_snapshot); E.saved_snapshot = NULL; editorFreeRows(); editorAppendRow(""); save_snapshot(); snprintf(E.msg, sizeof(E.msg), "New file %s", fname); E.msg_time = time(NULL);
+    } else {
+        fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+        char *buf = malloc(sz + 1); if (buf) { fread(buf, 1, sz, f); buf[sz] = '\0'; load_buffer_from_string(buf); free(buf); free(E.filename); E.filename = strdup(fname); save_snapshot(); free(E.saved_snapshot); E.saved_snapshot = serialize_buffer(); snprintf(E.msg, sizeof(E.msg), "Opened %s", fname); E.msg_time = time(NULL); }
+        fclose(f);
+    }
+}
+
+// Non-destructive variant: open into current window without pushing current buffer to a new tab.
+static void open_file_in_current_window_no_push(const char *fname) {
+    FILE *f = fopen(fname, "r");
+    if (!f) {
+        // prompt to create
+        char __tmpbuf[64]; int __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
+        if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
+        write(STDOUT_FILENO, "File not found. Create? (y/n) ", 28);
+        int resp = 0; while (1) { int k = readKey(); if (k == -1) continue; if (k=='y'||k=='Y') { resp='y'; break; } if (k=='n'||k=='N'||k==27) { resp='n'; break; } }
+        __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows); if (__tmpn>0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
+        if (resp != 'y') { snprintf(E.msg, sizeof(E.msg), "Open cancelled"); E.msg_time = time(NULL); return; }
+        free(E.filename); E.filename = strdup(fname); free(E.saved_snapshot); E.saved_snapshot = NULL; editorFreeRows(); editorAppendRow(""); save_snapshot(); snprintf(E.msg, sizeof(E.msg), "New file %s", fname); E.msg_time = time(NULL);
+    } else {
+        fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+        char *buf = malloc(sz + 1); if (buf) { fread(buf, 1, sz, f); buf[sz] = '\0'; load_buffer_from_string(buf); free(buf); free(E.filename); E.filename = strdup(fname); save_snapshot(); free(E.saved_snapshot); E.saved_snapshot = serialize_buffer(); snprintf(E.msg, sizeof(E.msg), "Opened %s", fname); E.msg_time = time(NULL); }
+        fclose(f);
+    }
+}
+
+// helper: open a file into a new tab (append and switch)
+static void open_file_in_new_tab(const char *fname) {
+    // create a new tab with the requested file loaded into it
+    struct Tab t = {0};
+    t.name = strdup(fname);
+    // try to load file content into a temporary snapshot
+    FILE *f = fopen(fname, "r");
+    if (!f) {
+        // new empty buffer
+        t.snapshot = strdup("");
+        t.saved_snapshot = NULL;
+    } else {
+        fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+        char *buf = malloc(sz + 1);
+        if (buf) { fread(buf, 1, sz, f); buf[sz] = '\0'; t.snapshot = strdup(buf); free(buf); }
+        fclose(f);
+        t.saved_snapshot = t.snapshot ? strdup(t.snapshot) : NULL;
+    }
+    int idx = append_tab(t);
+    if (idx >= 0) switch_to_tab(idx);
+}
+
+static void show_file_browser(void) {
+    char **entries = NULL; int nentries = 0;
+    char cwd[512]; getcwd(cwd, sizeof(cwd));
+    // ensure other overlays (help) are hidden while browser is active
+    E.help_visible = 0;
+
+    /* directory history stack: dir_history[0] is the initial directory, top is dir_history[dh_count-1]
+     * When user enters a directory we push the new cwd; Backspace pops and returns to previous cwd.
+     */
+    char **dir_history = NULL; int dh_count = 0;
+    // push initial cwd
+    dir_history = realloc(dir_history, sizeof(char*) * (dh_count + 1)); if (dir_history) dir_history[dh_count++] = strdup(cwd);
+
+    // helper to (re)populate entries for current directory
+    auto_reload:
+    for (int i = 0; i < nentries; i++) { free(entries[i]); }
+    free(entries); entries = NULL; nentries = 0;
+    DIR *d = opendir(".");
+    if (!d) { snprintf(E.msg, sizeof(E.msg), "Cannot open dir: %s", strerror(errno)); E.msg_time = time(NULL); return; }
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (strcmp(de->d_name, ".") == 0) continue;
+        // include ".." to go up
+        char *name = NULL;
+        struct stat st;
+        if (stat(de->d_name, &st) == 0 && S_ISDIR(st.st_mode)) {
+            int l = strlen(de->d_name) + 2; name = malloc(l); snprintf(name, l, "%s/", de->d_name);
+        } else {
+            name = strdup(de->d_name);
+        }
+        if (!name) continue;
+        char **n = realloc(entries, sizeof(char*) * (nentries + 1)); if (!n) { free(name); continue; }
+        entries = n; entries[nentries++] = name;
+    }
+    closedir(d);
+    if (nentries == 0) { snprintf(E.msg, sizeof(E.msg), "(empty)"); E.msg_time = time(NULL); return; }
+    qsort(entries, nentries, sizeof(char*), alphasort_entries);
+
+    int page = 0;
+    char selbuf[32] = {0}; int selpos = 0;
+    while (1) {
+        /* if terminal was resized, update dimensions and recompute page size */
+        if (winch_received) { getWindowSize(); winch_received = 0; }
+        int page_size = E.screenrows - 8; if (page_size < 3) page_size = 3;
+
+        // clear underlying editor region (lines below status/tab) to avoid leftover artifacts
+        for (int _ln = 3; _ln <= E.screenrows - 1; _ln++) {
+            char __tmp[64]; int __n = snprintf(__tmp, sizeof(__tmp), "\x1b[%d;1H\x1b[2K", _ln);
+            if (__n > 0) write(STDOUT_FILENO, __tmp, (size_t)__n);
+        }
+        // draw overlay box
+        int total_pages = (nentries + page_size - 1) / page_size;
+        if (page >= total_pages) page = total_pages - 1;
+        int start = page * page_size; int end = start + page_size; if (end > nentries) end = nentries;
+        // compute maximum entry width
+        int maxn = 0;
+        for (int i = start; i < end; i++) { int l = (int)strlen(entries[i]); if (l > maxn) maxn = l; }
+        // number of entries on this page affects number column width
+        int entries_on_page = end - start;
+        int numDigits = (entries_on_page > 0) ? snprintf(NULL, 0, "%d", entries_on_page) : 1;
+        int local_prefix = numDigits + 3; // e.g. "NN) "
+        // compute box width/height ensuring it can contain the widest entry and prompt
+        int minBoxW = local_prefix + maxn + 4;
+        int boxw = minBoxW;
+        // help text for second line: use the explicit parenthetical labels the user requested
+        char promptBase[128]; snprintf(promptBase, sizeof(promptBase), "PgUp/PgDn (page), Backspace (Back), q/ESC (cancel)");
+        int promptBaseLen = (int)strlen(promptBase);
+        int required_prompt_len = promptBaseLen;
+        /* increase margin so the full prompt isn't clipped prematurely */
+        if (required_prompt_len + 12 > boxw) boxw = required_prompt_len + 12;
+        /*
+         * If there's more horizontal space available than the minimum required,
+         * prefer to use it so long paths/help text aren't unnecessarily
+         * truncated. This makes the overlay expand when the terminal is
+         * enlarged.
+         */
+        if (E.screencols - 2 > boxw) boxw = E.screencols - 2;
+        if (boxw > E.screencols - 2) boxw = E.screencols - 2; // still clamp as a safety
+        // add an extra line so we can render two prompt lines (selection + help)
+        int boxh = (end - start) + 5;
+        if (boxh > E.screenrows - 4) boxh = E.screenrows - 4;
+        int max_base = boxw - 6 - 1;
+        if (max_base < 0) max_base = 0;
+        int display_plen = (promptBaseLen > max_base) ? max_base : promptBaseLen;
+        int sx = 1; int sy = (E.screenrows - boxh) / 2; // left-align overlay so it covers editor gutter
+        // background -- clear the whole box region to avoid leftover artifacts
+        for (int y = 0; y < boxh; y++) {
+            char buf[128]; int ln = sy + y + 1;
+            int written = snprintf(buf, sizeof(buf), "\x1b[%d;%dH", ln, sx + 1);
+            if (written > 0) write(STDOUT_FILENO, buf, (size_t)written);
+            for (int x = 0; x < boxw; x++) write(STDOUT_FILENO, " ", 1);
+        }
+        // title (truncate if needed to fit)
+        {
+            char title[256]; int tn = snprintf(title, sizeof(title), "Files in %s (page %d/%d)", cwd, page+1, total_pages);
+            if (tn > boxw - 6) title[boxw - 6] = '\0';
+            char buf[256]; int ln = sy + 1; int col = sx + 3; int n = snprintf(buf, sizeof(buf), "\x1b[%d;%dH%s", ln, col, title);
+            if (n>0) write(STDOUT_FILENO, buf, (size_t)n);
+            // clear remaining title line to avoid leftover chars from previous frames
+            int title_len = (int)strlen(title);
+            int remaining = boxw - (col - sx) - title_len - 1; if (remaining > 0) { for (int _i = 0; _i < remaining; _i++) write(STDOUT_FILENO, " ", 1); }
+        }
+        // list entries (number column is aligned, and entry names are truncated to fit)
+        for (int i = start; i < end; i++) {
+            int idx = i - start; int ln = sy + 2 + idx; int col = sx + 3;
+            char numbuf[64]; int written = snprintf(numbuf, sizeof(numbuf), "\x1b[%d;%dH%*d) ", ln, col, numDigits, idx + 1);
+            if (written > 0) write(STDOUT_FILENO, numbuf, (size_t)written);
+            int nameCols = boxw - (col - sx) - (numDigits + 3);
+            if (nameCols < 1) nameCols = 1;
+            int is_dir = (entries[i][strlen(entries[i]) - 1] == '/');
+            // color directories green and files yellow
+            int lnwrite = (int)strlen(entries[i]); if (lnwrite > nameCols) lnwrite = nameCols;
+            if (is_dir) write(STDOUT_FILENO, "\x1b[32m", 5);
+            else write(STDOUT_FILENO, "\x1b[33m", 5);
+            write(STDOUT_FILENO, entries[i], (size_t)lnwrite);
+            // pad with spaces if the new name is shorter than the previous content
+            int pad = nameCols - lnwrite; if (pad > 0) { for (int _p = 0; _p < pad; _p++) write(STDOUT_FILENO, " ", 1); }
+            write(STDOUT_FILENO, "\x1b[39m", 5);
+        }
+        // prompt: two lines
+        // 1) selection line (label + current selection)
+        {
+            int ln = sy + boxh - 2; int col = sx + 3;
+            const char sel_label[] = "Select number: ";
+            // write label in red
+            char pbuf[256]; int n = snprintf(pbuf, sizeof(pbuf), "\x1b[%d;%dH\x1b[31m%s\x1b[39m", ln, col, sel_label);
+            if (n>0) write(STDOUT_FILENO, pbuf, (size_t)n);
+            // write selection (uncolored so typed digits are clear)
+            int write_col = col + (int)strlen(sel_label);
+            char sbuf[128]; int sn = snprintf(sbuf, sizeof(sbuf), "\x1b[%d;%dH%s", ln, write_col, selbuf);
+            if (sn>0) write(STDOUT_FILENO, sbuf, (size_t)sn);
+        }
+        // 2) help line (PgUp/PgDn, Backspace behavior, q to cancel)
+        {
+            int ln = sy + boxh - 1; int col = sx + 3;
+            int plen = display_plen;
+            char trunc[256]; strncpy(trunc, promptBase, plen); trunc[plen] = '\0';
+            char pbuf2[256]; int n2 = snprintf(pbuf2, sizeof(pbuf2), "\x1b[%d;%dH\x1b[31m%s\x1b[39m", ln, col, trunc);
+            if (n2>0) write(STDOUT_FILENO, pbuf2, (size_t)n2);
+        }
+        // move cursor to selection input area (on selection line)
+        char cur[64]; int crow = sy + boxh - 2;
+        int sel_label_len = (int)strlen("Select number: ");
+        int curcol = sx + 3 + sel_label_len + (int)strlen(selbuf);
+        if (curcol > sx + boxw - 2) curcol = sx + boxw - 2;
+        int m = snprintf(cur, sizeof(cur), "\x1b[%d;%dH", crow, curcol);
+        if (m>0) write(STDOUT_FILENO, cur, (size_t)m);
+
+        // read keys
+        int k = readKey(); if (k == -1) { continue; }
+        if (k == 27 || k == 'q' || k == 'Q') { snprintf(E.msg, sizeof(E.msg), "Browser cancelled"); E.msg_time = time(NULL); break; }
+        if (k == PAGE_DOWN) { if (page + 1 < total_pages) page++; selbuf[0] = '\0'; selpos = 0; continue; }
+        if (k == PAGE_UP) { if (page > 0) page--; selbuf[0] = '\0'; selpos = 0; continue; }
+        // Backspace now only deletes typed selection (if any); if nothing typed, behaves like go-back/cancel
+        if (k == 127 || k == 8) {
+            /* If there is a typed selection, delete a digit first (expected behavior).
+             * Otherwise, if we have a directory history, go back. If we're at the
+             * initial directory, do NOT immediately cancel on a single Backspace to
+             * avoid accidental closure; instead show a hint (press q to cancel).
+             */
+            if (selpos > 0) { selpos--; selbuf[selpos] = '\0'; continue; }
+            if (dh_count > 1) {
+                // pop current
+                free(dir_history[dh_count - 1]); dir_history[dh_count - 1] = NULL; dh_count--;
+                // chdir to previous
+                if (chdir(dir_history[dh_count - 1]) == 0) {
+                    getcwd(cwd, sizeof(cwd));
+                    // reset pagination and selection
+                    page = 0; selbuf[0] = '\0'; selpos = 0;
+                    goto auto_reload;
+                } else {
+                    snprintf(E.msg, sizeof(E.msg), "Chdir failed: %s", strerror(errno)); E.msg_time = time(NULL);
+                    selbuf[0] = '\0'; selpos = 0; continue;
+                }
+            } else {
+                /* At initial directory and no digits typed: show a hint instead of
+                 * cancelling immediately (prevents accidental closure).
+                 */
+                snprintf(E.msg, sizeof(E.msg), "Press q or Esc to cancel the browser"); E.msg_time = time(NULL);
+                continue;
+            }
+        }
+        if (k >= '0' && k <= '9') { if (selpos < (int)sizeof(selbuf)-2) { selbuf[selpos++] = (char)k; selbuf[selpos] = '\0'; } continue; }
+        if (k == '\r' || k == '\n') {
+            if (selpos == 0) continue;
+            int sel = atoi(selbuf); if (sel <= 0 || sel > (end - start)) { snprintf(E.msg, sizeof(E.msg), "Bad selection"); E.msg_time = time(NULL); selbuf[0] = '\0'; selpos = 0; continue; }
+            int selidx = start + sel - 1;
+            // if directory, chdir and reload
+            int is_dir = (entries[selidx][strlen(entries[selidx]) - 1] == '/');
+            if (is_dir) {
+                // directory selected: offer Open / Delete / Cancel
+                char tmp[512]; snprintf(tmp, sizeof(tmp), "%s", entries[selidx]); tmp[strlen(tmp)-1] = '\0';
+                char __tmpbuf[128]; int __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
+                if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
+                int pn = snprintf(__tmpbuf, sizeof(__tmpbuf), "Directory '%s': (o) Open / (d) Delete / (c) Cancel: ", tmp);
+                if (pn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)pn);
+                int dresp = 0;
+                while (1) {
+                    int kk = readKey(); if (kk == -1) continue;
+                    if (kk == 'o' || kk == 'O' || kk == '\r' || kk == '\n') { dresp = 'o'; break; }
+                    if (kk == 'd' || kk == 'D') { dresp = 'd'; break; }
+                    if (kk == 'c' || kk == 'C' || kk == 27) { dresp = 'c'; break; }
+                }
+                __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
+                if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
+                if (dresp == 'c') { snprintf(E.msg, sizeof(E.msg), "Browse cancelled"); E.msg_time = time(NULL); selbuf[0] = '\0'; selpos = 0; continue; }
+                if (dresp == 'o') {
+                    if (chdir(tmp) == 0) {
+                        getcwd(cwd, sizeof(cwd));
+                        char **nh = realloc(dir_history, sizeof(char*) * (dh_count + 1));
+                        if (nh) { dir_history = nh; dir_history[dh_count++] = strdup(cwd); }
+                        page = 0; selbuf[0] = '\0'; selpos = 0;
+                        goto auto_reload;
+                    } else {
+                        snprintf(E.msg, sizeof(E.msg), "Chdir failed: %s", strerror(errno)); E.msg_time = time(NULL); selbuf[0] = '\0'; selpos = 0; continue;
+                    }
+                }
+                if (dresp == 'd') {
+                    // confirm delete
+                    __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
+                    if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
+                    pn = snprintf(__tmpbuf, sizeof(__tmpbuf), "Delete directory '%s'? (y/N): ", tmp);
+                    if (pn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)pn);
+                    int y = 0; while (1) { int k2 = readKey(); if (k2 == -1) continue; if (k2=='y'||k2=='Y') { y = 1; break; } if (k2=='n'||k2=='N'||k2==27) { y = 0; break; } }
+                    __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
+                    if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
+                    if (!y) { snprintf(E.msg, sizeof(E.msg), "Delete cancelled"); E.msg_time = time(NULL); selbuf[0] = '\0'; selpos = 0; continue; }
+                    if (rmdir(tmp) == 0) {
+                        snprintf(E.msg, sizeof(E.msg), "Deleted directory %s", tmp);
+                    } else {
+                        snprintf(E.msg, sizeof(E.msg), "rmdir failed: %s", strerror(errno));
+                    }
+                    E.msg_time = time(NULL);
+                    selbuf[0] = '\0'; selpos = 0; goto auto_reload;
+                }
+            } else {
+                // prompt user whether to open in current window or in a new tab
+                char __tmpbuf[128]; int __tmpn;
+                /* Clear the last one or two lines before drawing the prompt */
+                if (E.screenrows > 1) __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K\x1b[%d;1H\x1b[K", E.screenrows - 1, E.screenrows);
+                else __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
+                if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
+                // determine whether current buffer is unsaved
+                int cur_unsaved = 0; char *curss_tmp = serialize_buffer(); if (curss_tmp) { if (!(E.saved_snapshot && strcmp(E.saved_snapshot, curss_tmp) == 0)) cur_unsaved = 1; free(curss_tmp); }
+                int pn;
+                /* Show the concise initial choices; defer save/discard confirmation until the user selects Current Tab. Include (d) Delete. */
+                if (cur_unsaved) pn = snprintf(__tmpbuf, sizeof(__tmpbuf), "Open '%s' as: (t) New Tab / (o) Current Tab / (d) Delete / (c) Cancel: ", entries[selidx]);
+                else pn = snprintf(__tmpbuf, sizeof(__tmpbuf), "Open '%s' as: (t) New Tab / (o) Current Tab / (d) Delete / (c) Cancel: ", entries[selidx]);
+                if (pn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)pn);
+                int resp = 0;
+                while (1) {
+                    int kk = readKey(); if (kk == -1) continue;
+                    if (kk == 't' || kk == 'T' || kk == 'n' || kk == 'N') { resp = 't'; break; }
+                    if (kk == 'o' || kk == 'O' || kk == '\r' || kk == '\n') { resp = 'o'; break; }
+                    if (kk == 'd' || kk == 'D') { resp = 'd'; break; }
+                    if (kk == 'c' || kk == 'C' || kk == 27) { resp = 'c'; break; }
+                }
+                // clear prompt line
+                __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
+                if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
+                if (resp == 'c') { snprintf(E.msg, sizeof(E.msg), "Open cancelled"); E.msg_time = time(NULL); selbuf[0] = '\0'; selpos = 0; continue; }
+                if (resp == 'd') {
+                    // confirm delete
+                    char __tmp2[128]; int __n2 = snprintf(__tmp2, sizeof(__tmp2), "\x1b[%d;1H\x1b[KDelete '%s'? (y/N): ", E.screenrows, entries[selidx]);
+                    if (__n2 > 0) write(STDOUT_FILENO, __tmp2, (size_t)__n2);
+                    int ok = 0; while (1) { int k2 = readKey(); if (k2 == -1) continue; if (k2=='y'||k2=='Y') { ok = 1; break; } if (k2=='n'||k2=='N'||k2==27) { ok = 0; break; } }
+                    __n2 = snprintf(__tmp2, sizeof(__tmp2), "\x1b[%d;1H\x1b[K", E.screenrows); if (__n2>0) write(STDOUT_FILENO, __tmp2, (size_t)__n2);
+                    if (!ok) { snprintf(E.msg, sizeof(E.msg), "Delete cancelled"); E.msg_time = time(NULL); selbuf[0] = '\0'; selpos = 0; continue; }
+                    // perform unlink
+                    if (access(entries[selidx], F_OK) == 0) {
+                        if (unlink(entries[selidx]) == 0) {
+                            // if we deleted the currently open file, switch similar to fn del
+                            if (E.filename && strcmp(E.filename, entries[selidx]) == 0) {
+                                if (NumTabs > 0) {
+                                    int target = NumTabs - 1;
+                                    if (switch_to_tab(target) == 0) {
+                                        snprintf(E.msg, sizeof(E.msg), "Deleted %s; switched to tab %d", entries[selidx], target+2);
+                                    } else {
+                                        free(E.filename); E.filename = NULL; editorFreeRows(); editorAppendRow(""); save_snapshot(); free(E.saved_snapshot); E.saved_snapshot = serialize_buffer(); snprintf(E.msg, sizeof(E.msg), "Deleted %s; opened empty buffer", entries[selidx]);
+                                    }
+                                } else {
+                                    free(E.filename); E.filename = NULL; editorFreeRows(); editorAppendRow(""); save_snapshot(); free(E.saved_snapshot); E.saved_snapshot = serialize_buffer(); snprintf(E.msg, sizeof(E.msg), "Deleted %s; opened empty buffer", entries[selidx]);
+                                }
+                            } else {
+                                snprintf(E.msg, sizeof(E.msg), "Deleted %s", entries[selidx]);
+                            }
+                        } else {
+                            snprintf(E.msg, sizeof(E.msg), "Delete failed: %s", strerror(errno));
+                        }
+                    } else {
+                        snprintf(E.msg, sizeof(E.msg), "No such file %s", entries[selidx]);
+                    }
+                    E.msg_time = time(NULL);
+                    selbuf[0] = '\0'; selpos = 0; goto auto_reload;
+                }
+                if (resp == 't') { open_file_in_new_tab(entries[selidx]); break; }
+                if (resp == 's') { save_to_file(NULL); open_file_in_current_window_no_push(entries[selidx]); break; }
+                // resp == 'o' -> open in current window; if unsaved, this will discard unsaved changes
+                if (resp == 'o') {
+                    if (cur_unsaved) {
+                        /* Ask for confirmation and offer save option to avoid accidental data loss */
+                        int __pn;
+                        if (E.screenrows > 3) {
+                            /* four-line layout: message + three option lines */
+                            __pn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K\x1b[1mCurrent file has unsaved changes:\x1b[0m", E.screenrows - 3);
+                            if (__pn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__pn);
+                            __pn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K(s) \x1b[32mSave changes and open file\x1b[0m", E.screenrows - 2);
+                            if (__pn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__pn);
+                            __pn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K(d) \x1b[31mDiscard unsaved changes and open file\x1b[0m", E.screenrows - 1);
+                            if (__pn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__pn);
+                            __pn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K(c) \x1b[33mCancel\x1b[0m", E.screenrows);
+                            if (__pn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__pn);
+                        } else if (E.screenrows > 1) {
+                            /* two-line fallback */
+                            __pn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K\x1b[1mCurrent file has unsaved changes:\x1b[0m", E.screenrows - 1);
+                            if (__pn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__pn);
+                            __pn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K(s) \x1b[32mSave changes and open file\x1b[0m / (d) \x1b[31mDiscard unsaved changes and open file\x1b[0m / (c) \x1b[33mCancel\x1b[0m", E.screenrows);
+                            if (__pn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__pn);
+                        } else {
+                            /* single-line fallback */
+                            __pn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[KCurrent file has unsaved changes. (s) Save changes and open file / (d) Discard unsaved changes and open file / (c) Cancel: ", E.screenrows);
+                            if (__pn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__pn);
+                        }
+                        int __r = 0;
+                        while (1) {
+                            int __kk = readKey(); if (__kk == -1) continue;
+                            if (__kk == 's' || __kk == 'S') { __r = 's'; break; }
+                            if (__kk == 'd' || __kk == 'D' || __kk == '\r' || __kk == '\n') { __r = 'd'; break; }
+                            if (__kk == 'c' || __kk == 'C' || __kk == 27) { __r = 'c'; break; }
+                        }
+                        if (E.screenrows > 3) __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K\x1b[%d;1H\x1b[K\x1b[%d;1H\x1b[K\x1b[%d;1H\x1b[K", E.screenrows - 3, E.screenrows - 2, E.screenrows - 1, E.screenrows);
+                        else if (E.screenrows > 1) __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K\x1b[%d;1H\x1b[K", E.screenrows - 1, E.screenrows);
+                        else __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
+                        if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
+                        if (__r == 'c') { snprintf(E.msg, sizeof(E.msg), "Open cancelled"); E.msg_time = time(NULL); selbuf[0] = '\0'; selpos = 0; continue; }
+                        if (__r == 's') { save_to_file(NULL); open_file_in_current_window_no_push(entries[selidx]); break; }
+                        /* fallthrough for confirmed discard */
+                    }
+                    open_file_in_current_window_no_push(entries[selidx]);
+                    break;
+                }
+                break;
+            }
+        }
+        // any other key resets selection buffer
+        selbuf[0] = '\0'; selpos = 0;
+    }
+    for (int i = 0; i < nentries; i++) { free(entries[i]); }
+    free(entries); entries = NULL; nentries = 0;
+    // free directory history
+    if (dir_history) {
+        for (int i = 0; i < dh_count; i++) { free(dir_history[i]); }
+        free(dir_history); dir_history = NULL; dh_count = 0;
+    }
+    // redraw editor
+    editorRefreshScreen();
+}
+
+
+static void editorRefreshScreen(void) {
+    // clear and redraw
+    write(STDOUT_FILENO, "\x1b[?25l", 6); // hide cursor
+    write(STDOUT_FILENO, "\x1b[H", 3); // move to top-left
+
+    // Status bar (fixed top row)
+    int content_rows = E.screenrows - 1; // reserve status
+    if (content_rows < 1) content_rows = 1;
+
+    // Optionally render a tab bar below the status row
+    if (conf.show_tab_bar) {
+        // build and render a simple tab bar: current buffer followed by saved tabs
+        // format: [*]name  [1]name  [2]name ... where the active entry is reverse-video
+        int remaining = E.screencols;
+        // render current buffer first (active when CurTab == -1)
+        const char *cname = E.filename ? E.filename : "(No Name)";
+        // detect unsaved for current buffer by comparing saved snapshot
+        int cur_unsaved = 0;
+        {
+            char *curss = serialize_buffer();
+            if (curss) {
+                if (!(E.saved_snapshot && strcmp(E.saved_snapshot, curss) == 0)) cur_unsaved = 1;
+                free(curss);
+            }
+        }
+        int cur_num = 1;
+        int cur_num_digits = snprintf(NULL, 0, "%d", cur_num);
+        int need = (cur_num_digits + 2) + (int)strlen(cname) + (cur_unsaved ? 1 : 0) + 1; // [N]name[*]
+        if (need > remaining) {
+            // write truncated prefix (no coloring when truncated)
+            char pfx[32]; int pn = snprintf(pfx, sizeof(pfx), "[%d]", cur_num);
+            if (pn > remaining) write(STDOUT_FILENO, pfx, remaining);
+            else {
+                if (CurTab == -1) write(STDOUT_FILENO, "\x1b[7m", 4);
+                write(STDOUT_FILENO, pfx, pn);
+                int can = remaining - pn;
+                if (can > 0) write(STDOUT_FILENO, cname, can);
+                if (CurTab == -1) write(STDOUT_FILENO, "\x1b[m", 3);
+            }
+            remaining = 0;
+        } else {
+            if (CurTab == -1) write(STDOUT_FILENO, "\x1b[7m", 4); // reverse for active
+            // write [1] with yellow '1'
+            write(STDOUT_FILENO, "[", 1);
+            write(STDOUT_FILENO, "\x1b[33m", 5);
+            write(STDOUT_FILENO, "1", 1);
+            write(STDOUT_FILENO, "\x1b[39m", 5);
+            write(STDOUT_FILENO, "]", 1);
+            write(STDOUT_FILENO, cname, strlen(cname));
+            if (cur_unsaved) write(STDOUT_FILENO, "\x1b[31m*\x1b[39m", 9);
+            write(STDOUT_FILENO, " ", 1);
+            if (CurTab == -1) write(STDOUT_FILENO, "\x1b[m", 3);
+            remaining -= need;
+        }
+        // render stored tabs with colored numbers and unsaved marker
+        for (int t = 0; t < NumTabs && remaining > 0; t++) {
+            const char *tname = Tabs[t].name ? Tabs[t].name : "(No Name)";
+            int namelen = (int)strlen(tname);
+            int unsaved = 0;
+            if (Tabs[t].saved_snapshot && Tabs[t].snapshot) {
+                unsaved = (strcmp(Tabs[t].saved_snapshot, Tabs[t].snapshot) != 0);
+            } else if (Tabs[t].saved_snapshot == NULL && Tabs[t].snapshot) {
+                unsaved = 1; // unknown or unsaved
+            }
+            // displayed length: [N]name[*] and space (compute digits properly)
+            int displayed_num = t + 2;
+            int num_digits = snprintf(NULL, 0, "%d", displayed_num);
+            int blen = (num_digits + 2) + namelen + (unsaved ? 1 : 0) + 1;
+            if (blen > remaining) {
+                // partial write: write as much of the name/prefix as fits
+                // write prefix [N]
+                char pfx[32]; int pn = snprintf(pfx, sizeof(pfx), "[%d]", displayed_num);
+                int to_write = remaining;
+                if (to_write > pn) {
+                    write(STDOUT_FILENO, pfx, pn); to_write -= pn;
+                    // write part of name
+                    write(STDOUT_FILENO, tname, to_write);
+                } else {
+                    // even prefix doesn't fit; write trimmed prefix
+                    write(STDOUT_FILENO, pfx, to_write);
+                }
+                remaining = 0; break;
+            }
+            if (t == CurTab) write(STDOUT_FILENO, "\x1b[7m", 4);
+            // write opening bracket
+            write(STDOUT_FILENO, "[", 1);
+            // write number in yellow
+            char numbuf[16]; int nn = snprintf(numbuf, sizeof(numbuf), "%d", t+2);
+            write(STDOUT_FILENO, "\x1b[33m", 5);
+            write(STDOUT_FILENO, numbuf, nn);
+            write(STDOUT_FILENO, "\x1b[39m", 5);
+            // closing bracket
+            write(STDOUT_FILENO, "]", 1);
+            // write name
+            write(STDOUT_FILENO, tname, namelen);
+            // unsaved marker in red
+            if (unsaved) { write(STDOUT_FILENO, "\x1b[31m*\x1b[39m", 9); }
+            // trailing space
+            write(STDOUT_FILENO, " ", 1);
+            if (t == CurTab) write(STDOUT_FILENO, "\x1b[m", 3);
+            remaining -= blen;
+        }
+        // fill rest of line with spaces and newline
+        for (int i = 0; i < remaining; i++) write(STDOUT_FILENO, " ", 1);
+        write(STDOUT_FILENO, "\r\n", 2);
+        // reduce content rows available by 1
+        content_rows = E.screenrows - 2; if (content_rows < 1) content_rows = 1;
+    }
+    char status[256];
+    /* show filename (or No Name) and saved/unsaved marker */
+    const char *name = E.filename ? E.filename : "No Name";
+    char save_mark[16] = "";
+    if (!E.saved_snapshot) {
+        snprintf(save_mark, sizeof(save_mark), " (unsaved)");
+    } else {
+        char *curss = serialize_buffer();
+        if (curss) {
+            if (strcmp(curss, E.saved_snapshot) == 0) snprintf(save_mark, sizeof(save_mark), " (saved)");
+            else snprintf(save_mark, sizeof(save_mark), " (unsaved)");
+            free(curss);
+        } else {
+            snprintf(save_mark, sizeof(save_mark), " (unsaved)");
+        }
+    }
+    int nleft = snprintf(status, sizeof(status), "%s%s - %d lines", name, save_mark, E.numrows);
+    char rstatus[64];
+    int visible = E.numrows - E.row_offset;
+    if (visible > content_rows) visible = content_rows;
+    if (visible < 0) visible = 0;
+    int nr = snprintf(rstatus, sizeof(rstatus), "Ln %d, Col %d", E.cy + 1, E.cx + 1);
+    /* if there's a recent transient message, show it on the right side for visibility */
+    time_t now = time(NULL);
+    if (E.msg_time && now - E.msg_time < 5) {
+        nr = snprintf(rstatus, sizeof(rstatus), "%s", E.msg);
+    }
+    // compose status with padding to full width
+    int total = E.screencols;
+    if (nleft + nr >= total) {
+        // truncate left if needed
+        status[total - nr - 1] = '\0';
+        nleft = (int)strlen(status);
+    }
+    // build mode text and optionally command buffer (displayed next to mode in view)
+    const char *mode_base = (E.mode == MODE_VIEW) ? "VIEW MODE" : "EDIT MODE";
+    char mode_text[256];
+    int mode_len = 0;
+    if (E.mode == MODE_VIEW && E.command_len > 0) {
+        // display command next to mode, prefixed with ':'
+        snprintf(mode_text, sizeof(mode_text), "%s :%s", mode_base, E.command_buf);
+    } else {
+        snprintf(mode_text, sizeof(mode_text), "%s", mode_base);
+    }
+    mode_len = (int)strlen(mode_text);
+
+    // available space between left and right
+    int available = total - nleft - nr;
+    if (available < 0) available = 0;
+
+    int left_pad = 0, right_pad = 0;
+    if (available > mode_len) {
+        int extra = available - mode_len;
+        left_pad = extra / 2;
+        right_pad = extra - left_pad;
+    } else {
+        // not enough space to show full mode text; truncate
+        mode_len = available;
+    }
+
+    write(STDOUT_FILENO, "\x1b[7m", 4);
+    // left part
+    write(STDOUT_FILENO, status, nleft);
+    // left padding
+    for (int i = 0; i < left_pad; i++) write(STDOUT_FILENO, " ", 1);
+    // mode text (possibly truncated). If view mode with command, color the command portion.
+    if (E.mode == MODE_VIEW && E.command_len > 0) {
+        // find ':' position
+        char *colpos = strchr(mode_text, ':');
+        if (colpos != NULL) {
+            int head_len = (int)(colpos - mode_text);
+            if (head_len > mode_len) head_len = mode_len;
+            // write mode base
+            if (head_len > 0) write(STDOUT_FILENO, mode_text, head_len);
+            // write command in reverse video + yellow (inside reverse video it's still visible)
+            int cmd_len = mode_len - head_len;
+            if (cmd_len > 0) {
+                // color with ANSI yellow while still reverse-video
+                write(STDOUT_FILENO, "\x1b[33m", 5);
+                write(STDOUT_FILENO, colpos, cmd_len);
+                write(STDOUT_FILENO, "\x1b[39m", 5);
+            }
+        } else {
+            write(STDOUT_FILENO, mode_text, mode_len);
+        }
+    } else {
+        if (mode_len > 0) write(STDOUT_FILENO, mode_text, mode_len);
+    }
+
+    // right padding
+    for (int i = 0; i < right_pad; i++) write(STDOUT_FILENO, " ", 1);
+    // right part
+    write(STDOUT_FILENO, rstatus, nr);
+    write(STDOUT_FILENO, "\x1b[m", 3);
+    write(STDOUT_FILENO, "\r\n", 2);
+
+
+    // compute width for line numbers (based on visible content rows)
+    int total_lines = (E.numrows > content_rows) ? E.numrows : content_rows;
+    int ln_width = snprintf(NULL, 0, "%d", total_lines);
+    if (ln_width < 1) ln_width = 1;
+    int prefix_len = ln_width + 3; // "%*d | " -> number + space + '|' + space
+
+    // make sure row_offset is valid
+    if (E.row_offset < 0) E.row_offset = 0;
+    if (E.row_offset > E.numrows) E.row_offset = E.numrows;
+
+    for (int y = 0; y < content_rows; y++) {
+        int filerow = y + E.row_offset;
+        char linebuf[64];
+        if (filerow < E.numrows) {
+            // print line number prefix for existing rows
+            int n = snprintf(linebuf, sizeof(linebuf), "%*d | ", ln_width, filerow + 1);
+            if (n > 0) write(STDOUT_FILENO, linebuf, (size_t)n);
+
+            int avail = E.screencols - prefix_len;
+            if (avail < 0) avail = 0;
+            // respect horizontal offset
+            int rlen = (int)strlen(E.rows[filerow]);
+            int start = (E.col_offset < rlen) ? E.col_offset : rlen;
+            int len = rlen - start;
+            if (len > avail) len = avail;
+            if (len > 0) write(STDOUT_FILENO, E.rows[filerow] + start, len);
+        } else {
+            // print blank gutter for non-existing rows, then a ~ marker
+            int n = snprintf(linebuf, sizeof(linebuf), "%*s | ", ln_width, "");
+            if (n > 0) write(STDOUT_FILENO, linebuf, (size_t)n);
+            write(STDOUT_FILENO, "~", 1);
+        }
+
+        write(STDOUT_FILENO, "\x1b[K", 3); // clear to end of line
+        if (y < content_rows - 1) write(STDOUT_FILENO, "\r\n", 2);
+    }
+
+    // If help overlay is visible, draw it on top and return
+    if (E.help_visible) {
+        draw_help_overlay();
+        return;
+    }
+
+    // If file browser overlay visible, draw it on top and return
+    // (drawn by show_file_browser when active)
+    // if (E.browser_visible) { draw_file_browser(); return; }
+
+
+    // position cursor (account for line-number prefix and horizontal offset)
+    char buf[64];
+    int base_row = conf.show_tab_bar ? 3 : 2;
+    int screen_r = (E.cy - E.row_offset) + base_row; // base_row accounts for status (+tab if enabled)
+    if (screen_r < base_row) screen_r = base_row;
+    if (screen_r > E.screenrows) screen_r = E.screenrows;
+    int c = E.cx - E.col_offset + 1 + prefix_len; // 1-indexed column plus prefix, minus offset
+    if (c < prefix_len + 1) c = prefix_len + 1;
+    if (c > E.screencols) c = E.screencols;
+    int n = snprintf(buf, sizeof(buf), "\x1b[%d;%dH\x1b[?25h", screen_r, c);
+    if (n > 0) write(STDOUT_FILENO, buf, (size_t)n);
+}
+
+static void editorProcessKeypress(void) {
+    int c = readKey();
+    if (c == -1) return;
+    if (c == 17) { // Ctrl-Q to quit
+        // clear screen before exit
+        // remove swap file if present
+        if (E.filename) {
+            char *base = strrchr(E.filename, '/');
+            const char *b = base ? base + 1 : E.filename;
+            char swapbuf[1024];
+            if (base) snprintf(swapbuf, sizeof(swapbuf), "%.*s/.%s.swp", (int)(base - E.filename), E.filename, b);
+            else snprintf(swapbuf, sizeof(swapbuf), ".%s.swp", b);
+            unlink(swapbuf);
+        }
+        write(STDOUT_FILENO, "\x1b[2J", 4);
+        write(STDOUT_FILENO, "\x1b[H", 3);
+        exit(0);
+    }
+
+    // Handle lone Escape: toggle help or mode. We already parse escape sequences
+    // in readKey(), so c==27 here is a lone ESC key.
+    if (c == 27) {
+        if (E.help_visible) {
+            E.help_visible = 0;
+        } else {
+            // Toggle mode
+            if (E.mode == MODE_VIEW) {
+                E.mode = MODE_EDIT;
+                // snapshot before editing
+                save_snapshot();
+            } else E.mode = MODE_VIEW;
+            // Clear command buffer when leaving view mode
+            E.command_len = 0;
+            E.command_buf[0] = '\0';
+        }
+        return;
+    }
+
+    // Navigation keys - work in both modes
+    if (c == ARROW_UP) {
+        if (E.cy > 0) {
+            E.cy--;
+            int rowlen = strlen(E.rows[E.cy]);
+            if (E.cx > rowlen) E.cx = rowlen;
+        }
+        E.last_edit_kind = EDIT_KIND_NONE;
+        editorScroll();
+        return;
+    }
+    if (c == ARROW_DOWN) {
+        if (E.cy + 1 < E.numrows) {
+            E.cy++;
+            int rowlen = strlen(E.rows[E.cy]);
+            if (E.cx > rowlen) E.cx = rowlen;
+        }
+        E.last_edit_kind = EDIT_KIND_NONE;
+        editorScroll();
+        return;
+    }
+    if (c == ARROW_LEFT) {
+        if (E.cx > 0) {
+            E.cx--;
+        } else if (E.cy > 0) {
+            E.cy--;
+            E.cx = strlen(E.rows[E.cy]);
+            E.last_edit_kind = EDIT_KIND_NONE;
+        }
+        editorScroll();
+        return;
+    }
+    if (c == ARROW_RIGHT) {
+        int rowlen = (E.cy < E.numrows) ? (int)strlen(E.rows[E.cy]) : 0;
+        if (E.cx < rowlen) {
+            E.cx++;
+        } else if (E.cy + 1 < E.numrows) {
+            E.cy++;
+            E.cx = 0;
+            E.last_edit_kind = EDIT_KIND_NONE;
+        }
+        editorScroll();
+        return;
+    }
+    if (c == HOME_KEY) { E.cx = 0; E.last_edit_kind = EDIT_KIND_NONE; editorScroll(); return; }
+    if (c == END_KEY) { if (E.cy < E.numrows) E.cx = strlen(E.rows[E.cy]); E.last_edit_kind = EDIT_KIND_NONE; editorScroll(); return; }
+    if (c == PAGE_UP) {
+        int times = E.screenrows - 2;
+        while (times-- && E.cy > 0) E.cy--;
+        int rowlen = strlen(E.rows[E.cy]);
+        if (E.cx > rowlen) E.cx = rowlen;
+        E.last_edit_kind = EDIT_KIND_NONE;
+        editorScroll();
+        return;
+    }
+    if (c == PAGE_DOWN) {
+        int times = E.screenrows - 2;
+        while (times-- && E.cy + 1 < E.numrows) E.cy++;
+        int rowlen2 = strlen(E.rows[E.cy]);
+        if (E.cx > rowlen2) E.cx = rowlen2;
+        E.last_edit_kind = EDIT_KIND_NONE;
+        editorScroll();
+        return;
+    }
+
+    // Mode-aware handling
+    if (E.mode == MODE_EDIT) {
+        if (c == 127 || c == 8) { // backspace
+            editorDelChar();
+            editorScroll();
+        } else if (c == '\r' || c == '\n') {
+            // auto-indent/newline to be implemented later; currently simple insert
+            editorInsertNewline();
+            editorScroll();
+        } else if (c == '\t') {
+            // Tab: insert either real tab or configured number of spaces
+            if (conf.use_tabs) {
+                editorInsertChar('\t');
+            } else {
+                for (int k = 0; k < conf.indent_size; k++) editorInsertChar(' ');
+            }
+            editorScroll();
+        } else if (isprint(c)) {
+            // auto-dedent for closing brace when at line start
+            if (c == '}') {
+                char *row = E.rows[E.cy];
+                int rlen = strlen(row);
+                int onlyws = 1;
+                for (int i = 0; i < E.cx; i++) { if (row[i] != ' ' && row[i] != '\t') { onlyws = 0; break; } }
+                if (onlyws) {
+                    // Find matching open brace by scanning backwards and tracking balance, ignoring braces in strings
+                    int match_row = -1;
+                    int balance = 0;
+                    int in_string = 0;
+                    for (int r = E.cy; r >= 0 && match_row == -1; r--) {
+                        int endcol = (r == E.cy) ? E.cx - 1 : (int)strlen(E.rows[r]) - 1;
+                        for (int col = endcol; col >= 0; col--) {
+                            char ch = E.rows[r][col];
+                            if (ch == '"' || ch == '\'') {
+                                in_string = !in_string;
+                                continue;
+                            }
+                            if (in_string) continue;
+                            if (ch == '}') balance++;
+                            else if (ch == '{') {
+                                if (balance == 0) { match_row = r; break; }
+                                balance--;
+                            }
+                        }
+                    }
+                    int new_indent;
+                    if (match_row != -1) {
+                        new_indent = compute_leading_spaces(E.rows[match_row]);
+                    } else {
+                        int cur_indent = compute_leading_spaces(row);
+                        new_indent = cur_indent - conf.indent_size;
+                        if (new_indent < 0) new_indent = 0;
+                    }
+                    char *ind = make_indent_string(new_indent);
+                    if (ind) {
+                        int first_non = 0; while (first_non < rlen && (row[first_non] == ' ' || row[first_non] == '\t')) first_non++;
+                        int newlen = strlen(ind) + (rlen - first_non);
+                        char *newrow = malloc(newlen + 1);
+                        if (newrow) {
+                            strcpy(newrow, ind);
+                            strcpy(newrow + strlen(ind), row + first_non);
+                            free(E.rows[E.cy]); E.rows[E.cy] = newrow;
+                            E.cx = strlen(ind);
+                        }
+                        free(ind);
+                    }
+                }
+                editorInsertChar('}');
+                editorScroll();
+            } else if (c == '(' || c == '[' || c == '"' || c == '\'') {
+                // insert pair for parens, quotes, brackets
+                editorInsertChar(c);
+                char pair = (c == '(') ? ')' : (c == '[') ? ']' : c;
+                editorInsertChar(pair);
+                // move cursor back between them
+                E.cx--;
+            } else if (c == '{') {
+                // VSCode-like behaviour: when typing '{' after a statement, auto-insert a newline,
+                // an indented inner line, and a closing '}' aligned with the statement start.
+                // Insert the '{', split the line, let editorInsertNewline compute inner indent,
+                // then insert a closing '}' row below aligned to the statement.
+                editorInsertChar('{');
+                // split into new indented inner row
+                editorInsertNewline();
+                // compute indent of the statement line (the line with the opening '{')
+                int stmt_row = E.cy - 1;
+                if (stmt_row < 0) stmt_row = 0;
+                int clos_indent = compute_leading_spaces(E.rows[stmt_row]);
+                char *clos_ind = make_indent_string(clos_indent);
+                if (clos_ind) {
+                    size_t blen = strlen(clos_ind) + 2; // indent + '}' + NUL
+                    char *clos_row = malloc(blen);
+                    if (clos_row) {
+                        strcpy(clos_row, clos_ind);
+                        strcat(clos_row, "}");
+                        editorInsertRow(E.cy + 1, clos_row);
+                        free(clos_row);
+                    }
+                    free(clos_ind);
+                }
+                // position cursor on the indented inner line
+                editorScroll();
+            } else {
+                editorInsertChar(c);
+            }
+        }
+    } else { // MODE_VIEW
+        // If help overlay visible
+        if (E.help_visible) {
+            if (c == 27 || c == '?') {
+                E.help_visible = 0;
+            }
+            return;
+        }
+
+        // handle view-mode input: command buffer
+        if (c == '?') {
+            E.help_visible = 1;
+            return;
+        }
+        if (c == '\r' || c == '\n') {
+            // execute command in buffer
+            if (E.command_len > 0) {
+                // null-terminate and process
+                E.command_buf[E.command_len] = '\0';
+                execute_command(E.command_buf);
+            }
+            E.command_len = 0;
+            E.command_buf[0] = '\0';
+            return;
+        }
+        if (c == 127 || c == 8) { // backspace in command buffer
+            if (E.command_len > 0) {
+                E.command_len--;
+                E.command_buf[E.command_len] = '\0';
+            }
+            return;
+        }
+        if (c == 27) { // ESC toggles to edit mode
+            E.mode = MODE_EDIT;
+            return;
+        }
+        if (isprint(c)) {
+            if (E.command_len + 1 < (int)sizeof(E.command_buf)) {
+                E.command_buf[E.command_len++] = (char)c;
+                E.command_buf[E.command_len] = '\0';
+            }
+        }
+    }
+}
+
+static void initEditor(void) {
+    // load user config early
+    load_config();
+
+    E.cx = 0; E.cy = 0; E.numrows = 0; E.rows = NULL; E.row_offset = 0; E.col_offset = 0;
+    E.mode = MODE_VIEW;
+    E.command_len = 0;
+    E.command_buf[0] = '\0';
+    E.help_visible = 0;
+    E.history = NULL;
+    E.history_count = 0;
+    E.history_idx = -1;
+    E.clipboard = NULL;
+    E.batching = 0;
+    E.saved_snapshot = NULL;
+    E.filename = NULL;
+    E.last_edit_kind = EDIT_KIND_NONE;
+    E.last_edit_time_ms = 0;
+    getWindowSize();
+    // start with one empty line
+    editorAppendRow("");
+    // initial snapshot
+    save_snapshot();
+    // consider this initial state as saved (no unsaved changes)
+    free(E.saved_snapshot);
+    E.saved_snapshot = serialize_buffer();
+}
+
+int main(int argc, char **argv) {
+    enableRawMode();
+
+    /* register terminate signals to ensure terminal is restored */
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = handle_terminate_signal;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGHUP, &sa, NULL);
+    sigaction(SIGQUIT, &sa, NULL);
+    /* handle terminal resize */
+    struct sigaction ws;
+    memset(&ws, 0, sizeof(ws));
+    ws.sa_handler = handle_sigwinch;
+    sigaction(SIGWINCH, &ws, NULL);
+
+    initEditor();
+
+    // If a filename is provided on the command line, open or create it
+    if (argc > 1 && argv[1]) {
+        const char *fn = argv[1];
+        FILE *f = fopen(fn, "r");
+        if (!f) {
+            // create empty buffer and set filename (file not created on disk until save)
+            free(E.filename);
+            E.filename = strdup(fn);
+            editorFreeRows(); editorAppendRow("");
+            save_snapshot();
+            free(E.saved_snapshot); E.saved_snapshot = NULL;
+            snprintf(E.msg, sizeof(E.msg), "New file %s", fn); E.msg_time = time(NULL);
+        } else {
+            fseek(f, 0, SEEK_END);
+            long sz = ftell(f); fseek(f, 0, SEEK_SET);
+            char *buf = malloc(sz + 1);
+            if (buf) {
+                fread(buf, 1, sz, f);
+                buf[sz] = '\0';
+                load_buffer_from_string(buf);
+                free(buf);
+                free(E.filename);
+                E.filename = strdup(fn);
+                save_snapshot();
+                free(E.saved_snapshot); E.saved_snapshot = serialize_buffer();
+                snprintf(E.msg, sizeof(E.msg), "Opened %s", fn); E.msg_time = time(NULL);
+            }
+            fclose(f);
+        }
+    }
+
+    while (1) {
+        if (winch_received) { getWindowSize(); winch_received = 0; }
+        editorRefreshScreen();
+        editorProcessKeypress();
+    }
+    editorFreeRows();
+    return 0;
+}

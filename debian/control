@@ -1,0 +1,13 @@
+Source: jed
+Section: editors
+Priority: optional
+Maintainer: wewantgreatness <wewantgreatness@example.com>
+Build-Depends: debhelper (>= 13)
+Standards-Version: 4.6.1
+Rules-Requires-Root: no
+
+Package: jed
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: JEDJMON Hans Editor - minimal modal terminal editor
+ A small terminal modal editor with simple commands and swap-file recovery.

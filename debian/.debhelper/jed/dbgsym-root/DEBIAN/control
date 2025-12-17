@@ -1,0 +1,13 @@
+Package: jed-dbgsym
+Package-Type: ddeb
+Source: jed
+Version: 0.1-1
+Auto-Built-Package: debug-symbols
+Architecture: amd64
+Maintainer: wewantgreatness <wewantgreatness@example.com>
+Installed-Size: 18
+Depends: jed (= 0.1-1)
+Section: debug
+Priority: optional
+Description: debug symbols for jed
+Build-Ids: 653b52e31cf6812d9bd06047761d27fe4c3f4fd3
