@@ -6,7 +6,7 @@ MANDIR ?= $(PREFIX)/share/man/man1
 CC = gcc
 CFLAGS = -std=c99 -Wall -Wextra -O2
 TARGET = editor_min
-SRC = editor_min.c
+SRC = editor_min.c highlight.c include_classifier.c keyword_highlight/generated_index.c
 
 all: $(TARGET)
 
