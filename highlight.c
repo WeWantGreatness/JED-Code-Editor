@@ -67,11 +67,37 @@ int set_language(const char *lang) {
 #define C_SYMBOL "\x1b[97m"        /* bright white */
 /* Newline color */
 #define C_NEWLINE "\x1b[90m"        /* dim */
+/* Escape sequences in strings */
+#define C_ESCAPE "\x1b[97m"        /* bright white */
+/* Format specifiers */
+#define C_FORMAT "\x1b[91m"        /* bright red */
 
-static int is_in_list(const char *s, const char *arr[]) {
-    if (!arr) return 0;
-    for (int i = 0; arr[i]; i++) if (strcmp(s, arr[i]) == 0) return 1;
-    return 0;
+static int tokenize_string(const char *line, size_t line_offset, const char *str, size_t str_len, struct HLToken *tokens, int max_tokens, int *tcount) {
+    size_t pos = 0;
+    while (pos < str_len && *tcount < max_tokens) {
+        if (str[pos] == '\\' && pos + 1 < str_len) {
+            /* escape sequence */
+            size_t esc_len = 2;
+            if (str[pos+1] == 'n') {
+                tokens[(*tcount)++] = (struct HLToken){HL_ESCAPE, line_offset + (str - line) + pos, esc_len};
+            } else {
+                tokens[(*tcount)++] = (struct HLToken){HL_STRING, line_offset + (str - line) + pos, esc_len};
+            }
+            pos += esc_len;
+        } else if (str[pos] == '%') {
+            /* format specifier */
+            tokens[(*tcount)++] = (struct HLToken){HL_FORMAT, line_offset + (str - line) + pos, 1};
+            pos++;
+        } else {
+            /* find next special char */
+            size_t start = pos;
+            while (pos < str_len && str[pos] != '\\' && str[pos] != '%') pos++;
+            if (pos > start) {
+                tokens[(*tcount)++] = (struct HLToken){HL_STRING, line_offset + (str - line) + start, pos - start};
+            }
+        }
+    }
+    return *tcount;
 }
 
 /* No default language is selected at startup. The editor should call
@@ -135,7 +161,7 @@ int highlight_line_state(const char *line, struct HLToken *tokens, int max_token
             else q++;
         }
         size_t len = (size_t)(q - p);
-        tokens[tcount++] = (struct HLToken){HL_STRING, (size_t)(p - line), len};
+        tokenize_string(line, 0, p, len, tokens, max_tokens, &tcount);
         if (q < end && *q == qch) state->in_string = 0;
         p = q;
     }
@@ -223,7 +249,7 @@ int highlight_line_state(const char *line, struct HLToken *tokens, int max_token
                 else q++;
             }
             size_t len = (size_t)(q - p);
-            tokens[tcount++] = (struct HLToken){HL_STRING, (size_t)(p - line), len};
+            tokenize_string(line, 0, p, len, tokens, max_tokens, &tcount);
             if (q >= end && state) { state->in_string = 1; state->quote = qch; }
             p = q;
             continue;
@@ -305,6 +331,8 @@ void colorize_line(const char *line) {
             case HL_PREPROC: col = C_PREPROC; break;
             case HL_FUNCTION: col = C_FUNCTION; break;
             case HL_SYMBOL: col = C_SYMBOL; break;
+            case HL_ESCAPE: col = C_ESCAPE; break;
+            case HL_FORMAT: col = C_FORMAT; break;
             default: col = C_RESET; break;
         }
         printf("%s", col);

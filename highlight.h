@@ -24,6 +24,8 @@ enum HLType {
     HL_SYMBOL,
     HL_NEWLINE,
     HL_FUNCTION,
+    HL_ESCAPE,
+    HL_FORMAT,
 };
 
 struct HLToken {
