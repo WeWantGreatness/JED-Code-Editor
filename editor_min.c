@@ -174,6 +174,7 @@ static int switch_to_tab(int idx) {
 // forward-declare small helpers used by close_tab
 static void editorAppendRow(const char *s);
 static void save_snapshot(void);
+static int switch_to_home(void);
 
 // Close tab at index; if closing the currently-visible tab, load a neighboring tab
 static int close_tab(int idx) {
@@ -187,8 +188,12 @@ static int close_tab(int idx) {
     if (NumTabs == 0) {
         free(Tabs); Tabs = NULL; CurTab = -1;
         if (was_current) {
-            free(E.filename); E.filename = NULL;
-            editorFreeRows(); editorAppendRow(""); save_snapshot(); free(E.saved_snapshot); E.saved_snapshot = serialize_buffer();
+            if (HaveHomeTab) {
+                switch_to_home();
+            } else {
+                free(E.filename); E.filename = NULL;
+                editorFreeRows(); editorAppendRow(""); save_snapshot(); free(E.saved_snapshot); E.saved_snapshot = serialize_buffer();
+            }
         }
         return 0;
     }
@@ -1315,96 +1320,52 @@ static void execute_command(const char *cmd) {
 
             
 
-            // otherwise treat token as a filename (fall back to old behavior)
+            // otherwise treat token as a filename (rename if current file has name, else error)
             if (token_len > 0) {
                 char fname[512];
                 int sl = (token_len < (int)sizeof(fname) - 1) ? token_len : (int)sizeof(fname) - 1;
                 memcpy(fname, &cmd[start], sl);
                 fname[sl] = '\0';
-                // try open file (existing behavior: load file or create new buffer)
-                FILE *f = fopen(fname, "r");
-                if (!f) {
-                    // file doesn't exist — check for swap file and offer recovery
-                    char swapbuf[1024];
-                    char *base = strrchr(fname, '/');
-                    const char *b = base ? base + 1 : fname;
-                    if (base) snprintf(swapbuf, sizeof(swapbuf), "%.*s/.%s.swp", (int)(base - fname), fname, b);
-                    else snprintf(swapbuf, sizeof(swapbuf), ".%s.swp", b);
-                    if (access(swapbuf, F_OK) == 0) {
-                        // prompt user: recover/delete/cancel (clear prompt line first and show at bottom)
-                        char __tmpbuf[64]; int __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
-                        if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
-                        write(STDOUT_FILENO, "Swap found. (r)ecover/(d)elete/(c)ancel: ", 41);
-                        int resp = 0;
-                        while (1) {
-                            int k = readKey(); if (k == -1) continue;
-                            if (k == 'r' || k == 'R') { resp = 'r'; break; }
-                            if (k == 'd' || k == 'D') { resp = 'd'; break; }
-                            if (k == 'c' || k == 'C' || k == 27) { resp = 0; break; }
-                        }
-                        __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
-                        if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
-                        if (resp == 'r') {
-                            // load swap
-                            FILE *sf = fopen(swapbuf, "r");
-                            if (sf) {
-                                fseek(sf, 0, SEEK_END);
-                                long ssz = ftell(sf); fseek(sf, 0, SEEK_SET);
-                                char *sbuf = malloc(ssz + 1);
-                                if (sbuf) { fread(sbuf, 1, ssz, sf); sbuf[ssz] = '\0'; load_buffer_from_string(sbuf); free(sbuf); }
-                                fclose(sf);
+                if (E.filename && E.filename[0]) {
+                    // has filename: rename to fname after confirmation
+                    char __tmpbuf[128]; int __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
+                    if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
+                    int pn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[1;97mRename\x1b[0m \x1b[96m'%s'\x1b[0m \x1b[1;97mto\x1b[0m \x1b[96m'%s'\x1b[0m? \x1b[92m(y)\x1b[0m\x1b[91m(N)\x1b[0m: ", E.filename, fname);
+                    if (pn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)pn);
+                    int y = 0; while (1) { int k2 = readKey(); if (k2 == -1) continue; if (k2=='y' || k2=='Y') { y = 1; break; } if (k2=='n' || k2=='N' || k2==27) { y = 0; break; } }
+                    __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
+                    if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
+                    if (y) {
+                        // rename: if file exists on disk, rename it; update E.filename
+                        if (access(E.filename, F_OK) == 0) {
+                            if (rename(E.filename, fname) == 0) {
                                 free(E.filename); E.filename = strdup(fname);
-                                // mark as unsaved (swap recovery)
-                                free(E.saved_snapshot); E.saved_snapshot = NULL;
-                                save_snapshot();
-                                snprintf(E.msg, sizeof(E.msg), "Recovered from swap %s", swapbuf); E.msg_time = time(NULL);
+                                set_language_from_filename(fname);
+                                snprintf(E.msg, sizeof(E.msg), "Renamed to %s", fname);
                             } else {
-                                snprintf(E.msg, sizeof(E.msg), "Swap read failed"); E.msg_time = time(NULL);
+                                snprintf(E.msg, sizeof(E.msg), "Rename failed: %s", strerror(errno));
                             }
-                        } else if (resp == 'd') {
-                            unlink(swapbuf);
-                            // create empty buffer
-                            free(E.filename); E.filename = strdup(fname);
-                            free(E.saved_snapshot); E.saved_snapshot = NULL;
-                            editorFreeRows(); editorAppendRow(""); save_snapshot();
-                            snprintf(E.msg, sizeof(E.msg), "New file %s", fname); E.msg_time = time(NULL);
                         } else {
-                            // cancel
-                            snprintf(E.msg, sizeof(E.msg), "Open cancelled"); E.msg_time = time(NULL);
+                            // file not on disk, just update name
+                            free(E.filename); E.filename = strdup(fname);
+                            set_language_from_filename(fname);
+                            snprintf(E.msg, sizeof(E.msg), "Renamed to %s", fname);
                         }
                     } else {
-                        // no swap — just create buffer and set filename (do NOT create file on disk yet)
-                        free(E.filename);
-                        E.filename = strdup(fname);
-                        // mark as unsaved (no saved snapshot)
-                        free(E.saved_snapshot); E.saved_snapshot = NULL;
-                        // reset buffer to empty
-                        editorFreeRows();
-                        editorAppendRow("");
-                        save_snapshot();
-                        snprintf(E.msg, sizeof(E.msg), "New file %s", fname); E.msg_time = time(NULL);
+                        snprintf(E.msg, sizeof(E.msg), "Rename cancelled");
                     }
+                    E.msg_time = time(NULL);
                 } else {
-                    // read file into buffer
-                    fseek(f, 0, SEEK_END);
-                    long sz = ftell(f); fseek(f, 0, SEEK_SET);
-                    char *buf = malloc(sz + 1);
-                    if (buf) {
-                        fread(buf, 1, sz, f);
-                        buf[sz] = '\0';
-                        load_buffer_from_string(buf);
-                        free(buf);
-                        free(E.filename);
-                        E.filename = strdup(fname);
-                        save_snapshot();
-                        // mark as saved
-                        free(E.saved_snapshot); E.saved_snapshot = serialize_buffer();
-                        snprintf(E.msg, sizeof(E.msg), "Opened %s", fname); E.msg_time = time(NULL);
-                    }
-                    fclose(f);
+                    // no filename: set the filename for this buffer
+                    free(E.filename); E.filename = strdup(fname);
+                    set_language_from_filename(fname);
+                    // mark as unsaved
+                    free(E.saved_snapshot); E.saved_snapshot = NULL;
+                    snprintf(E.msg, sizeof(E.msg), "File named %s", fname);
+                    E.msg_time = time(NULL);
                 }
+                continue;
             }
-            continue;
         }
 
         // opent <file> -> open file in a new tab (create if missing)
@@ -1417,20 +1378,54 @@ static void execute_command(const char *cmd) {
             char fname[512]; int sl = (tlen < (int)sizeof(fname)-1) ? tlen : (int)sizeof(fname)-1; memcpy(fname, &cmd[start], sl); fname[sl] = '\0';
             // debug: show parsed filename and existence
             snprintf(E.msg, sizeof(E.msg), "opent -> '%s' (exists=%d)", fname, access(fname, F_OK) == 0); E.msg_time = time(NULL);
-            // if file exists or user agrees to create, create new tab and switch to it
-            if (access(fname, F_OK) != 0) {
-                // ask to create
-                char __tmpbuf[64]; int __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
+            // if file exists, prompt
+            if (access(fname, F_OK) == 0) {
+                // file exists: prompt open / create duplicate / cancel
+                char __tmpbuf[128]; int __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
                 if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
-                write(STDOUT_FILENO, "\x1b[93mFile not found. Create?\x1b[0m \x1b[92m(y)\x1b[0m\x1b[91m(n)\x1b[0m ", 52);
-                int resp = 0; while (1) { int k = readKey(); if (k == -1) continue; if (k=='y'||k=='Y') { resp='y'; break; } if (k=='n'||k=='N'||k==27) { resp='n'; break; } }
-                __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows); if (__tmpn>0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
-                if (resp != 'y') { snprintf(E.msg, sizeof(E.msg), "Open cancelled"); E.msg_time = time(NULL); continue; }
+                int pn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[1;97mFile\x1b[0m \x1b[96m'%s'\x1b[0m \x1b[1;97mexists\x1b[0m. \x1b[92m(o) Open\x1b[0m / \x1b[94m(d) Create duplicate\x1b[0m / \x1b[93m(c) Cancel\x1b[0m: ", fname);
+                if (pn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)pn);
+                int resp = 0;
+                while (1) {
+                    int kk = readKey(); if (kk == -1) continue;
+                    if (kk == 'o' || kk == 'O') { resp = 'o'; break; }
+                    if (kk == 'd' || kk == 'D') { resp = 'd'; break; }
+                    if (kk == 'c' || kk == 'C' || kk == 27) { resp = 'c'; break; }
+                }
+                __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
+                if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
+                if (resp == 'c') { snprintf(E.msg, sizeof(E.msg), "Open cancelled"); E.msg_time = time(NULL); continue; }
+                if (resp == 'd') {
+                    // create duplicate: find available name like fname1.ext, fname2.ext, etc.
+                    char base[512]; char ext[64] = {0};
+                    char *dot = strrchr(fname, '.');
+                    if (dot) {
+                        int blen = dot - fname;
+                        if (blen > 0) memcpy(base, fname, blen); base[blen] = '\0';
+                        strcpy(ext, dot);
+                    } else {
+                        strcpy(base, fname);
+                    }
+                    char newname[512];
+                    int num = 1;
+                    while (1) {
+                        if (ext[0]) snprintf(newname, sizeof(newname), "%s%d%s", base, num, ext);
+                        else snprintf(newname, sizeof(newname), "%s%d", base, num);
+                        if (access(newname, F_OK) != 0) break;
+                        num++;
+                        if (num > 100) { snprintf(E.msg, sizeof(E.msg), "Too many duplicates"); E.msg_time = time(NULL); continue; }
+                    }
+                    // set fname to newname
+                    strcpy(fname, newname);
+                    // fall through to create
+                }
+                // resp == 'o': fall through to open existing
+            } else {
+                // doesn't exist: will create
             }
             // push current buffer to tabs and create new tab with the file
             push_current_to_tab_list();
             // load file into editor
-            // reuse execute 'fn' by temporarily constructing it: call open file logic inline
             FILE *f = fopen(fname, "r");
             if (!f) {
                 free(E.filename); E.filename = strdup(fname); free(E.saved_snapshot); E.saved_snapshot = NULL; editorFreeRows(); editorAppendRow(""); save_snapshot(); snprintf(E.msg, sizeof(E.msg), "New file %s", fname); E.msg_time = time(NULL);
@@ -1460,15 +1455,54 @@ static void execute_command(const char *cmd) {
             snprintf(E.msg, sizeof(E.msg), "open -> '%s' (exists=%d)", fname, access(fname, F_OK) == 0); E.msg_time = time(NULL);
             // push current file to new tab
             push_current_to_tab_list();
-            // then open requested file into current editor (create if missing)
+            // then open requested file into current editor
+            if (access(fname, F_OK) == 0) {
+                // file exists: prompt open / create duplicate / cancel
+                char __tmpbuf[128]; int __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
+                if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
+                int pn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[1;97mFile\x1b[0m \x1b[96m'%s'\x1b[0m \x1b[1;97mexists\x1b[0m. \x1b[92m(o) Open\x1b[0m / \x1b[94m(d) Create duplicate\x1b[0m / \x1b[93m(c) Cancel\x1b[0m: ", fname);
+                if (pn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)pn);
+                int resp = 0;
+                while (1) {
+                    int kk = readKey(); if (kk == -1) continue;
+                    if (kk == 'o' || kk == 'O') { resp = 'o'; break; }
+                    if (kk == 'd' || kk == 'D') { resp = 'd'; break; }
+                    if (kk == 'c' || kk == 'C' || kk == 27) { resp = 'c'; break; }
+                }
+                __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
+                if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
+                if (resp == 'c') { snprintf(E.msg, sizeof(E.msg), "Open cancelled"); E.msg_time = time(NULL); continue; }
+                if (resp == 'd') {
+                    // create duplicate: find available name like fname1.ext, fname2.ext, etc.
+                    char base[512]; char ext[64] = {0};
+                    char *dot = strrchr(fname, '.');
+                    if (dot) {
+                        int blen = dot - fname;
+                        if (blen > 0) memcpy(base, fname, blen); base[blen] = '\0';
+                        strcpy(ext, dot);
+                    } else {
+                        strcpy(base, fname);
+                    }
+                    char newname[512];
+                    int num = 1;
+                    while (1) {
+                        if (ext[0]) snprintf(newname, sizeof(newname), "%s%d%s", base, num, ext);
+                        else snprintf(newname, sizeof(newname), "%s%d", base, num);
+                        if (access(newname, F_OK) != 0) break;
+                        num++;
+                        if (num > 100) { snprintf(E.msg, sizeof(E.msg), "Too many duplicates"); E.msg_time = time(NULL); continue; }
+                    }
+                    // create new file with newname
+                    FILE *nf = fopen(newname, "w");
+                    if (nf) { fclose(nf); free(E.filename); E.filename = strdup(newname); free(E.saved_snapshot); E.saved_snapshot = NULL; editorFreeRows(); editorAppendRow(""); save_snapshot(); snprintf(E.msg, sizeof(E.msg), "Created duplicate %s", newname); E.msg_time = time(NULL); }
+                    else { snprintf(E.msg, sizeof(E.msg), "Create duplicate failed: %s", strerror(errno)); E.msg_time = time(NULL); }
+                    continue;
+                }
+                // resp == 'o': fall through to open existing
+            }
             FILE *f = fopen(fname, "r");
             if (!f) {
-                char __tmpbuf[64]; int __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
-                if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
-                write(STDOUT_FILENO, "\x1b[93mFile not found. Create?\x1b[0m \x1b[92m(y)\x1b[0m\x1b[91m(n)\x1b[0m ", 52);
-                int resp = 0; while (1) { int k = readKey(); if (k == -1) continue; if (k=='y'||k=='Y') { resp='y'; break; } if (k=='n'||k=='N'||k==27) { resp='n'; break; } }
-                __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows); if (__tmpn>0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
-                if (resp != 'y') { snprintf(E.msg, sizeof(E.msg), "Open cancelled"); E.msg_time = time(NULL); continue; }
+                // file doesn't exist: create it
                 free(E.filename); E.filename = strdup(fname); free(E.saved_snapshot); E.saved_snapshot = NULL; editorFreeRows(); editorAppendRow(""); save_snapshot(); snprintf(E.msg, sizeof(E.msg), "New file %s", fname); E.msg_time = time(NULL);
             } else {
                 fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
@@ -1647,6 +1681,25 @@ static void execute_command(const char *cmd) {
             if (cmd[i] == 'b') i += 1; else i += 6; show_file_browser(); continue;
         }
 
+        // cd <path> - change directory
+        if (i + 1 < L && strncmp(&cmd[i], "cd", 2) == 0) {
+            char next = (i + 2 < L) ? cmd[i+2] : '\0';
+            if (!(next == '\0' || next == ' ')) { i++; continue; }
+            i += 2; while (i < L && cmd[i] == ' ') i++;
+            if (i >= L) { snprintf(E.msg, sizeof(E.msg), "cd: missing path"); E.msg_time = time(NULL); continue; }
+            char path[512]; int pidx = 0;
+            while (i < L && pidx < (int)sizeof(path)-1) { path[pidx++] = cmd[i++]; }
+            path[pidx] = '\0';
+            if (chdir(path) == 0) {
+                char cwd[512]; getcwd(cwd, sizeof(cwd));
+                snprintf(E.msg, sizeof(E.msg), "Changed directory to %s", cwd);
+            } else {
+                snprintf(E.msg, sizeof(E.msg), "cd failed: %s", strerror(errno));
+            }
+            E.msg_time = time(NULL);
+            continue;
+        }
+
         // help - toggle help overlay
         if (i + 3 < L && strncmp(&cmd[i], "help", 4) == 0) { i += 4; E.help_visible = 1; E.help_scroll = 0; continue; }
 
@@ -1688,9 +1741,16 @@ static void execute_command(const char *cmd) {
                 if (CurTab == -1) {
                     // same as no-number close above
                     if (NumTabs > 0) {
-                        int target = NumTabs - 1; if (switch_to_tab(target) == 0) { free_tab(&HomeTab); HaveHomeTab = 0; snprintf(E.msg, sizeof(E.msg), "Closed current buffer; switched to tab %d", target + 2); }
-                        else snprintf(E.msg, sizeof(E.msg), "Close failed for current buffer");
-                    } else { free(E.filename); E.filename = NULL; editorFreeRows(); editorAppendRow(""); save_snapshot(); free(E.saved_snapshot); E.saved_snapshot = serialize_buffer(); free_tab(&HomeTab); HaveHomeTab = 0; snprintf(E.msg, sizeof(E.msg), "Closed current buffer"); }
+                        int target = NumTabs - 1;
+                        HomeTab = Tabs[target];
+                        HaveHomeTab = 1;
+                        NumTabs--;
+                        CurTab = -1;
+                        switch_to_home();
+                        snprintf(E.msg, sizeof(E.msg), "Closed tab 1");
+                    } else {
+                        free(E.filename); E.filename = NULL; editorFreeRows(); editorAppendRow(""); save_snapshot(); free(E.saved_snapshot); E.saved_snapshot = serialize_buffer(); free_tab(&HomeTab); HaveHomeTab = 0; snprintf(E.msg, sizeof(E.msg), "Closed current buffer");
+                    }
                 } else {
                     // home not visible: just clear saved home
                     free_tab(&HomeTab); HaveHomeTab = 0; snprintf(E.msg, sizeof(E.msg), "Closed buffer 1 (home)");
@@ -1795,7 +1855,22 @@ static void execute_command(const char *cmd) {
         }
         if (cmd[i] == 's') {
             char next = (i + 1 < L) ? cmd[i+1] : '\0';
-            if (next == '\0' || next == ' ') { save_to_file(NULL); i++; continue; } else { i++; continue; }
+            if (next == '\0' || next == ' ') {
+                // prompt to confirm save
+                char __tmpbuf[128]; int __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
+                if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
+                int pn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[1mSave file?\x1b[0m \x1b[92m(y)\x1b[0m\x1b[91m(N)\x1b[0m: ");
+                if (pn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)pn);
+                int y = 0; while (1) { int k2 = readKey(); if (k2 == -1) continue; if (k2=='y' || k2=='Y') { y = 1; break; } if (k2=='n' || k2=='N' || k2==27) { y = 0; break; } }
+                __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
+                if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
+                if (y) {
+                    save_to_file(NULL);
+                } else {
+                    snprintf(E.msg, sizeof(E.msg), "Save cancelled"); E.msg_time = time(NULL);
+                }
+                i++; continue;
+            } else { i++; continue; }
         }
         if (cmd[i] == 'p') {
             char next = (i + 1 < L) ? cmd[i+1] : '\0';
@@ -2078,7 +2153,7 @@ static void draw_help_overlay(void) {
         "\x1b[96mCommand Cheat Sheet\x1b[0m",
         "",
         "\x1b[96mFile & Tab Management\x1b[0m",
-        "\x1b[93mfn <file>\x1b[0m        Open/Create file",
+        "\x1b[93mfn <file>\x1b[0m        Name/rename current file",
         "\x1b[93mfn add <file>\x1b[0m    Create file on disk",
         "\x1b[93mfn del <file>\x1b[0m    Delete file",
         "\x1b[93mopen <file>\x1b[0m      Open in current window",
@@ -2088,6 +2163,7 @@ static void draw_help_overlay(void) {
         "\x1b[93mtabc<N>\x1b[0m          Close tab N",
         "\x1b[93mmd <dir>\x1b[0m        Make directory",
         "\x1b[93mmd -p <dir>\x1b[0m     Make directory (recursive)",
+        "\x1b[93mcd <path>\x1b[0m      Change directory",
         "",
         "\x1b[96mEditing\x1b[0m",
         "\x1b[93ms\x1b[0m                Save",
@@ -2177,7 +2253,7 @@ static void open_help_tab(void) {
         "Command Cheat Sheet",
         "",
         "File & Tab Management",
-        "fn <file>        Open/Create file",
+        "fn <file>        Name/rename current file",
         "fn add <file>    Create file on disk",
         "fn del <file>    Delete file",
         "open <file>      Open in current window",
@@ -2187,6 +2263,7 @@ static void open_help_tab(void) {
         "tabc<N>          Close tab N",
         "md <dir>         Make directory",
         "md -p <dir>      Make directory (recursive)",
+        "cd <path>        Change directory",
         "",
         "Editing",
         "s                Save",
@@ -2536,17 +2613,30 @@ static void show_file_browser(void) {
             // if directory, chdir and reload
             int is_dir = (entries[selidx][strlen(entries[selidx]) - 1] == '/');
             if (is_dir) {
-                // directory selected: offer Open / Delete / Cancel
+                // directory selected: offer Open / Delete / Cancel, except for ".." which just goes up
                 char tmp[512]; snprintf(tmp, sizeof(tmp), "%s", entries[selidx]); tmp[strlen(tmp)-1] = '\0';
+                if (strcmp(tmp, "..") == 0) {
+                    // special case: ".." just goes up without prompt
+                    if (chdir(tmp) == 0) {
+                        getcwd(cwd, sizeof(cwd));
+                        char **nh = realloc(dir_history, sizeof(char*) * (dh_count + 1));
+                        if (nh) { dir_history = nh; dir_history[dh_count++] = strdup(cwd); }
+                        page = 0; selbuf[0] = '\0'; selpos = 0;
+                        goto auto_reload;
+                    } else {
+                        snprintf(E.msg, sizeof(E.msg), "Chdir failed: %s", strerror(errno)); E.msg_time = time(NULL); selbuf[0] = '\0'; selpos = 0; continue;
+                    }
+                }
                 char __tmpbuf[128]; int __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
                 if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
-                int pn = snprintf(__tmpbuf, sizeof(__tmpbuf), "Directory '%s': \x1b[92m(o) Open\x1b[0m / \x1b[91m(d) Delete\x1b[0m / \x1b[93m(c) Cancel\x1b[0m: ", tmp);
+                int pn = snprintf(__tmpbuf, sizeof(__tmpbuf), "Directory '%s': \x1b[92m(o) Open\x1b[0m / \x1b[91m(d) Delete\x1b[0m / \x1b[94m(g) Change Directory\x1b[0m / \x1b[93m(c) Cancel\x1b[0m: ", tmp);
                 if (pn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)pn);
                 int dresp = 0;
                 while (1) {
                     int kk = readKey(); if (kk == -1) continue;
                     if (kk == 'o' || kk == 'O' || kk == '\r' || kk == '\n') { dresp = 'o'; break; }
                     if (kk == 'd' || kk == 'D') { dresp = 'd'; break; }
+                    if (kk == 'g' || kk == 'G') { dresp = 'g'; break; }
                     if (kk == 'c' || kk == 'C' || kk == 27) { dresp = 'c'; break; }
                 }
                 __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
@@ -2559,6 +2649,16 @@ static void show_file_browser(void) {
                         if (nh) { dir_history = nh; dir_history[dh_count++] = strdup(cwd); }
                         page = 0; selbuf[0] = '\0'; selpos = 0;
                         goto auto_reload;
+                    } else {
+                        snprintf(E.msg, sizeof(E.msg), "Chdir failed: %s", strerror(errno)); E.msg_time = time(NULL); selbuf[0] = '\0'; selpos = 0; continue;
+                    }
+                }
+                if (dresp == 'g') {
+                    if (chdir(tmp) == 0) {
+                        char newcwd[512]; getcwd(newcwd, sizeof(newcwd));
+                        snprintf(E.msg, sizeof(E.msg), "Changed directory to %s", newcwd);
+                        E.msg_time = time(NULL);
+                        break; // exit browser
                     } else {
                         snprintf(E.msg, sizeof(E.msg), "Chdir failed: %s", strerror(errno)); E.msg_time = time(NULL); selbuf[0] = '\0'; selpos = 0; continue;
                     }
@@ -2583,7 +2683,7 @@ static void show_file_browser(void) {
                 }
             } else {
                 // prompt user whether to open in current window or in a new tab
-                char __tmpbuf[128]; int __tmpn;
+                char __tmpbuf[256]; int __tmpn;
                 /* Clear the last one or two lines before drawing the prompt */
                 if (E.screenrows > 1) __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K\x1b[%d;1H\x1b[K", E.screenrows - 1, E.screenrows);
                 else __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
@@ -2592,8 +2692,8 @@ static void show_file_browser(void) {
                 int cur_unsaved = 0; char *curss_tmp = serialize_buffer(); if (curss_tmp) { if (!(E.saved_snapshot && strcmp(E.saved_snapshot, curss_tmp) == 0)) cur_unsaved = 1; free(curss_tmp); }
                 int pn;
                 /* Show the concise initial choices; defer save/discard confirmation until the user selects Current Tab. Include (d) Delete. */
-                if (cur_unsaved) pn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[93mOpen '%s' as:\x1b[0m \x1b[94m(t) New Tab\x1b[0m / \x1b[92m(o) Current Tab\x1b[0m / \x1b[91m(d) Delete\x1b[0m / \x1b[93m(c) Cancel\x1b[0m: ", entries[selidx]);
-                else pn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[93mOpen '%s' as:\x1b[0m \x1b[94m(t) New Tab\x1b[0m / \x1b[92m(o) Current Tab\x1b[0m / \x1b[91m(d) Delete\x1b[0m / \x1b[93m(c) Cancel\x1b[0m: ", entries[selidx]);
+                if (cur_unsaved) pn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[1;97mOpen\x1b[0m \x1b[96m'%s'\x1b[0m \x1b[1;97mas:\x1b[0m \x1b[94m(t) New Tab\x1b[0m / \x1b[92m(o) Current Tab\x1b[0m / \x1b[91m(d) Delete\x1b[0m / \x1b[93m(c) Cancel\x1b[0m: ", entries[selidx]);
+                else pn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[1;97mOpen\x1b[0m \x1b[96m'%s'\x1b[0m \x1b[1;97mas:\x1b[0m \x1b[94m(t) New Tab\x1b[0m / \x1b[92m(o) Current Tab\x1b[0m / \x1b[91m(d) Delete\x1b[0m / \x1b[93m(c) Cancel\x1b[0m: ", entries[selidx]);
                 if (pn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)pn);
                 int resp = 0;
                 while (1) {
@@ -2723,14 +2823,14 @@ static void editorRefreshScreen(void) {
         const char *home_name;
         int home_unsaved = 0;
         if (CurTab == -1) {
-            home_name = E.filename ? E.filename : "(No Name)";
+            home_name = (E.filename && *E.filename) ? E.filename : "(No Name)";
             char *curss = serialize_buffer();
             if (curss) {
                 if (!(E.saved_snapshot && strcmp(E.saved_snapshot, curss) == 0)) home_unsaved = 1;
                 free(curss);
             }
         } else {
-            home_name = HaveHomeTab && HomeTab.name ? HomeTab.name : "(No Name)";
+            home_name = (HaveHomeTab && HomeTab.name && *HomeTab.name) ? HomeTab.name : "(No Name)";
             if (HomeTab.saved_snapshot && HomeTab.snapshot) {
                 home_unsaved = (strcmp(HomeTab.saved_snapshot, HomeTab.snapshot) != 0);
             } else if (HomeTab.saved_snapshot == NULL && HomeTab.snapshot) {
@@ -2771,7 +2871,7 @@ static void editorRefreshScreen(void) {
         }
         // render stored tabs
         for (int t = 0; t < NumTabs && remaining > 0; t++) {
-            const char *tname = Tabs[t].name ? Tabs[t].name : "(No Name)";
+            const char *tname = (Tabs[t].name && *Tabs[t].name) ? Tabs[t].name : "(No Name)";
             int namelen = (int)strlen(tname);
             int unsaved = 0;
             if (Tabs[t].saved_snapshot && Tabs[t].snapshot) {
