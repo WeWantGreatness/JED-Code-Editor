@@ -15,6 +15,32 @@ Here are two small, user-facing ideas to keep in the roadmap (keep them simple):
 
 (If you'd like, I can add a minimal example `~/.jedrc` and a tiny parser to get started.)
 
+Additional planned features
+---------------------------
+1. **Change Directory in Browser Menu**: Add `cd` command to allow users to change the current directory within the file browser overlay. This would update the browser's root directory for navigation.
+
+2. **Delete Folder**: Implement `del <path>` command to delete folders. Ensure confirmation prompts and handle permissions/errors gracefully.
+
+3. **File Rename Functionality (`fn`)**:
+   - Allow renaming files with `fn <new_name>`.
+   - If the file is unnamed (new buffer), proceed with naming it.
+   - If the file already has a name, prompt for confirmation before renaming.
+   - If the new name already exists, notify the user and prevent overwrite unless confirmed.
+
+4. **Create New File with Tab Options**:
+   - Use `fn` to create a new file while on a current file.
+   - Prompt the user to choose: open in current tab or new tab.
+   - If current tab, follow the same prompting as opening a file into the current tab (e.g., save current changes if unsaved).
+
+5. **Native Git Integration**:
+   - Add basic git commands like `git push`, `git pull`, `git status`, etc., accessible within the editor.
+   - Implement as editor commands (e.g., `:git push`, `:git pull`).
+   - Provide feedback and handle common scenarios like conflicts or authentication.
+
+6. **Open Man Pages**:
+   - Add ability to open man pages directly within the editor or via a command (e.g., `:man <topic>`).
+   - If not natively supported, integrate with the embedded terminal or external viewer.
+
 Current state
 -------------
 - `Makefile` with `install` and `install-man` targets
