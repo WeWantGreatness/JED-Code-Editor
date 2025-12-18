@@ -1423,24 +1423,9 @@ static void execute_command(const char *cmd) {
             } else {
                 // doesn't exist: will create
             }
-            // push current buffer to tabs and create new tab with the file
-            push_current_to_tab_list();
-            // load file into editor
-            FILE *f = fopen(fname, "r");
-            if (!f) {
-                free(E.filename); E.filename = strdup(fname); free(E.saved_snapshot); E.saved_snapshot = NULL; editorFreeRows(); editorAppendRow(""); save_snapshot(); snprintf(E.msg, sizeof(E.msg), "New file %s", fname); E.msg_time = time(NULL);
-            } else {
-                fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
-                char *buf = malloc(sz + 1); if (buf) { fread(buf, 1, sz, f); buf[sz] = '\0'; load_buffer_from_string(buf); free(buf); free(E.filename); E.filename = strdup(fname); save_snapshot(); free(E.saved_snapshot); E.saved_snapshot = serialize_buffer(); snprintf(E.msg, sizeof(E.msg), "Opened %s", fname); E.msg_time = time(NULL); }
-                fclose(f);
-            }
-            // append the newly opened file as a tab and switch to it
-            struct Tab t = make_tab_from_editor(); int idx = append_tab(t);
-            if (idx >= 0) {
-                int sret = switch_to_tab(idx);
-                if (sret == 0) { snprintf(E.msg, sizeof(E.msg), "opent: opened %s (tab %d)", fname, idx+2); E.msg_time = time(NULL); }
-                else { snprintf(E.msg, sizeof(E.msg), "opent: switch failed %d", sret); E.msg_time = time(NULL); }
-            } else { snprintf(E.msg, sizeof(E.msg), "opent: append failed"); E.msg_time = time(NULL); }
+            // Create a new tab with the file without modifying the current buffer
+            open_file_in_new_tab(fname);
+            snprintf(E.msg, sizeof(E.msg), "opent: opened %s", fname); E.msg_time = time(NULL);
             continue;
         }
 
@@ -2328,6 +2313,249 @@ static int alphasort_entries(const void *a, const void *b) {
     return strcasecmp(A, B);
 }
 
+// --- Filesystem fuzzy matching helpers -------------------------------------------------
+// Return array of directory entries (names with trailing '/' for directories).
+// Caller must free returned array and strings.
+static char **dir_entries(const char *dir, int *out_n) {
+    char **entries = NULL; int nentries = 0;
+    DIR *d = opendir(dir ? dir : ".");
+    if (!d) { if (out_n) *out_n = 0; return NULL; }
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (strcmp(de->d_name, ".") == 0) continue; // skip self
+        char *name = NULL;
+        struct stat st;
+        if (stat(de->d_name, &st) == 0 && S_ISDIR(st.st_mode)) {
+            int l = (int)strlen(de->d_name) + 2; name = malloc(l); if (!name) continue; snprintf(name, l, "%s/", de->d_name);
+        } else {
+            name = strdup(de->d_name);
+        }
+        if (!name) continue;
+        char **n = realloc(entries, sizeof(char*) * (nentries + 1)); if (!n) { free(name); continue; }
+        entries = n; entries[nentries++] = name;
+    }
+    closedir(d);
+    if (nentries == 0) { if (out_n) *out_n = 0; return entries; }
+    qsort(entries, nentries, sizeof(char*), alphasort_entries);
+    if (out_n) *out_n = nentries; return entries;
+}
+
+// Simple fuzzy subsequence scorer: return -1 if not a subsequence, else higher is better.
+// Scoring heuristics: longer matched runs and smaller gaps give higher score; matches at start or after '/','_','-' are rewarded.
+static int fuzzy_score(const char *name, const char *pat) {
+    if (!pat || !*pat) return 0;
+    int n = (int)strlen(name); int m = (int)strlen(pat);
+    int i = 0, j = 0;
+    int score = 0; int last = -1; int consec = 0;
+    while (i < n && j < m) {
+        char cn = name[i]; char cp = pat[j];
+        if (tolower((unsigned char)cn) == tolower((unsigned char)cp)) {
+            int idx = i;
+            int gap = (last == -1) ? idx : (idx - last - 1);
+            // base points for matching a char
+            int pts = 10;
+            // reward consecutive matches
+            if (last != -1 && idx == last + 1) { consec++; pts += 5 * consec; }
+            else consec = 0;
+            // reward if match at start or after separator
+            if (idx == 0 || name[idx-1] == '/' || name[idx-1] == '_' || name[idx-1] == '-') pts += 8;
+            // penalize gaps
+            pts -= gap;
+            score += pts;
+            last = idx; j++; i++;
+        } else {
+            i++;
+        }
+    }
+    if (j < m) return -1; // not a subsequence
+    // Slight boost for longer patterns matched
+    score += m * 2;
+    return score;
+}
+
+// Comparator for match sorting: higher score first, then directory-first, then case-insensitive name
+struct match_item { char *name; int score; };
+static int match_cmp(const void *a, const void *b) {
+    const struct match_item *A = (const struct match_item *)a;
+    const struct match_item *B = (const struct match_item *)b;
+    if (A->score != B->score) return B->score - A->score;
+    int da = (A->name[strlen(A->name)-1] == '/');
+    int db = (B->name[strlen(B->name)-1] == '/');
+    if (da != db) return db - da;
+    return strcasecmp(A->name, B->name);
+}
+
+// Return up to max matches (allocated array of strdup'd names); out_n is number returned. Caller must free.
+static char **get_fuzzy_matches(const char *dir, const char *pat, int max, int *out_n) {
+    int n = 0; char **entries = dir_entries(dir, &n);
+    if (!entries || n == 0) { if (out_n) *out_n = 0; if (entries) free(entries); return NULL; }
+    struct match_item *matches = malloc(sizeof(struct match_item) * n);
+    int mc = 0;
+    for (int i = 0; i < n; i++) {
+        int sc = fuzzy_score(entries[i], pat);
+        if (sc >= 0) {
+            matches[mc].name = entries[i]; matches[mc].score = sc; mc++; // take ownership of the string pointer
+            entries[i] = NULL; // mark taken
+        }
+    }
+    // free leftover entries we didn't take
+    for (int i = 0; i < n; i++) if (entries[i]) free(entries[i]); free(entries);
+    if (mc == 0) { free(matches); if (out_n) *out_n = 0; return NULL; }
+    qsort(matches, mc, sizeof(struct match_item), match_cmp);
+    int ret_n = (mc < max) ? mc : max;
+    char **ret = malloc(sizeof(char*) * ret_n);
+    for (int i = 0; i < ret_n; i++) ret[i] = strdup(matches[i].name);
+    // free matches array (but not names; ret holds copies)
+    for (int i = 0; i < mc; i++) free(matches[i].name);
+    free(matches);
+    if (out_n) *out_n = ret_n; return ret;
+}
+
+static void free_matches(char **m, int n) { if (!m) return; for (int i = 0; i < n; i++) free(m[i]); free(m); }
+
+// Active suggestion state for live completion
+static char **ActiveMatches = NULL;
+static int ActiveMatchesN = 0;
+static int ActiveMatchSel = 0;
+static int ActiveFilenameStart = -1; // offset in E.command_buf where filename begins
+static int SuggestionsVisible = 0;
+static int SuggestionMax = 8; // default suggestion limit (within 5-10 per design)
+
+static void clear_active_suggestions(void) {
+    free_matches(ActiveMatches, ActiveMatchesN);
+    ActiveMatches = NULL; ActiveMatchesN = 0; ActiveMatchSel = 0; ActiveFilenameStart = -1; SuggestionsVisible = 0;
+}
+
+// Update suggestions based on current E.command_buf. Shows suggestions if command is 'open' or 'opent'.
+static void update_suggestions_from_command(void) {
+    // clear previous
+    clear_active_suggestions();
+    const char *cmds[] = {"open", "opent"};
+    for (int ci = 0; ci < (int)(sizeof(cmds)/sizeof(cmds[0])); ci++) {
+        const char *kw = cmds[ci]; size_t kwlen = strlen(kw);
+        if (E.command_len >= (int)kwlen && strncmp(E.command_buf, kw, kwlen) == 0) {
+            if (E.command_len == (int)kwlen || E.command_buf[kwlen] == ' ') {
+                int pos = (int)kwlen; while (pos < E.command_len && E.command_buf[pos] == ' ') pos++;
+                // pattern is remainder (may be empty)
+                char pat[512] = {0}; int plen = 0;
+                if (pos < E.command_len) { plen = E.command_len - pos; if (plen > (int)sizeof(pat)-1) plen = (int)sizeof(pat)-1; memcpy(pat, &E.command_buf[pos], plen); pat[plen] = '\0'; }
+                int n = 0;
+                char **matches = get_fuzzy_matches(".", pat, SuggestionMax, &n);
+                if (n > 0) {
+                    ActiveMatches = matches; ActiveMatchesN = n; ActiveMatchSel = 0; ActiveFilenameStart = pos; SuggestionsVisible = 1; return;
+                } else {
+                    // no matches: keep suggestions hidden
+                    clear_active_suggestions(); return;
+                }
+            }
+        }
+    }
+    // not an open/opent command: ensure hidden
+    clear_active_suggestions();
+}
+
+// render suggestions overlay (non-blocking; drawn from refresh)
+static void render_suggestions_overlay(void) {
+    if (!SuggestionsVisible || ActiveMatchesN <= 0) return;
+    int n = ActiveMatchesN;
+    int sel = ActiveMatchSel;
+    if (sel < 0) sel = 0; if (sel >= n) sel = n - 1;
+    int maxlen = 0; for (int i = 0; i < n; i++) { int l = (int)strlen(ActiveMatches[i]); if (l > maxlen) maxlen = l; }
+    int boxw = maxlen + 6; if (boxw > E.screencols) boxw = E.screencols;
+    int boxh = n + 4; if (boxh > E.screenrows) boxh = E.screenrows;
+    int sx = (E.screencols - boxw) / 2; int sy = (E.screenrows - boxh) / 2;
+    // clear box area
+    for (int y = 0; y < boxh; y++) {
+        char buf[128]; int ln = sy + y + 1;
+        int written = snprintf(buf, sizeof(buf), "\x1b[%d;%dH", ln, sx + 1);
+        if (written > 0) write(STDOUT_FILENO, buf, (size_t)written);
+        for (int x = 0; x < boxw; x++) write(STDOUT_FILENO, " ", 1);
+    }
+    // title
+    char title[128]; snprintf(title, sizeof(title), "Suggestions (%d)", n);
+    int col = sx + 2; int ln = sy + 1; char linebuf[256]; int pn = snprintf(linebuf, sizeof(linebuf), "\x1b[%d;%dH%s", ln, col, title); if (pn>0) write(STDOUT_FILENO, linebuf, (size_t)pn);
+    // list entries
+    for (int i = 0; i < n; i++) {
+        int ln2 = sy + 2 + i;
+        int col2 = sx + 2;
+        char buf[512]; int rn = snprintf(buf, sizeof(buf), "\x1b[%d;%dH", ln2, col2);
+        if (rn>0) write(STDOUT_FILENO, buf, (size_t)rn);
+        if (i == sel) write(STDOUT_FILENO, "\x1b[7m", 4);
+        int is_dir = (ActiveMatches[i][strlen(ActiveMatches[i]) - 1] == '/');
+        if (is_dir) write(STDOUT_FILENO, "\x1b[32m", 5);
+        else write(STDOUT_FILENO, "\x1b[93m", 5);
+        write(STDOUT_FILENO, ActiveMatches[i], strlen(ActiveMatches[i]));
+        write(STDOUT_FILENO, "\x1b[0m", 4);
+        int pad = boxw - 4 - (int)strlen(ActiveMatches[i]); if (pad > 0) { for (int p = 0; p < pad; p++) write(STDOUT_FILENO, " ", 1); }
+        if (i == sel) write(STDOUT_FILENO, "\x1b[m", 3);
+    }
+    // position cursor out of way
+    char cur[64]; int m = snprintf(cur, sizeof(cur), "\x1b[%d;%dH", sy + boxh, sx + 1); if (m>0) write(STDOUT_FILENO, cur, (size_t)m);
+}
+
+// accept current active suggestion and insert into command buffer (does not execute command)
+static void accept_active_suggestion(void) {
+    if (!SuggestionsVisible || ActiveMatchesN <= 0 || ActiveFilenameStart < 0) return;
+    int sel = ActiveMatchSel; if (sel < 0 || sel >= ActiveMatchesN) sel = 0;
+    int addlen = (int)strlen(ActiveMatches[sel]);
+    int pre = ActiveFilenameStart;
+    int newlen = pre + addlen;
+    if (newlen + 1 < (int)sizeof(E.command_buf)) {
+        memcpy(&E.command_buf[pre], ActiveMatches[sel], addlen);
+        E.command_len = newlen; E.command_buf[E.command_len] = '\0';
+    }
+    clear_active_suggestions();
+}
+
+// Blocking picker (used by Tab-triggered flow). Returns selected index or -1 if cancelled.
+static int pick_from_matches(char **matches, int n) {
+    if (!matches || n <= 0) return -1;
+    int sel = 0;
+    while (1) {
+        if (winch_received) { getWindowSize(); editorRefreshScreen(); winch_received = 0; }
+        // compute box dimensions
+        int maxlen = 0; for (int i = 0; i < n; i++) { int l = (int)strlen(matches[i]); if (l > maxlen) maxlen = l; }
+        int boxw = maxlen + 6; if (boxw > E.screencols) boxw = E.screencols;
+        int boxh = n + 4; if (boxh > E.screenrows) boxh = E.screenrows;
+        int sx = (E.screencols - boxw) / 2; int sy = (E.screenrows - boxh) / 2;
+        // clear box area
+        for (int y = 0; y < boxh; y++) {
+            char buf[128]; int ln = sy + y + 1;
+            int written = snprintf(buf, sizeof(buf), "\x1b[%d;%dH", ln, sx + 1);
+            if (written > 0) write(STDOUT_FILENO, buf, (size_t)written);
+            for (int x = 0; x < boxw; x++) write(STDOUT_FILENO, " ", 1);
+        }
+        // title
+        char title[128]; snprintf(title, sizeof(title), "Suggestions (%d)", n);
+        int col = sx + 2; int ln = sy + 1; char linebuf[256]; int pn = snprintf(linebuf, sizeof(linebuf), "\x1b[%d;%dH%s", ln, col, title); if (pn>0) write(STDOUT_FILENO, linebuf, (size_t)pn);
+        // list entries
+        for (int i = 0; i < n; i++) {
+            int ln2 = sy + 2 + i;
+            int col2 = sx + 2;
+            char buf[512]; int rn = snprintf(buf, sizeof(buf), "\x1b[%d;%dH", ln2, col2);
+            if (rn>0) write(STDOUT_FILENO, buf, (size_t)rn);
+            if (i == sel) write(STDOUT_FILENO, "\x1b[7m", 4);
+            int is_dir = (matches[i][strlen(matches[i]) - 1] == '/');
+            if (is_dir) write(STDOUT_FILENO, "\x1b[32m", 5);
+            else write(STDOUT_FILENO, "\x1b[93m", 5);
+            write(STDOUT_FILENO, matches[i], strlen(matches[i]));
+            write(STDOUT_FILENO, "\x1b[0m", 4);
+            int pad = boxw - 4 - (int)strlen(matches[i]); if (pad > 0) { for (int p = 0; p < pad; p++) write(STDOUT_FILENO, " ", 1); }
+            if (i == sel) write(STDOUT_FILENO, "\x1b[m", 3);
+        }
+        // position cursor out of way
+        char cur[64]; int m = snprintf(cur, sizeof(cur), "\x1b[%d;%dH", sy + boxh, sx + 1); if (m>0) write(STDOUT_FILENO, cur, (size_t)m);
+        // read key
+        int k = readKey(); if (k == -1) continue;
+        if (k == ARROW_DOWN) { sel = (sel + 1) % n; continue; }
+        if (k == ARROW_UP) { sel = (sel - 1 + n) % n; continue; }
+        if (k == '\r' || k == '\n' || k == '\t') { return sel; }
+        if (k == 27 || k == 'q' || k == 'Q') { return -1; }
+    }
+}
+
+// -------------------------------------------------------------------------------------
+
 // helper: open a file into the current editor window (push current buffer to a new tab)
 static void open_file_in_current_window(const char *fname) {
     // push current file to new tab
@@ -3089,6 +3317,12 @@ static void editorRefreshScreen(void) {
         return;
     }
 
+    // Render suggestions overlay (if any) on top of the editor
+    if (SuggestionsVisible) {
+        render_suggestions_overlay();
+        return; // overlay drawn, skip further drawing to avoid artifacts
+    }
+
     // If file browser overlay visible, draw it on top and return
     // (drawn by show_file_browser when active)
     // if (E.browser_visible) { draw_file_browser(); return; }
@@ -3129,6 +3363,7 @@ static void editorProcessKeypress(void) {
     // Handle lone Escape: toggle help or mode. We already parse escape sequences
     // in readKey(), so c==27 here is a lone ESC key.
     if (c == 27) {
+        if (SuggestionsVisible) { clear_active_suggestions(); return; }
         if (E.help_visible) {
             E.help_visible = 0;
         } else {
@@ -3143,6 +3378,14 @@ static void editorProcessKeypress(void) {
             E.command_buf[0] = '\0';
         }
         return;
+    }
+
+    // If suggestions visible and in view mode, let ARROW/Enter/Tab/Esc control them
+    if (SuggestionsVisible && E.mode == MODE_VIEW) {
+        if (c == ARROW_DOWN) { ActiveMatchSel = (ActiveMatchSel + 1) % ActiveMatchesN; return; }
+        if (c == ARROW_UP) { ActiveMatchSel = (ActiveMatchSel - 1 + ActiveMatchesN) % ActiveMatchesN; return; }
+        if (c == '\r' || c == '\n' || c == '\t') { accept_active_suggestion(); return; }
+        if (c == 27) { clear_active_suggestions(); return; }
     }
 
     // Navigation keys - work in both modes
@@ -3340,6 +3583,8 @@ static void editorProcessKeypress(void) {
             // execute command in buffer
             if (E.command_len > 0) {
                 // null-terminate and process
+                // clear suggestions first (so overlay doesn't persist)
+                clear_active_suggestions();
                 E.command_buf[E.command_len] = '\0';
                 execute_command(E.command_buf);
             }
@@ -3351,6 +3596,8 @@ static void editorProcessKeypress(void) {
             if (E.command_len > 0) {
                 E.command_len--;
                 E.command_buf[E.command_len] = '\0';
+                // update suggestions when typing filename
+                update_suggestions_from_command();
             }
             return;
         }
@@ -3358,11 +3605,49 @@ static void editorProcessKeypress(void) {
             E.mode = MODE_EDIT;
             return;
         }
+        if (c == '\t') {
+            // Autocomplete for filename in commands like "open" and "opent".
+            // If buffer starts with open/opent, find filename part and show suggestions.
+            const char *cmds[] = {"open", "opent"};
+            for (int ci = 0; ci < (int)(sizeof(cmds)/sizeof(cmds[0])); ci++) {
+                const char *kw = cmds[ci]; size_t kwlen = strlen(kw);
+                if (E.command_len >= (int)kwlen && strncmp(E.command_buf, kw, kwlen) == 0) {
+                    // ensure next char is space or end
+                    if (E.command_len == (int)kwlen || E.command_buf[kwlen] == ' ') {
+                        // find start of filename (skip keyword and spaces)
+                        int pos = (int)kwlen; while (pos < E.command_len && E.command_buf[pos] == ' ') pos++;
+                        // build pattern from pos to end
+                        char pat[512] = {0}; int plen = 0;
+                        if (pos < E.command_len) { plen = E.command_len - pos; if (plen > (int)sizeof(pat)-1) plen = (int)sizeof(pat)-1; memcpy(pat, &E.command_buf[pos], plen); pat[plen] = '\0'; }
+                        int n = 0; int max_sugg = 8; char **matches = get_fuzzy_matches(".", pat, max_sugg, &n);
+                        if (n > 0) {
+                            int picked = pick_from_matches(matches, n);
+                            if (picked >= 0 && picked < n) {
+                                // replace buffer content from pos to end with chosen match
+                                int newlen = pos + (int)strlen(matches[picked]);
+                                if (newlen + 1 < (int)sizeof(E.command_buf)) {
+                                    // shift/replace
+                                    memcpy(&E.command_buf[pos], matches[picked], strlen(matches[picked]));
+                                    E.command_len = pos + (int)strlen(matches[picked]);
+                                    E.command_buf[E.command_len] = '\0';
+                                }
+                            }
+                            free_matches(matches, n);
+                        }
+                        break;
+                    }
+                }
+            }
+            return;
+        }
         if (isprint(c)) {
             if (E.command_len + 1 < (int)sizeof(E.command_buf)) {
                 E.command_buf[E.command_len++] = (char)c;
                 E.command_buf[E.command_len] = '\0';
+                // update suggestions when typing filename
+                update_suggestions_from_command();
             }
+            return;
         }
     }
 }
