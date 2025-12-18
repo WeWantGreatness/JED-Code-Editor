@@ -1,0 +1,24 @@
+name: Include classifier tests
+
+on:
+  push:
+    paths:
+      - 'include_classifier.c'
+      - 'include_classifier.h'
+      - 'tests/**'
+      - '.github/workflows/include-tests.yml'
+  pull_request:
+    paths:
+      - 'include_classifier.c'
+      - 'include_classifier.h'
+      - 'tests/**'
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build deps
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config
+      - name: Run tests
+        run: bash ./tests/run_include_tests.sh

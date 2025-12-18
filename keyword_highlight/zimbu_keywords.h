@@ -1,0 +1,198 @@
+/* Generated from vim syntax file */
+#include <stddef.h>
+static const char *zimbu_ctype[] = {
+    "GET",
+    "USE",
+    "VAR",
+    "array",
+    "bigInt",
+    "bigNat",
+    "bool",
+    "byte",
+    "byteString",
+    "callback",
+    "complex",
+    "complex128",
+    "complex32",
+    "complex64",
+    "complex80",
+    "cond",
+    "def",
+    "dict",
+    "dictList",
+    "dyn",
+    "evalThread",
+    "fixed1",
+    "fixed10",
+    "fixed11",
+    "fixed12",
+    "fixed13",
+    "fixed14",
+    "fixed15",
+    "fixed2",
+    "fixed3",
+    "fixed4",
+    "fixed5",
+    "fixed6",
+    "fixed7",
+    "fixed8",
+    "fixed9",
+    "float",
+    "float128",
+    "float32",
+    "float64",
+    "float80",
+    "func",
+    "int",
+    "int1",
+    "int10",
+    "int11",
+    "int12",
+    "int13",
+    "int14",
+    "int15",
+    "int16",
+    "int2",
+    "int3",
+    "int32",
+    "int4",
+    "int5",
+    "int6",
+    "int64",
+    "int7",
+    "int8",
+    "int9",
+    "list",
+    "lock",
+    "multiDict",
+    "multiDictList",
+    "multiSet",
+    "nat",
+    "nat1",
+    "nat10",
+    "nat11",
+    "nat12",
+    "nat13",
+    "nat14",
+    "nat15",
+    "nat16",
+    "nat2",
+    "nat3",
+    "nat32",
+    "nat4",
+    "nat5",
+    "nat6",
+    "nat64",
+    "nat7",
+    "nat8",
+    "nat9",
+    "pipe",
+    "proc",
+    "set",
+    "sortedList",
+    "status",
+    "string",
+    "thread",
+    "tuple",
+    "type",
+    "varByteString",
+    "varString",
+    NULL
+};
+
+static const char *zimbu_cstorageclass[] = {
+    NULL
+};
+
+static const char *zimbu_cstatement[] = {
+    "ABSTRACT",
+    "ALIAS",
+    "AS",
+    "BITS",
+    "BREAK",
+    "BUILD_ELSE",
+    "BUILD_ELSEIF",
+    "BUILD_IF",
+    "CASE",
+    "CATCH",
+    "CONNECT",
+    "CONTINUE",
+    "DEFAULT",
+    "DEFER",
+    "DEFINE",
+    "DO",
+    "ELSE",
+    "ELSEIF",
+    "ENUM",
+    "EXIT",
+    "EXTENDS",
+    "FINAL",
+    "FINALLY",
+    "FOR",
+    "GENERATE_ELSE",
+    "GENERATE_ELSEIF",
+    "GENERATE_ERROR",
+    "GENERATE_IF",
+    "IF",
+    "IFNIL",
+    "IMPLEMENTS",
+    "IMPORT",
+    "IN",
+    "INCLUDE",
+    "INTERFACE",
+    "LAMBDA",
+    "LOCAL",
+    "MAIN",
+    "MODULE",
+    "OPTIONS",
+    "PARENT",
+    "PART",
+    "PIECE",
+    "PROCEED",
+    "REPEAT",
+    "REPLACE",
+    "RETURN",
+    "SHARED",
+    "STATIC",
+    "STEP",
+    "SWITCH",
+    "THROW",
+    "TO",
+    "TRY",
+    "TYPE",
+    "UNTIL",
+    "VIRTUAL",
+    "WHILE",
+    "WITH",
+    "WRAP",
+    NULL
+};
+
+static const char *zimbu_cconditional[] = {
+    NULL
+};
+
+static const char *zimbu_crepeat[] = {
+    NULL
+};
+
+static const char *zimbu_coperator[] = {
+    "IS",
+    "ISA",
+    "ISNOT",
+    "ISNOTA",
+    NULL
+};
+
+static const char *zimbu_cconstant[] = {
+    NULL
+};
+
+static const char *zimbu_ctypedef[] = {
+    NULL
+};
+
+static const char *zimbu_cstructure[] = {
+    NULL
+};
+

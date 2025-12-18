@@ -1,0 +1,113 @@
+/* Generated from vim syntax file */
+#include <stddef.h>
+static const char *prolog_ctype[] = {
+    NULL
+};
+
+static const char *prolog_cstorageclass[] = {
+    NULL
+};
+
+static const char *prolog_cstatement[] = {
+    "abolish",
+    "append",
+    "arg",
+    "asserta",
+    "assertz",
+    "at_end_of_stream",
+    "atom",
+    "atom_chars",
+    "atom_codes",
+    "atom_concat",
+    "atom_length",
+    "atomic",
+    "bagof",
+    "call",
+    "catch",
+    "char_code",
+    "char_conversion",
+    "clause",
+    "close",
+    "compound",
+    "copy_term",
+    "current_char_conversion",
+    "current_input",
+    "current_op",
+    "current_output",
+    "current_predicate",
+    "current_prolog_flag",
+    "dynamic",
+    "fail",
+    "findall",
+    "float",
+    "flush_output",
+    "functor",
+    "get_byte",
+    "get_char",
+    "get_code",
+    "halt",
+    "integer",
+    "is",
+    "meta_predicate",
+    "module",
+    "multifile",
+    "nl",
+    "nonvar",
+    "number",
+    "number_chars",
+    "number_codes",
+    "once",
+    "op",
+    "open",
+    "peek_byte",
+    "peek_char",
+    "peek_code",
+    "put_byte",
+    "put_char",
+    "put_code",
+    "read",
+    "read_term",
+    "repeat",
+    "retract",
+    "set_input",
+    "set_output",
+    "set_prolog_flag",
+    "set_stream_position",
+    "setof",
+    "stream_property",
+    "sub_atom",
+    "throw",
+    "true",
+    "unify_with_occurs_check",
+    "var",
+    "write",
+    "write_canonical",
+    "write_term",
+    "writeq",
+    NULL
+};
+
+static const char *prolog_cconditional[] = {
+    NULL
+};
+
+static const char *prolog_crepeat[] = {
+    NULL
+};
+
+static const char *prolog_coperator[] = {
+    NULL
+};
+
+static const char *prolog_cconstant[] = {
+    NULL
+};
+
+static const char *prolog_ctypedef[] = {
+    NULL
+};
+
+static const char *prolog_cstructure[] = {
+    NULL
+};
+

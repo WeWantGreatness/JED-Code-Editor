@@ -1,0 +1,197 @@
+/* Generated from vim syntax file */
+#include <stddef.h>
+static const char *sh_ctype[] = {
+    NULL
+};
+
+static const char *sh_cstorageclass[] = {
+    NULL
+};
+
+static const char *sh_cstatement[] = {
+    "alarm",
+    "autoload",
+    "basename",
+    "bg",
+    "bind",
+    "break",
+    "builtin",
+    "caller",
+    "cat",
+    "cd",
+    "chdir",
+    "chgrp",
+    "chmod",
+    "chown",
+    "cksum",
+    "clear",
+    "cmp",
+    "comm",
+    "command",
+    "compgen",
+    "complete",
+    "compopt",
+    "compound",
+    "continue",
+    "cp",
+    "cut",
+    "date",
+    "declare",
+    "dirname",
+    "dirs",
+    "disown",
+    "du",
+    "egrep",
+    "eloop",
+    "enable",
+    "enum",
+    "eval",
+    "exec",
+    "exit",
+    "export",
+    "expr",
+    "false",
+    "fc",
+    "fds",
+    "fg",
+    "fgrep",
+    "find",
+    "float",
+    "fmt",
+    "fold",
+    "functions",
+    "getconf",
+    "getopts",
+    "grep",
+    "hash",
+    "head",
+    "help",
+    "hist",
+    "history",
+    "iconv",
+    "id",
+    "integer",
+    "jobs",
+    "join",
+    "kill",
+    "killall",
+    "less",
+    "let",
+    "ln",
+    "local",
+    "login",
+    "logname",
+    "logout",
+    "ls",
+    "mapfile",
+    "md5sum",
+    "mkdir",
+    "mkfifo",
+    "mknod",
+    "mkservice",
+    "mktemp",
+    "mv",
+    "nameref",
+    "newgrp",
+    "nice",
+    "nohup",
+    "od",
+    "paste",
+    "pathchk",
+    "pids",
+    "poll",
+    "popd",
+    "printenv",
+    "printf",
+    "pushd",
+    "pwd",
+    "r",
+    "read",
+    "readarray",
+    "readlink",
+    "readonly",
+    "realpath",
+    "redirect",
+    "reload",
+    "rename",
+    "restart",
+    "return",
+    "rev",
+    "rm",
+    "rmdir",
+    "sed",
+    "sha1sum",
+    "sha224sum",
+    "sha256sum",
+    "sha2sum",
+    "sha384sum",
+    "sha512sum",
+    "shift",
+    "shopt",
+    "skipwhite",
+    "sleep",
+    "sort",
+    "source",
+    "start",
+    "status",
+    "stop",
+    "strip",
+    "stty",
+    "sum",
+    "suspend",
+    "sync",
+    "tail",
+    "tee",
+    "test",
+    "time",
+    "times",
+    "tput",
+    "tr",
+    "trap",
+    "true",
+    "tty",
+    "type",
+    "typeset",
+    "ulimit",
+    "umask",
+    "unalias",
+    "uname",
+    "uniq",
+    "vmstate",
+    "wait",
+    "wc",
+    "whence",
+    "which",
+    "xargs",
+    "xgrep",
+    NULL
+};
+
+static const char *sh_cconditional[] = {
+    "contained",
+    "elif",
+    "else",
+    "then",
+    NULL
+};
+
+static const char *sh_crepeat[] = {
+    NULL
+};
+
+static const char *sh_coperator[] = {
+    NULL
+};
+
+static const char *sh_cconstant[] = {
+    NULL
+};
+
+static const char *sh_ctypedef[] = {
+    NULL
+};
+
+static const char *sh_cstructure[] = {
+    NULL
+};
+
