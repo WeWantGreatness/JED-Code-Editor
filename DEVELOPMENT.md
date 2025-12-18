@@ -41,6 +41,13 @@ Additional planned features
    - Add ability to open man pages directly within the editor or via a command (e.g., `:man <topic>`).
    - If not natively supported, integrate with the embedded terminal or external viewer.
 
+7. **Move Files in Browser**:
+   - Add `mv <path>` command to move files to a specified directory path.
+   - In the browser overlay, use `m` to select a file for moving, then navigate to the target directory and press `m` again with confirmation to move the file there (similar to delete confirmation).
+
+8. **Delete All Lines Command**:
+   - Implement `dall` command to delete all lines of code in the current file, similar to how `dl` deletes the selected line.
+
 Current state
 -------------
 - `Makefile` with `install` and `install-man` targets
