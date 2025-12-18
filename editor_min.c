@@ -329,6 +329,7 @@ static void run_embedded_terminal(void) {
             struct winsize _ws;
             if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &_ws) == 0) ioctl(masterfd, TIOCSWINSZ, &_ws);
             getWindowSize();
+            editorScroll();
             winch_received = 0;
         }
         FD_SET(masterfd, &rfds);
@@ -741,6 +742,7 @@ static void execute_command(const char *cmd);
 static void editorInsertChar(int c);
 static void editorInsertNewline(void);
 static void editorScroll(void);
+static void paste_at_cursor(void);
 
 // helper: delete line at index (0-based)
 static void delete_line_at(int idx) {
@@ -769,35 +771,352 @@ static void copy_line_n(int n) {
     snprintf(E.msg, sizeof(E.msg), "Copied line %d", n); E.msg_time = time(NULL);
 }
 
+static void copy_lines_list(int *list, int cnt) {
+    if (cnt <= 0) return;
+    // calculate total length
+    size_t total_len = 0;
+    for (int k = 0; k < cnt; k++) {
+        int ln = list[k];
+        if (ln < 1 || ln > E.numrows) continue;
+        total_len += strlen(E.rows[ln - 1]) + 1; // +1 for \n
+    }
+    if (total_len == 0) {
+        snprintf(E.msg, sizeof(E.msg), "No valid lines to copy"); E.msg_time = time(NULL); return;
+    }
+    char *buf = malloc(total_len);
+    if (!buf) { snprintf(E.msg, sizeof(E.msg), "Memory error"); E.msg_time = time(NULL); return; }
+    buf[0] = '\0';
+    for (int k = 0; k < cnt; k++) {
+        int ln = list[k];
+        if (ln < 1 || ln > E.numrows) continue;
+        if (buf[0]) strcat(buf, "\n");
+        strcat(buf, E.rows[ln - 1]);
+    }
+    free(E.clipboard);
+    E.clipboard = buf;
+    snprintf(E.msg, sizeof(E.msg), "Copied %d lines", cnt); E.msg_time = time(NULL);
+}
+
+static void delete_last_words(int n) {
+    if (n <= 0) return;
+    char *row = E.rows[E.cy];
+    int len = (int)strlen(row);
+    if (len == 0) return;
+    // find the last n words
+    int word_count = 0;
+    int pos = len - 1;
+    // skip trailing whitespace
+    while (pos >= 0 && (row[pos] == ' ' || row[pos] == '\t')) pos--;
+    while (pos >= 0 && word_count < n) {
+        // skip non-whitespace (word)
+        while (pos >= 0 && row[pos] != ' ' && row[pos] != '\t') pos--;
+        word_count++;
+        // skip whitespace
+        while (pos >= 0 && (row[pos] == ' ' || row[pos] == '\t')) pos--;
+    }
+    if (word_count < n) pos = -1; // delete all if not enough words
+    int new_len = pos + 1;
+    if (new_len < 0) new_len = 0;
+    row[new_len] = '\0';
+    E.cx = new_len;
+    if (E.cx > len) E.cx = len; // shouldn't happen
+    editorScroll();
+}
+
+static void delete_first_words(int n) {
+    if (n <= 0) return;
+    char *row = E.rows[E.cy];
+    int len = (int)strlen(row);
+    if (len == 0) return;
+    // find the first n words
+    int word_count = 0;
+    int pos = 0;
+    // skip leading whitespace
+    while (pos < len && (row[pos] == ' ' || row[pos] == '\t')) pos++;
+    while (pos < len && word_count < n) {
+        // skip word
+        while (pos < len && row[pos] != ' ' && row[pos] != '\t') pos++;
+        word_count++;
+        // skip whitespace
+        while (pos < len && (row[pos] == ' ' || row[pos] == '\t')) pos++;
+    }
+    if (word_count < n) pos = len; // delete all
+    // shift the rest
+    memmove(row, row + pos, len - pos + 1);
+    E.cx = 0;
+    editorScroll();
+}
+
 static void paste_at_line_n(int n) {
     if (!E.clipboard) { snprintf(E.msg, sizeof(E.msg), "Clipboard empty"); E.msg_time = time(NULL); return; }
     int at = n;
     if (at < 1) at = 1;
     if (at > E.numrows) at = E.numrows + 1;
-    // If the target line exists and is blank (empty or only whitespace), replace it instead of inserting.
     save_snapshot();
     int target_idx = at - 1;
+    const char *p = E.clipboard;
+    // Helper: iterate over clipboard lines, splitting on '\n'
+    // If target exists and is non-blank, append first clipboard line to it and insert remaining lines after.
     if (target_idx >= 0 && target_idx < E.numrows) {
         char *t = E.rows[target_idx];
         int j = 0; int onlyws = 1;
         while (t[j]) { if (t[j] != ' ' && t[j] != '\t' && t[j] != '\r' && t[j] != '\n') { onlyws = 0; break; } j++; }
+        // find first clipboard line
+        const char *nl = strchr(p, '\n');
+        size_t first_len = nl ? (size_t)(nl - p) : strlen(p);
+        // determine insertion column: always append for pl<N>
+        int insert_col = (int)strlen(E.rows[target_idx]);
         if (onlyws) {
-            // replace existing blank row
+            // replace existing blank row with first line
             free(E.rows[target_idx]);
-            E.rows[target_idx] = strdup(E.clipboard);
-            if (!E.rows[target_idx]) die("strdup");
+            E.rows[target_idx] = malloc(first_len + 1);
+            if (!E.rows[target_idx]) die("malloc");
+            memcpy(E.rows[target_idx], p, first_len);
+            E.rows[target_idx][first_len] = '\0';
             E.cy = target_idx;
             E.cx = (int)strlen(E.rows[target_idx]);
             editorScroll();
+            // insert remaining lines after target
+            const char *rest = nl ? (nl + 1) : NULL;
+            while (rest && *rest) {
+                const char *n2 = strchr(rest, '\n');
+                size_t L = n2 ? (size_t)(n2 - rest) : strlen(rest);
+                begin_batch();
+                editorInsertRow(target_idx + 1, "");
+                // replace the newly inserted row with proper content
+                free(E.rows[target_idx + 1]);
+                E.rows[target_idx + 1] = malloc(L + 1);
+                if (!E.rows[target_idx + 1]) die("malloc");
+                memcpy(E.rows[target_idx + 1], rest, L); E.rows[target_idx + 1][L] = '\0';
+                end_batch();
+                target_idx++;
+                rest = n2 ? (n2 + 1) : NULL;
+            }
             snprintf(E.msg, sizeof(E.msg), "Pasted into line %d", at); E.msg_time = time(NULL);
+            return;
+        } else {
+            // insert first line at insert_col (not necessarily append)
+            int oldlen = (int)strlen(E.rows[target_idx]);
+            int ins = insert_col;
+            if (ins < 0) ins = 0; if (ins > oldlen) ins = oldlen;
+            char *newrow = malloc(oldlen + (int)first_len + 1);
+            if (!newrow) die("malloc");
+            // copy prefix
+            memcpy(newrow, E.rows[target_idx], ins);
+            // copy clipboard first fragment
+            memcpy(newrow + ins, p, first_len);
+            // copy suffix
+            memcpy(newrow + ins + first_len, E.rows[target_idx] + ins, oldlen - ins + 1);
+            free(E.rows[target_idx]);
+            E.rows[target_idx] = newrow;
+            // if there are more lines in clipboard, insert them after target
+            const char *rest = nl ? (nl + 1) : NULL;
+            int last_idx = target_idx;
+            while (rest && *rest) {
+                const char *n2 = strchr(rest, '\n');
+                size_t L = n2 ? (size_t)(n2 - rest) : strlen(rest);
+                begin_batch();
+                editorInsertRow(last_idx + 1, "");
+                free(E.rows[last_idx + 1]);
+                E.rows[last_idx + 1] = malloc(L + 1);
+                if (!E.rows[last_idx + 1]) die("malloc");
+                memcpy(E.rows[last_idx + 1], rest, L); E.rows[last_idx + 1][L] = '\0';
+                end_batch();
+                last_idx++;
+                rest = n2 ? (n2 + 1) : NULL;
+            }
+            E.cy = last_idx;
+            E.cx = (int)strlen(E.rows[last_idx]);
+            editorScroll();
+            snprintf(E.msg, sizeof(E.msg), "Pasted at line %d", at); E.msg_time = time(NULL);
             return;
         }
     }
-    // otherwise insert at position at-1 (0-based)
-    begin_batch();
-    editorInsertRow(at - 1, E.clipboard);
-    end_batch();
+    // target does not exist (append past end) -> insert all clipboard lines starting at at-1
+    int insert_idx = at - 1;
+    const char *rest = p;
+    int last_idx = insert_idx - 1;
+    while (rest && *rest) {
+        const char *n2 = strchr(rest, '\n');
+        size_t L = n2 ? (size_t)(n2 - rest) : strlen(rest);
+        begin_batch();
+        editorInsertRow(last_idx + 1, "");
+        free(E.rows[last_idx + 1]);
+        E.rows[last_idx + 1] = malloc(L + 1);
+        if (!E.rows[last_idx + 1]) die("malloc");
+        memcpy(E.rows[last_idx + 1], rest, L); E.rows[last_idx + 1][L] = '\0';
+        end_batch();
+        last_idx++;
+        rest = n2 ? (n2 + 1) : NULL;
+    }
+    E.cy = last_idx;
+    E.cx = (int)strlen(E.rows[last_idx]);
+    editorScroll();
     snprintf(E.msg, sizeof(E.msg), "Pasted at line %d", at); E.msg_time = time(NULL);
+}
+
+static void paste_at_line_n_front(int n) {
+    if (!E.clipboard) { snprintf(E.msg, sizeof(E.msg), "Clipboard empty"); E.msg_time = time(NULL); return; }
+    int at = n;
+    if (at < 1) at = 1;
+    if (at > E.numrows) at = E.numrows + 1;
+    save_snapshot();
+    int target_idx = at - 1;
+    const char *p = E.clipboard;
+    // Helper: iterate over clipboard lines, splitting on '\n'
+    // If target exists and is non-blank, insert first clipboard line at front and insert remaining lines after.
+    if (target_idx >= 0 && target_idx < E.numrows) {
+        char *t = E.rows[target_idx];
+        int j = 0; int onlyws = 1;
+        while (t[j]) { if (t[j] != ' ' && t[j] != '\t' && t[j] != '\r' && t[j] != '\n') { onlyws = 0; break; } j++; }
+        // find first clipboard line
+        const char *nl = strchr(p, '\n');
+        size_t first_len = nl ? (size_t)(nl - p) : strlen(p);
+        // determine insertion column: always front for plf<N>
+        int insert_col = 0;
+        if (onlyws) {
+            // replace existing blank row with first line
+            free(E.rows[target_idx]);
+            E.rows[target_idx] = malloc(first_len + 1);
+            if (!E.rows[target_idx]) die("malloc");
+            memcpy(E.rows[target_idx], p, first_len);
+            E.rows[target_idx][first_len] = '\0';
+            E.cy = target_idx;
+            E.cx = (int)strlen(E.rows[target_idx]);
+            editorScroll();
+            // insert remaining lines after target
+            const char *rest = nl ? (nl + 1) : NULL;
+            while (rest && *rest) {
+                const char *n2 = strchr(rest, '\n');
+                size_t L = n2 ? (size_t)(n2 - rest) : strlen(rest);
+                begin_batch();
+                editorInsertRow(target_idx + 1, "");
+                // replace the newly inserted row with proper content
+                free(E.rows[target_idx + 1]);
+                E.rows[target_idx + 1] = malloc(L + 1);
+                if (!E.rows[target_idx + 1]) die("malloc");
+                memcpy(E.rows[target_idx + 1], rest, L); E.rows[target_idx + 1][L] = '\0';
+                end_batch();
+                target_idx++;
+                rest = n2 ? (n2 + 1) : NULL;
+            }
+            snprintf(E.msg, sizeof(E.msg), "Pasted into line %d", at); E.msg_time = time(NULL);
+            return;
+        } else {
+            // insert first line at insert_col (front)
+            int oldlen = (int)strlen(E.rows[target_idx]);
+            int ins = insert_col;
+            if (ins < 0) ins = 0; if (ins > oldlen) ins = oldlen;
+            char *newrow = malloc(oldlen + (int)first_len + 1);
+            if (!newrow) die("malloc");
+            // copy prefix
+            memcpy(newrow, E.rows[target_idx], ins);
+            // copy clipboard first fragment
+            memcpy(newrow + ins, p, first_len);
+            // copy suffix
+            memcpy(newrow + ins + first_len, E.rows[target_idx] + ins, oldlen - ins + 1);
+            free(E.rows[target_idx]);
+            E.rows[target_idx] = newrow;
+            // if there are more lines in clipboard, insert them after target
+            const char *rest = nl ? (nl + 1) : NULL;
+            int last_idx = target_idx;
+            while (rest && *rest) {
+                const char *n2 = strchr(rest, '\n');
+                size_t L = n2 ? (size_t)(n2 - rest) : strlen(rest);
+                begin_batch();
+                editorInsertRow(last_idx + 1, "");
+                free(E.rows[last_idx + 1]);
+                E.rows[last_idx + 1] = malloc(L + 1);
+                if (!E.rows[last_idx + 1]) die("malloc");
+                memcpy(E.rows[last_idx + 1], rest, L); E.rows[last_idx + 1][L] = '\0';
+                end_batch();
+                last_idx++;
+                rest = n2 ? (n2 + 1) : NULL;
+            }
+            E.cy = last_idx;
+            E.cx = (int)strlen(E.rows[last_idx]);
+            editorScroll();
+            snprintf(E.msg, sizeof(E.msg), "Pasted at line %d", at); E.msg_time = time(NULL);
+            return;
+        }
+    }
+    // target does not exist (append past end) -> insert all clipboard lines starting at at-1
+    int insert_idx = at - 1;
+    const char *rest = p;
+    int last_idx = insert_idx - 1;
+    while (rest && *rest) {
+        const char *n2 = strchr(rest, '\n');
+        size_t L = n2 ? (size_t)(n2 - rest) : strlen(rest);
+        begin_batch();
+        editorInsertRow(last_idx + 1, "");
+        free(E.rows[last_idx + 1]);
+        E.rows[last_idx + 1] = malloc(L + 1);
+        if (!E.rows[last_idx + 1]) die("malloc");
+        memcpy(E.rows[last_idx + 1], rest, L); E.rows[last_idx + 1][L] = '\0';
+        end_batch();
+        last_idx++;
+        rest = n2 ? (n2 + 1) : NULL;
+    }
+    E.cy = last_idx;
+    E.cx = (int)strlen(E.rows[last_idx]);
+    editorScroll();
+    snprintf(E.msg, sizeof(E.msg), "Pasted at line %d", at); E.msg_time = time(NULL);
+}
+
+static void paste_at_cursor(void) {
+    if (!E.clipboard) { snprintf(E.msg, sizeof(E.msg), "Clipboard empty"); E.msg_time = time(NULL); return; }
+    save_snapshot();
+    // Insert clipboard content at current cursor position within the current row.
+    if (E.cy < 0) E.cy = 0;
+    if (E.cy >= E.numrows) {
+        while (E.numrows <= E.cy) editorAppendRow("");
+    }
+    char *row = E.rows[E.cy];
+    int rowlen = (int)strlen(row);
+    if (E.cx < 0) E.cx = 0; if (E.cx > rowlen) E.cx = rowlen;
+    const char *p = E.clipboard;
+    const char *nl = strchr(p, '\n');
+    if (!nl) {
+        // single-line clipboard -> insert into current row
+        size_t addlen = strlen(p);
+        char *newrow = malloc(rowlen + (int)addlen + 1);
+        if (!newrow) die("malloc");
+        memcpy(newrow, row, E.cx);
+        memcpy(newrow + E.cx, p, addlen);
+        memcpy(newrow + E.cx + addlen, row + E.cx, rowlen - E.cx + 1);
+        free(E.rows[E.cy]); E.rows[E.cy] = newrow;
+        E.cx += (int)addlen;
+        editorScroll();
+        snprintf(E.msg, sizeof(E.msg), "Pasted at cursor"); E.msg_time = time(NULL);
+        return;
+    }
+    // multi-line clipboard: insert first part into current row at cursor, then insert remaining lines below
+    size_t first_len = (size_t)(nl - p);
+    char *first_part = malloc(E.cx + (int)first_len + 1);
+    if (!first_part) die("malloc");
+    memcpy(first_part, row, E.cx);
+    memcpy(first_part + E.cx, p, first_len);
+    first_part[E.cx + first_len] = '\0';
+    free(E.rows[E.cy]); E.rows[E.cy] = first_part;
+    int last_idx = E.cy;
+    const char *rest = nl + 1;
+    while (rest && *rest) {
+        const char *n2 = strchr(rest, '\n');
+        size_t L = n2 ? (size_t)(n2 - rest) : strlen(rest);
+        begin_batch();
+        editorInsertRow(last_idx + 1, "");
+        free(E.rows[last_idx + 1]);
+        E.rows[last_idx + 1] = malloc(L + 1);
+        if (!E.rows[last_idx + 1]) die("malloc");
+        memcpy(E.rows[last_idx + 1], rest, L); E.rows[last_idx + 1][L] = '\0';
+        end_batch();
+        last_idx++;
+        rest = n2 ? (n2 + 1) : NULL;
+    }
+    E.cy = last_idx;
+    E.cx = (int)strlen(E.rows[last_idx]);
+    editorScroll();
+    snprintf(E.msg, sizeof(E.msg), "Pasted at cursor (multi-line)"); E.msg_time = time(NULL);
 }
 
 // parse a positive integer from s[pos], update pos via *pidx; return -1 if no digits
@@ -1164,11 +1483,67 @@ static void execute_command(const char *cmd) {
             copy_whole_line(); i += 3; continue;
         }
         if (i + 1 < L && strncmp(&cmd[i], "cl", 2) == 0) {
-            i += 2; int num = parse_number_at(cmd, &i); if (num > 0) copy_line_n(num); continue;
+            i += 2;
+            if (!isdigit((unsigned char)cmd[i])) {
+                // copy current line
+                copy_line_n(E.cy + 1); continue;
+            } else {
+                int *list = NULL; int cnt = 0;
+                int starti = i;
+                if (parse_line_list(cmd, &i, &list, &cnt) == 0 && cnt > 0) {
+                    copy_lines_list(list, cnt);
+                    free(list);
+                } else {
+                    i = starti; // rollback to single number
+                    int num = parse_number_at(cmd, &i);
+                    if (num > 0) copy_line_n(num);
+                }
+                continue;
+            }
+        }
+        if (i + 2 < L && strncmp(&cmd[i], "plf", 3) == 0) {
+            i += 3; int num = parse_number_at(cmd, &i); if (num > 0) { save_snapshot(); paste_at_line_n_front(num); } continue;
         }
         if (i + 1 < L && strncmp(&cmd[i], "pl", 2) == 0) {
             i += 2; int num = parse_number_at(cmd, &i); if (num > 0) { save_snapshot(); paste_at_line_n(num); } continue;
         }
+        // dall -> delete all lines (clear buffer)
+        if (i + 3 < L && strncmp(&cmd[i], "dall", 4) == 0) {
+            i += 4;
+            save_snapshot();
+            editorFreeRows();
+            editorAppendRow("");
+            free(E.saved_snapshot); E.saved_snapshot = serialize_buffer();
+            E.cy = 0; E.cx = 0;
+            snprintf(E.msg, sizeof(E.msg), "Deleted all lines"); E.msg_time = time(NULL);
+            continue;
+        }
+
+        // dl<N>w -> delete last N words on current line
+        if (i + 2 < L && strncmp(&cmd[i], "dl", 2) == 0) {
+            int save_i = i;
+            i += 2;
+            int num = parse_number_at(cmd, &i);
+            if (num > 0 && i < L && cmd[i] == 'w') {
+                i++; // consume 'w'
+                save_snapshot(); delete_last_words(num);
+                continue;
+            }
+            i = save_i; // rollback
+        }
+        // df<N>w -> delete first N words on current line
+        if (i + 2 < L && strncmp(&cmd[i], "df", 2) == 0) {
+            int save_i = i;
+            i += 2;
+            int num = parse_number_at(cmd, &i);
+            if (num > 0 && i < L && cmd[i] == 'w') {
+                i++; // consume 'w'
+                save_snapshot(); delete_first_words(num);
+                continue;
+            }
+            i = save_i; // rollback
+        }
+
         if (i + 1 < L && strncmp(&cmd[i], "dl", 2) == 0) {
             i += 2;
             if (!isdigit((unsigned char)cmd[i])) {
@@ -1179,20 +1554,50 @@ static void execute_command(const char *cmd) {
                 int starti = i;
                 if (parse_line_list(cmd, &i, &list, &cnt) == 0 && cnt > 0) {
                     save_snapshot();
-                    // deduplicate and sort descending
-                    // simple approach: mark valid ones and delete highest first
+                    // process each line: clear text, delete if empty/whitespace
                     for (int k = 0; k < cnt; k++) {
-                        int v = list[k]; if (v < 1 || v > E.numrows) list[k] = -1;
-                    }
-                    // sort (descending)
-                    for (int a = 0; a < cnt; a++) for (int b = a+1; b < cnt; b++) if (list[a] < list[b]) { int t = list[a]; list[a] = list[b]; list[b] = t; }
-                    for (int k = 0; k < cnt; k++) {
-                        if (list[k] <= 0) continue;
-                        delete_line_at(list[k] - 1);
+                        int ln = list[k];
+                        if (ln < 1 || ln > E.numrows) continue;
+                        int idx = ln - 1;
+                        char *row = E.rows[idx];
+                        int len = (int)strlen(row);
+                        int is_whitespace = 1;
+                        for (int j = 0; j < len; j++) {
+                            if (row[j] != ' ' && row[j] != '\t' && row[j] != '\r' && row[j] != '\n') {
+                                is_whitespace = 0;
+                                break;
+                            }
+                        }
+                        if (is_whitespace) {
+                            delete_line_at(idx);
+                        } else {
+                            row[0] = '\0';
+                            if (E.cy == idx) E.cx = 0;
+                        }
                     }
                     free(list);
                 } else {
-                    i = starti; // rollback
+                    i = starti; // rollback to single number
+                    int num = parse_number_at(cmd, &i);
+                    if (num >= 1 && num <= E.numrows) {
+                        save_snapshot();
+                        int idx = num - 1;
+                        char *row = E.rows[idx];
+                        int len = (int)strlen(row);
+                        int is_whitespace = 1;
+                        for (int j = 0; j < len; j++) {
+                            if (row[j] != ' ' && row[j] != '\t' && row[j] != '\r' && row[j] != '\n') {
+                                is_whitespace = 0;
+                                break;
+                            }
+                        }
+                        if (is_whitespace) {
+                            delete_line_at(idx);
+                        } else {
+                            row[0] = '\0';
+                            if (E.cy == idx) E.cx = 0;
+                        }
+                    }
                 }
                 continue;
             }
@@ -1222,11 +1627,11 @@ static void execute_command(const char *cmd) {
         // tabs - list tabs
         if (i + 3 < L && strncmp(&cmd[i], "tabs", 4) == 0) {
             i += 4;
-            // build a small list into E.msg (truncate if needed). Include current buffer as tab 1, then stored tabs 2..N+1
+            // build a small list into E.msg (truncate if needed). Include home as tab 1, then stored tabs 2..N+1
             char buf[256]; buf[0] = '\0'; int p = 0;
-            // current buffer
-            const char *cname = E.filename ? E.filename : "(No Name)";
-            int n = snprintf(buf + p, sizeof(buf) - p, "1:%s ", cname); if (n > 0) p += n;
+            // home tab
+            const char *hname = (CurTab == -1) ? (E.filename ? E.filename : "(No Name)") : (HaveHomeTab && HomeTab.name ? HomeTab.name : "(No Name)");
+            int n = snprintf(buf + p, sizeof(buf) - p, "1:%s ", hname); if (n > 0) p += n;
             for (int t = 0; t < NumTabs; t++) {
                 int n2 = snprintf(buf + p, sizeof(buf) - p, "%d:%s ", t+2, Tabs[t].name ? Tabs[t].name : "");
                 if (n2 <= 0) break; p += n2; if (p >= (int)sizeof(buf)-20) break;
@@ -1391,6 +1796,10 @@ static void execute_command(const char *cmd) {
         if (cmd[i] == 's') {
             char next = (i + 1 < L) ? cmd[i+1] : '\0';
             if (next == '\0' || next == ' ') { save_to_file(NULL); i++; continue; } else { i++; continue; }
+        }
+        if (cmd[i] == 'p') {
+            char next = (i + 1 < L) ? cmd[i+1] : '\0';
+            if (next == '\0' || next == ' ') { paste_at_cursor(); i++; continue; } else { i++; continue; }
         }
         if (cmd[i] == 'q') {
             char next = (i + 1 < L) ? cmd[i+1] : '\0';
@@ -1687,10 +2096,16 @@ static void draw_help_overlay(void) {
         "\x1b[93mu\x1b[0m                Undo",
         "\x1b[93mr\x1b[0m                Redo",
         "\x1b[93mcwl\x1b[0m              Copy Current Line",
-        "\x1b[93mcl<N>\x1b[0m            Copy Line N",
+        "\x1b[93mcl<N>\x1b[0m            Copy Line(s) N or Range",
+        "\x1b[93mp\x1b[0m                Paste at cursor",
         "\x1b[93mpl<N>\x1b[0m            Paste at Line N",
+        "\x1b[93mplf<N>\x1b[0m           Paste at Front of Line N",
+        "\x1b[93mdall\x1b[0m             Delete all lines",
         "\x1b[93mdl\x1b[0m               Delete current line",
-        "\x1b[93mdl<Range>\x1b[0m        Delete range (e.g. dl1-5)",
+        "\x1b[93mdl<Range>\x1b[0m        Clear text on range (remove empty lines)",
+        "\x1b[93mdl<N>\x1b[0m            Clear text on line N (remove if empty)",
+        "\x1b[93mdl<N>w\x1b[0m           Delete last N words",
+        "\x1b[93mdf<N>w\x1b[0m           Delete first N words",
         "",
         "\x1b[96mNavigation\x1b[0m",
         "\x1b[93mjl<N>\x1b[0m            Jump to Front of Line N",
@@ -1780,10 +2195,16 @@ static void open_help_tab(void) {
         "u                Undo",
         "r                Redo",
         "cwl              Copy Current Line",
-        "cl<N>            Copy Line N",
+        "cl<N>            Copy Line(s) N or Range",
+        "p                Paste at cursor",
         "pl<N>            Paste at Line N",
+        "plf<N>           Paste at Front of Line N",
+        "dall             Delete all lines",
         "dl               Delete current line",
-        "dl<Range>        Delete range (e.g. dl1-5)",
+        "dl<Range>        Clear text on range (remove empty lines)",
+        "dl<N>            Clear text on line N (remove if empty)",
+        "dl<N>w           Delete last N words",
+        "df<N>w           Delete first N words",
         "",
         "Navigation",
         "jl<N>            Jump to Front of Line N",
@@ -1935,7 +2356,7 @@ static void show_file_browser(void) {
     char selbuf[32] = {0}; int selpos = 0;
     while (1) {
         /* if terminal was resized, update dimensions and recompute page size */
-        if (winch_received) { getWindowSize(); winch_received = 0; }
+        if (winch_received) { getWindowSize(); editorScroll(); editorRefreshScreen(); winch_received = 0; }
         int page_size = E.screenrows - 8; if (page_size < 3) page_size = 3;
 
         // clear underlying editor region (lines below status/tab) to avoid leftover artifacts
@@ -1957,26 +2378,60 @@ static void show_file_browser(void) {
         // compute box width/height ensuring it can contain the widest entry and prompt
         int minBoxW = local_prefix + maxn + 4;
         int boxw = minBoxW;
-        // help text for second line: use the explicit parenthetical labels the user requested
-        char promptBase[128]; snprintf(promptBase, sizeof(promptBase), "\x1b[93mPgUp/PgDn\x1b[0m (page), \x1b[93mBackspace\x1b[0m (Back), \x1b[93mq/ESC\x1b[0m (cancel)");
-        int promptBaseLen = (int)strlen(promptBase);
-        int required_prompt_len = promptBaseLen;
-        /* increase margin so the full prompt isn't clipped prematurely */
-        if (required_prompt_len + 12 > boxw) boxw = required_prompt_len + 12;
         /*
          * If there's more horizontal space available than the minimum required,
          * prefer to use it so long paths/help text aren't unnecessarily
          * truncated. This makes the overlay expand when the terminal is
          * enlarged.
          */
-        if (E.screencols - 2 > boxw) boxw = E.screencols - 2;
-        if (boxw > E.screencols - 2) boxw = E.screencols - 2; // still clamp as a safety
+        if (E.screencols > boxw) boxw = E.screencols;
+        if (boxw > E.screencols) boxw = E.screencols; // still clamp as a safety
         // add an extra line so we can render two prompt lines (selection + help)
         int boxh = (end - start) + 5;
         if (boxh > E.screenrows - 4) boxh = E.screenrows - 4;
         int max_base = boxw - 3 - 1;
         if (max_base < 0) max_base = 0;
-        int display_plen = (promptBaseLen > max_base) ? max_base : promptBaseLen;
+        // help text for second line: use the explicit parenthetical labels the user requested
+        char promptBase[128];
+        const char *fullPrompt = "\x1b[93mPgUp/PgDn\x1b[0m (page), \x1b[93mBackspace\x1b[0m (Back), \x1b[93mq/ESC\x1b[0m (cancel)";
+        const char *shortPrompt = "\x1b[93mPgUp/Dn\x1b[0m (pg), \x1b[93mBS\x1b[0m (bk), \x1b[93mq\x1b[0m (can)";
+        // helper to calculate visible length (ignoring ANSI escape codes)
+        int visible_len(const char *s) {
+            int len = 0;
+            while (*s) {
+                if (*s == '\x1b') {
+                    while (*s && *s != 'm') s++;
+                    if (*s) s++;
+                } else {
+                    len++;
+                    s++;
+                }
+            }
+            return len;
+        }
+        // helper to find string index for given visible length
+        int visible_index(const char *s, int vis) {
+            int len = 0;
+            int idx = 0;
+            while (*s && len < vis) {
+                if (*s == '\x1b') {
+                    while (*s && *s != 'm') { s++; idx++; }
+                    if (*s) { s++; idx++; }
+                } else {
+                    len++;
+                    s++;
+                    idx++;
+                }
+            }
+            return idx;
+        }
+        int fullVisible = visible_len(fullPrompt);
+        int useShort = (fullVisible > max_base) ? 1 : 0;
+        const char *chosenPrompt = useShort ? shortPrompt : fullPrompt;
+        int chosenVisible = visible_len(chosenPrompt);
+        int trunc_visible = (chosenVisible > max_base) ? max_base : chosenVisible;
+        int trunc_index = visible_index(chosenPrompt, trunc_visible);
+        snprintf(promptBase, sizeof(promptBase), "%.*s", trunc_index, chosenPrompt);
         int sx = 1; int sy = (E.screenrows - boxh) / 2; // left-align overlay so it covers editor gutter
         // background -- clear the whole box region to avoid leftover artifacts
         for (int y = 0; y < boxh; y++) {
@@ -2028,9 +2483,7 @@ static void show_file_browser(void) {
         // 2) help line (PgUp/PgDn, Backspace behavior, q to cancel)
         {
             int ln = sy + boxh - 1; int col = sx + 3;
-            int plen = display_plen;
-            char trunc[256]; strncpy(trunc, promptBase, plen); trunc[plen] = '\0';
-            char pbuf2[512]; int n2 = snprintf(pbuf2, sizeof(pbuf2), "\x1b[%d;%dH%s", ln, col, trunc);
+            char pbuf2[512]; int n2 = snprintf(pbuf2, sizeof(pbuf2), "\x1b[%d;%dH%s", ln, col, promptBase);
             if (n2>0) write(STDOUT_FILENO, pbuf2, (size_t)n2);
         }
         // move cursor to selection input area (on selection line)
@@ -2263,50 +2716,60 @@ static void editorRefreshScreen(void) {
 
     // Optionally render a tab bar below the status row
     if (conf.show_tab_bar) {
-        // build and render a simple tab bar: current buffer followed by saved tabs
-        // format: [*]name  [1]name  [2]name ... where the active entry is reverse-video
+        // build and render a simple tab bar: fixed order [1]home [2]stored0 [3]stored1...
+        // format: [1]name[*] [2]name[*] ... where the active entry is reverse-video
         int remaining = E.screencols;
-        // render current buffer first (active when CurTab == -1)
-        const char *cname = E.filename ? E.filename : "(No Name)";
-        // detect unsaved for current buffer by comparing saved snapshot
-        int cur_unsaved = 0;
-        {
+        // determine home name and unsaved
+        const char *home_name;
+        int home_unsaved = 0;
+        if (CurTab == -1) {
+            home_name = E.filename ? E.filename : "(No Name)";
             char *curss = serialize_buffer();
             if (curss) {
-                if (!(E.saved_snapshot && strcmp(E.saved_snapshot, curss) == 0)) cur_unsaved = 1;
+                if (!(E.saved_snapshot && strcmp(E.saved_snapshot, curss) == 0)) home_unsaved = 1;
                 free(curss);
             }
-        }
-        int cur_num = 1;
-        int cur_num_digits = snprintf(NULL, 0, "%d", cur_num);
-        int need = (cur_num_digits + 2) + (int)strlen(cname) + (cur_unsaved ? 1 : 0) + 1; // [N]name[*]
-        if (need > remaining) {
-            // write truncated prefix (no coloring when truncated)
-            char pfx[32]; int pn = snprintf(pfx, sizeof(pfx), "[%d]", cur_num);
-            if (pn > remaining) write(STDOUT_FILENO, pfx, remaining);
-            else {
-                if (CurTab == -1) write(STDOUT_FILENO, "\x1b[7m", 4);
-                write(STDOUT_FILENO, pfx, pn);
-                int can = remaining - pn;
-                if (can > 0) write(STDOUT_FILENO, cname, can);
-                if (CurTab == -1) write(STDOUT_FILENO, "\x1b[m", 3);
-            }
-            remaining = 0;
         } else {
-            if (CurTab == -1) write(STDOUT_FILENO, "\x1b[7m", 4); // reverse for active
-            // write [1] with yellow '1'
-            write(STDOUT_FILENO, "[", 1);
-            write(STDOUT_FILENO, "\x1b[93m", 5);
-            write(STDOUT_FILENO, "1", 1);
-            write(STDOUT_FILENO, "\x1b[0m", 4);
-            write(STDOUT_FILENO, "]", 1);
-            write(STDOUT_FILENO, cname, strlen(cname));
-            if (cur_unsaved) write(STDOUT_FILENO, "\x1b[91m*\x1b[0m", 8);
-            write(STDOUT_FILENO, " ", 1);
-            if (CurTab == -1) write(STDOUT_FILENO, "\x1b[m", 3);
-            remaining -= need;
+            home_name = HaveHomeTab && HomeTab.name ? HomeTab.name : "(No Name)";
+            if (HomeTab.saved_snapshot && HomeTab.snapshot) {
+                home_unsaved = (strcmp(HomeTab.saved_snapshot, HomeTab.snapshot) != 0);
+            } else if (HomeTab.saved_snapshot == NULL && HomeTab.snapshot) {
+                home_unsaved = 1;
+            }
         }
-        // render stored tabs with colored numbers and unsaved marker
+        int tab_index = 1;
+        // render home
+        {
+            int namelen = (int)strlen(home_name);
+            int bracket_len = 4 + (home_unsaved ? 1 : 0); // [1] or [*1]
+            int blen = bracket_len + namelen + 1; // + space
+            if (blen > remaining) {
+                char pfx[32]; int pn = home_unsaved ? snprintf(pfx, sizeof(pfx), "[*1]") : snprintf(pfx, sizeof(pfx), "[1]");
+                if (CurTab == -1) write(STDOUT_FILENO, "\x1b[7m", 4);
+                if (pn > remaining) write(STDOUT_FILENO, pfx, remaining);
+                else {
+                    write(STDOUT_FILENO, pfx, pn);
+                    int can = remaining - pn;
+                    if (can > 0) write(STDOUT_FILENO, home_name, can);
+                }
+                if (CurTab == -1) write(STDOUT_FILENO, "\x1b[m", 3);
+                remaining = 0;
+            } else {
+                if (CurTab == -1) write(STDOUT_FILENO, "\x1b[7m", 4);
+                write(STDOUT_FILENO, "[", 1);
+                if (home_unsaved) write(STDOUT_FILENO, "\x1b[91m*\x1b[0m", 8);
+                write(STDOUT_FILENO, "\x1b[93m", 5);
+                write(STDOUT_FILENO, "1", 1);
+                write(STDOUT_FILENO, "\x1b[0m", 4);
+                write(STDOUT_FILENO, "]", 1);
+                write(STDOUT_FILENO, home_name, namelen);
+                write(STDOUT_FILENO, " ", 1);
+                if (CurTab == -1) write(STDOUT_FILENO, "\x1b[m", 3);
+                remaining -= blen;
+            }
+            tab_index++;
+        }
+        // render stored tabs
         for (int t = 0; t < NumTabs && remaining > 0; t++) {
             const char *tname = Tabs[t].name ? Tabs[t].name : "(No Name)";
             int namelen = (int)strlen(tname);
@@ -2314,45 +2777,37 @@ static void editorRefreshScreen(void) {
             if (Tabs[t].saved_snapshot && Tabs[t].snapshot) {
                 unsaved = (strcmp(Tabs[t].saved_snapshot, Tabs[t].snapshot) != 0);
             } else if (Tabs[t].saved_snapshot == NULL && Tabs[t].snapshot) {
-                unsaved = 1; // unknown or unsaved
+                unsaved = 1;
             }
-            // displayed length: [N]name[*] and space (compute digits properly)
-            int displayed_num = t + 2;
-            int num_digits = snprintf(NULL, 0, "%d", displayed_num);
-            int blen = (num_digits + 2) + namelen + (unsaved ? 1 : 0) + 1;
+            int num_digits = snprintf(NULL, 0, "%d", tab_index);
+            int bracket_len = 2 + num_digits + 2 + (unsaved ? 1 : 0); // [ N ] or [ * N ]
+            int blen = bracket_len + namelen + 1;
             if (blen > remaining) {
-                // partial write: write as much of the name/prefix as fits
-                // write prefix [N]
-                char pfx[32]; int pn = snprintf(pfx, sizeof(pfx), "[%d]", displayed_num);
-                int to_write = remaining;
-                if (to_write > pn) {
-                    write(STDOUT_FILENO, pfx, pn); to_write -= pn;
-                    // write part of name
-                    write(STDOUT_FILENO, tname, to_write);
-                } else {
-                    // even prefix doesn't fit; write trimmed prefix
-                    write(STDOUT_FILENO, pfx, to_write);
+                char pfx[32]; int pn = unsaved ? snprintf(pfx, sizeof(pfx), "[*%d]", tab_index) : snprintf(pfx, sizeof(pfx), "[%d]", tab_index);
+                if (t == CurTab) write(STDOUT_FILENO, "\x1b[7m", 4);
+                if (pn > remaining) write(STDOUT_FILENO, pfx, remaining);
+                else {
+                    write(STDOUT_FILENO, pfx, pn);
+                    int can = remaining - pn;
+                    if (can > 0) write(STDOUT_FILENO, tname, can);
                 }
-                remaining = 0; break;
+                if (t == CurTab) write(STDOUT_FILENO, "\x1b[m", 3);
+                remaining = 0;
+                break;
             }
             if (t == CurTab) write(STDOUT_FILENO, "\x1b[7m", 4);
-            // write opening bracket
             write(STDOUT_FILENO, "[", 1);
-            // write number in yellow
-            char numbuf[16]; int nn = snprintf(numbuf, sizeof(numbuf), "%d", t+2);
+            if (unsaved) write(STDOUT_FILENO, "\x1b[91m*\x1b[0m", 8);
+            char numbuf[16]; int nn = snprintf(numbuf, sizeof(numbuf), "%d", tab_index);
             write(STDOUT_FILENO, "\x1b[93m", 5);
             write(STDOUT_FILENO, numbuf, nn);
             write(STDOUT_FILENO, "\x1b[0m", 4);
-            // closing bracket
             write(STDOUT_FILENO, "]", 1);
-            // write name
             write(STDOUT_FILENO, tname, namelen);
-            // unsaved marker in red
-            if (unsaved) { write(STDOUT_FILENO, "\x1b[91m*\x1b[0m", 8); }
-            // trailing space
             write(STDOUT_FILENO, " ", 1);
             if (t == CurTab) write(STDOUT_FILENO, "\x1b[m", 3);
             remaining -= blen;
+            tab_index++;
         }
         // fill rest of line with spaces and newline
         for (int i = 0; i < remaining; i++) write(STDOUT_FILENO, " ", 1);
@@ -2945,7 +3400,7 @@ int main(int argc, char **argv) {
     }
 
     while (1) {
-        if (winch_received) { getWindowSize(); winch_received = 0; }
+        if (winch_received) { getWindowSize(); editorScroll(); winch_received = 0; }
         if (include_update_received) { include_update_received = 0; snprintf(E.msg, sizeof(E.msg), "Include cache updated"); E.msg_time = time(NULL); }
         editorRefreshScreen();
         editorProcessKeypress();
