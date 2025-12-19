@@ -2091,8 +2091,16 @@ static void execute_command(const char *cmd) {
             // Now check each stored tab
             for (int t = 0; t < NumTabs && !cancelled; t++) {
                 int needs_save = 1;
-                if (Tabs[t].saved_snapshot) {
-                    if (strcmp(Tabs[t].snapshot ? Tabs[t].snapshot : "", Tabs[t].saved_snapshot ? Tabs[t].saved_snapshot : "") == 0) needs_save = 0;
+                if (t == CurTab) {
+                    char *cur = serialize_buffer();
+                    if (cur) {
+                        if (E.saved_snapshot && strcmp(E.saved_snapshot, cur) == 0) needs_save = 0;
+                        free(cur);
+                    }
+                } else {
+                    if (Tabs[t].saved_snapshot) {
+                        if (strcmp(Tabs[t].snapshot ? Tabs[t].snapshot : "", Tabs[t].saved_snapshot ? Tabs[t].saved_snapshot : "") == 0) needs_save = 0;
+                    }
                 }
                 if (needs_save) {
                     char __tmpbuf[128]; int __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
@@ -2111,12 +2119,16 @@ static void execute_command(const char *cmd) {
                     if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
                     if (resp == 'c') { cancelled = 1; }
                     if (resp == 's') {
-                        // save this tab: temporarily switch to it, save, switch back
-                        int orig_cur = CurTab;
-                        switch_to_tab(t);
-                        save_to_file(NULL);
-                        if (orig_cur >= 0 && orig_cur != t) switch_to_tab(orig_cur);
-                        else if (orig_cur == -1) switch_to_home();
+                        if (t == CurTab) {
+                            save_to_file(NULL);
+                        } else {
+                            // save this tab: temporarily switch to it, save, switch back
+                            int orig_cur = CurTab;
+                            switch_to_tab(t);
+                            save_to_file(NULL);
+                            if (orig_cur >= 0 && orig_cur != t) switch_to_tab(orig_cur);
+                            else if (orig_cur == -1) switch_to_home();
+                        }
                     }
                     // resp == 'd': discard, do nothing
                 }
@@ -2424,51 +2436,51 @@ static void draw_help_overlay(void) {
         "\x1b[96mCommand Cheat Sheet\x1b[0m",
         "",
         "\x1b[96mFile & Tab Management\x1b[0m",
-        "\x1b[93mfn <file>\x1b[0m        Name/rename current file",
-        "\x1b[93mfn add <file>\x1b[0m    Create file on disk",
-        "\x1b[93mfn del <file>\x1b[0m    Delete file",
-        "\x1b[93mopen <file>\x1b[0m      Open in current window",
-        "\x1b[93mopent <file>\x1b[0m     Open in new tab",
-        "\x1b[93mtabs\x1b[0m             List tabs",
-        "\x1b[93mtab<N>\x1b[0m           Switch to tab N",
-        "\x1b[93mtabc<N>\x1b[0m          Close tab N",
-        "\x1b[93mtabc all\x1b[0m         Close all tabs (prompts to save)",
-        "\x1b[93mmd <dir>\x1b[0m        Make directory",
-        "\x1b[93mmd -p <dir>\x1b[0m     Make directory (recursive)",
-        "\x1b[93mcd <path>\x1b[0m      Change directory",
+        "\x1b[93mfn <file>\x1b[0m                Name/rename current file",
+        "\x1b[93mfn add <file>\x1b[0m            Create file on disk",
+        "\x1b[93mfn del <file>\x1b[0m            Delete file",
+        "\x1b[93mopen <file>\x1b[0m              Open in current window",
+        "\x1b[93mopent <file>\x1b[0m             Open in new tab",
+        "\x1b[93mtabs\x1b[0m                       List tabs",
+        "\x1b[93mtab<N>\x1b[0m                     Switch to tab N",
+        "\x1b[93mtabc<N>\x1b[0m                    Close tab N",
+        "\x1b[93mtabc all\x1b[0m                   Close all tabs (prompts to save)",
+        "\x1b[93mmd <dir>\x1b[0m                  Make directory",
+        "\x1b[93mmd -p <dir>\x1b[0m               Make directory (recursive)",
+        "\x1b[93mcd <path>\x1b[0m                Change directory",
         "",
         "\x1b[96mEditing\x1b[0m",
-        "\x1b[93ms\x1b[0m                Save",
-        "\x1b[93mq\x1b[0m                Quit (prompts to save)",
-        "\x1b[93mqs\x1b[0m               Quit & Save",
-        "\x1b[93mu\x1b[0m                Undo",
-        "\x1b[93mr\x1b[0m                Redo",
-        "\x1b[93mcl<N>\x1b[0m            Copy Line(s) N or Range",
-        "\x1b[93mp\x1b[0m                Paste at cursor",
-        "\x1b[93mpl<N>\x1b[0m            Paste at Line N",
-        "\x1b[93mplf<N>\x1b[0m           Paste at Front of Line N",
-        "\x1b[93mdall\x1b[0m             Delete all lines",
-        "\x1b[93mdl\x1b[0m               Delete current line",
-        "\x1b[93mdl<Range>\x1b[0m        Clear text on range (remove empty lines)",
-        "\x1b[93mdl<N>\x1b[0m            Clear text on line N (remove if empty)",
-        "\x1b[93mdl<N>w\x1b[0m           Delete last N words",
-        "\x1b[93mdf<N>w\x1b[0m           Delete first N words",
+        "\x1b[93ms\x1b[0m                          Save",
+        "\x1b[93mq\x1b[0m                          Quit (prompts to save)",
+        "\x1b[93mqs\x1b[0m                         Quit & Save",
+        "\x1b[93mu\x1b[0m                          Undo",
+        "\x1b[93mr\x1b[0m                          Redo",
+        "\x1b[93mcl<N>\x1b[0m                      Copy line(s) N or range",
+        "\x1b[93mp\x1b[0m                          Paste at cursor",
+        "\x1b[93mpl<N>\x1b[0m                      Paste at line N",
+        "\x1b[93mplf<N>\x1b[0m                     Paste at front of line N",
+        "\x1b[93mdall\x1b[0m                       Delete all lines",
+        "\x1b[93mdl\x1b[0m                         Delete current line",
+        "\x1b[93mdl<Range>\x1b[0m                  Clear text on range (remove empty lines)",
+        "\x1b[93mdl<N>\x1b[0m                      Clear text on line N (remove if empty)",
+        "\x1b[93mdl<N>w\x1b[0m                     Delete last N words",
+        "\x1b[93mdf<N>w\x1b[0m                     Delete first N words",
         "",
         "\x1b[96mNavigation\x1b[0m",
-        "\x1b[93mjl<N>\x1b[0m            Jump to Front of Line N",
-        "\x1b[93mjml<N>\x1b[0m           Jump to Middle of Line N",
-        "\x1b[93mjel<N>\x1b[0m           Jump to End of Line N",
+        "\x1b[93mjl<N>\x1b[0m                      Jump to front of line N",
+        "\x1b[93mjml<N>\x1b[0m                     Jump to middle of line N",
+        "\x1b[93mjel<N>\x1b[0m                     Jump to end of line N",
         "",
         "\x1b[96mFile Browser\x1b[0m",
-        "\x1b[93mb\x1b[0m                File browser",
+        "\x1b[93mb\x1b[0m                          File browser",
         "",
         "\x1b[96mTerminal\x1b[0m",
-        "\x1b[93mot\x1b[0m               Open Terminal",
+        "\x1b[93mot\x1b[0m                         Open Terminal",
         "Type \"\x1b[91mexit\x1b[0m\" into the terminal to close",
         "",
         "\x1b[96mHelp\x1b[0m",
-        "\x1b[93mhelp\x1b[0m             Toggle help overlay",
-        "\x1b[93m?\x1b[0m                Toggle help overlay",
+        "\x1b[93mhelp\x1b[0m                       Toggle help overlay",
+        "\x1b[93m?\x1b[0m                          Toggle help overlay",
         "",
         ""
     };
@@ -3476,14 +3488,14 @@ static void editorRefreshScreen(void) {
             int namelen = (int)strlen(tname);
             int unsaved = 0;
             if (t == CurTab) {
-                // for current stored tab, check live buffer vs E.saved_snapshot
                 char *curss = serialize_buffer();
                 if (curss) {
                     if (!(E.saved_snapshot && strcmp(E.saved_snapshot, curss) == 0)) unsaved = 1;
                     free(curss);
+                } else {
+                    unsaved = 1;
                 }
             } else {
-                // for non-current stored tabs, use cached snapshots
                 if (Tabs[t].saved_snapshot && Tabs[t].snapshot) {
                     unsaved = (strcmp(Tabs[t].saved_snapshot, Tabs[t].snapshot) != 0);
                 } else if (Tabs[t].saved_snapshot == NULL && Tabs[t].snapshot) {
