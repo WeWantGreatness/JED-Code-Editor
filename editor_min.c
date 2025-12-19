@@ -1722,9 +1722,126 @@ static void execute_command(const char *cmd) {
         if (i + 3 < L && strncmp(&cmd[i], "help", 4) == 0) { i += 4; E.welcome_visible = 0; E.help_visible = 1; E.help_scroll = 0; continue; }
 
         // tabc <N> - close tab N (1-based). Allow compact forms like "tabc1" or "tabc 1" etc.
+        // tabc all - close all tabs with prompts for unsaved changes
         if (i + 3 < L && strncmp(&cmd[i], "tabc", 4) == 0) {
-            char next = (i + 4 < L) ? cmd[i+4] : '\0'; if (!(next == '\0' || next == ' ' || isdigit((unsigned char)next))) { i++; continue; }
-            i += 4; while (i < L && cmd[i] == ' ') i++; int start = i; while (i < L && isdigit((unsigned char)cmd[i])) i++; int tlen = i - start;
+            char next = (i + 4 < L) ? cmd[i+4] : '\0'; if (!(next == '\0' || next == ' ' || isdigit((unsigned char)next) || next == 'a')) { i++; continue; }
+            i += 4; while (i < L && cmd[i] == ' ') i++; int start = i;
+            // check if "all"
+            if (i + 2 < L && strncmp(&cmd[i], "all", 3) == 0 && (i + 3 >= L || cmd[i+3] == ' ' || cmd[i+3] == '\0')) {
+                i += 3;
+                // tabc all: close all tabs, prompting for unsaved changes
+                int cancelled = 0;
+                // First, check home tab (tab 1)
+                if (CurTab == -1) {
+                    // home is current
+                    char *cur = serialize_buffer();
+                    int needs_save = 1;
+                    if (E.saved_snapshot) {
+                        if (strcmp(cur ? cur : "", E.saved_snapshot ? E.saved_snapshot : "") == 0) needs_save = 0;
+                    }
+                    free(cur);
+                    if (needs_save) {
+                        char __tmpbuf[128]; int __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
+                        if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
+                        const char *tabname = E.filename ? E.filename : "(No Name)";
+                        int pn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[1;97mTab\x1b[0m \x1b[96m'%s'\x1b[0m \x1b[1;97mhas unsaved changes\x1b[0m. \x1b[92m(s) Save\x1b[0m / \x1b[94m(d) Discard\x1b[0m / \x1b[93m(c) Cancel\x1b[0m: ", tabname);
+                        if (pn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)pn);
+                        int resp = 0;
+                        while (1) {
+                            int k = readKey(); if (k == -1) continue;
+                            if (k == 's' || k == 'S') { resp = 's'; break; }
+                            if (k == 'd' || k == 'D') { resp = 'd'; break; }
+                            if (k == 'c' || k == 'C' || k == 27) { resp = 'c'; break; }
+                        }
+                        __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
+                        if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
+                        if (resp == 'c') { cancelled = 1; }
+                        if (resp == 's') { save_to_file(NULL); }
+                        // resp == 'd': discard, do nothing
+                    }
+                } else {
+                    // home is not current, check if it has unsaved changes
+                    if (HaveHomeTab) {
+                        int needs_save = 1;
+                        if (HomeTab.saved_snapshot) {
+                            if (strcmp(HomeTab.snapshot ? HomeTab.snapshot : "", HomeTab.saved_snapshot ? HomeTab.saved_snapshot : "") == 0) needs_save = 0;
+                        }
+                        if (needs_save) {
+                            char __tmpbuf[128]; int __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
+                            if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
+                            const char *tabname = HomeTab.name && HomeTab.name[0] ? HomeTab.name : "(No Name)";
+                            int pn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[1;97mTab\x1b[0m \x1b[96m'%s'\x1b[0m \x1b[1;97mhas unsaved changes\x1b[0m. \x1b[92m(s) Save\x1b[0m / \x1b[94m(d) Discard\x1b[0m / \x1b[93m(c) Cancel\x1b[0m: ", tabname);
+                            if (pn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)pn);
+                            int resp = 0;
+                            while (1) {
+                                int k = readKey(); if (k == -1) continue;
+                                if (k == 's' || k == 'S') { resp = 's'; break; }
+                                if (k == 'd' || k == 'D') { resp = 'd'; break; }
+                                if (k == 'c' || k == 'C' || k == 27) { resp = 'c'; break; }
+                            }
+                            __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
+                            if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
+                            if (resp == 'c') { cancelled = 1; }
+                            if (resp == 's') {
+                                // save home tab: temporarily switch to it, save, switch back
+                                int orig_cur = CurTab;
+                                switch_to_home();
+                                save_to_file(NULL);
+                                if (orig_cur >= 0) switch_to_tab(orig_cur);
+                            }
+                            // resp == 'd': discard, do nothing
+                        }
+                    }
+                }
+                // Now check each stored tab
+                for (int t = 0; t < NumTabs && !cancelled; t++) {
+                    int needs_save = 1;
+                    if (Tabs[t].saved_snapshot) {
+                        if (strcmp(Tabs[t].snapshot ? Tabs[t].snapshot : "", Tabs[t].saved_snapshot ? Tabs[t].saved_snapshot : "") == 0) needs_save = 0;
+                    }
+                    if (needs_save) {
+                        char __tmpbuf[128]; int __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
+                        if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
+                        const char *tabname = Tabs[t].name && Tabs[t].name[0] ? Tabs[t].name : "(No Name)";
+                        int pn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[1;97mTab\x1b[0m \x1b[96m'%s'\x1b[0m \x1b[1;97mhas unsaved changes\x1b[0m. \x1b[92m(s) Save\x1b[0m / \x1b[94m(d) Discard\x1b[0m / \x1b[93m(c) Cancel\x1b[0m: ", tabname);
+                        if (pn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)pn);
+                        int resp = 0;
+                        while (1) {
+                            int k = readKey(); if (k == -1) continue;
+                            if (k == 's' || k == 'S') { resp = 's'; break; }
+                            if (k == 'd' || k == 'D') { resp = 'd'; break; }
+                            if (k == 'c' || k == 'C' || k == 27) { resp = 'c'; break; }
+                        }
+                        __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
+                        if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
+                        if (resp == 'c') { cancelled = 1; }
+                        if (resp == 's') {
+                            // save this tab: temporarily switch to it, save, switch back
+                            int orig_cur = CurTab;
+                            switch_to_tab(t);
+                            save_to_file(NULL);
+                            if (orig_cur >= 0 && orig_cur != t) switch_to_tab(orig_cur);
+                            else if (orig_cur == -1) switch_to_home();
+                        }
+                        // resp == 'd': discard, do nothing
+                    }
+                }
+                if (cancelled) {
+                    snprintf(E.msg, sizeof(E.msg), "Close all cancelled"); E.msg_time = time(NULL);
+                    continue;
+                }
+                // Now close all tabs: free all stored tabs, clear home, switch to empty buffer
+                for (int t = 0; t < NumTabs; t++) free_tab(&Tabs[t]);
+                free(Tabs); Tabs = NULL; NumTabs = 0; CurTab = -1;
+                free_tab(&HomeTab); HaveHomeTab = 0;
+                free(E.filename); E.filename = NULL;
+                editorFreeRows(); editorAppendRow(""); save_snapshot(); free(E.saved_snapshot); E.saved_snapshot = serialize_buffer();
+                E.welcome_visible = 1; E.help_from_welcome = 0; E.browser_from_welcome = 0;
+                snprintf(E.msg, sizeof(E.msg), "Closed all tabs"); E.msg_time = time(NULL);
+                continue;
+            }
+            // parse number
+            while (i < L && isdigit((unsigned char)cmd[i])) i++; int tlen = i - start;
             if (tlen <= 0) {
                 // no number: close the currently-displayed tab (home==1 or stored)
                 if (CurTab >= 0) {

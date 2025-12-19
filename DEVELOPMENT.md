@@ -124,4 +124,5 @@ Tab commands
 - `tabs` shows a compact, numbered listing of open tabs.
 - `tabN` or `tab N` switches to tab N (1-based). The space between `tab` and the number is optional.
 - `tabcN` or `tabc N` closes tab N (1-based). The space between `tabc` and the number is optional.
+- `tabc all` closes all tabs, prompting to save unsaved changes for each tab with options to save, discard, or cancel.
 
