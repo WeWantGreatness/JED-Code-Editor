@@ -1542,9 +1542,6 @@ static void execute_command(const char *cmd) {
             snprintf(E.msg, sizeof(E.msg), "open: pushed (tabs=%d)", NumTabs); E.msg_time = time(NULL);
             continue;
         }
-        if (i + 2 < L && strncmp(&cmd[i], "cwl", 3) == 0) {
-            copy_whole_line(); i += 3; continue;
-        }
         if (i + 1 < L && strncmp(&cmd[i], "cl", 2) == 0) {
             i += 2;
             if (!isdigit((unsigned char)cmd[i])) {
@@ -2027,65 +2024,109 @@ static void execute_command(const char *cmd) {
         if (cmd[i] == 'q') {
             char next = (i + 1 < L) ? cmd[i+1] : '\0';
             if (!(next == '\0' || next == ' ')) { i++; continue; }
-            // quit
-            // if unsaved changes, prompt to save
-            char *cur = serialize_buffer();
-            int needs_save = 1;
-            if (E.saved_snapshot) {
-                if (strcmp(cur ? cur : "", E.saved_snapshot ? E.saved_snapshot : "") == 0) needs_save = 0;
-            }
-            free(cur);
-            if (needs_save) {
-                // prompt: Save before quit? (y/N) — displayed at bottom row (clear line first)
-                char __tmpbuf[64]; int __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
-                if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
-                write(STDOUT_FILENO, "\x1b[93mSave before quit?\x1b[0m \x1b[92m(y)\x1b[0m\x1b[91m(N)\x1b[0m ", 48);
-                // read response
-                int resp = 0;
-                while (1) {
-                    int k = readKey();
-                    if (k == -1) continue;
-                    if (k == 'y') { resp = 'y'; break; }
-                    if (k == 'N' || k == 27) { resp = 'n'; break; }
+            // quit: check all tabs for unsaved changes, prompt individually
+            int cancelled = 0;
+            // First, check home tab (tab 1)
+            if (CurTab == -1) {
+                // home is current
+                char *cur = serialize_buffer();
+                int needs_save = 1;
+                if (E.saved_snapshot) {
+                    if (strcmp(cur ? cur : "", E.saved_snapshot ? E.saved_snapshot : "") == 0) needs_save = 0;
                 }
-                // clear prompt line
-                __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
-                if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
-                if (resp == 'y') { save_to_file(NULL); write(STDOUT_FILENO, "\x1b[2J", 4); write(STDOUT_FILENO, "\x1b[H", 3); disableRawMode(); exit(0); }
-                if (resp == 'n') {
-                    // remove swap file before exiting without saving
-                    if (E.filename) {
-                        char *base = strrchr(E.filename, '/');
-                        const char *b = base ? base + 1 : E.filename;
-                        char swapbuf[1024];
-                        if (base) snprintf(swapbuf, sizeof(swapbuf), "%.*s/.%s.swp", (int)(base - E.filename), E.filename, b);
-                        else snprintf(swapbuf, sizeof(swapbuf), ".%s.swp", b);
-                        unlink(swapbuf);
+                free(cur);
+                if (needs_save) {
+                    char __tmpbuf[128]; int __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
+                    if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
+                    const char *tabname = E.filename ? E.filename : "(No Name)";
+                    int pn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[1;97mTab\x1b[0m \x1b[96m'%s'\x1b[0m \x1b[1;97mhas unsaved changes\x1b[0m. \x1b[92m(s) Save\x1b[0m / \x1b[94m(d) Discard\x1b[0m / \x1b[93m(c) Cancel\x1b[0m: ", tabname);
+                    if (pn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)pn);
+                    int resp = 0;
+                    while (1) {
+                        int k = readKey(); if (k == -1) continue;
+                        if (k == 's' || k == 'S') { resp = 's'; break; }
+                        if (k == 'd' || k == 'D') { resp = 'd'; break; }
+                        if (k == 'c' || k == 'C' || k == 27) { resp = 'c'; break; }
                     }
-                    write(STDOUT_FILENO, "\x1b[2J", 4); write(STDOUT_FILENO, "\x1b[H", 3); disableRawMode(); exit(0);
+                    __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
+                    if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
+                    if (resp == 'c') { cancelled = 1; }
+                    if (resp == 's') { save_to_file(NULL); }
+                    // resp == 'd': discard, do nothing
                 }
-                // otherwise cancel and continue
-                i++; continue;
             } else {
-                // no unsaved changes — remove swap if present, clear screen and exit
-                if (E.filename) {
-                    char *base = strrchr(E.filename, '/');
-                    const char *b = base ? base + 1 : E.filename;
-                    char swapbuf[1024];
-                    if (base) snprintf(swapbuf, sizeof(swapbuf), "%.*s/.%s.swp", (int)(base - E.filename), E.filename, b);
-                    else snprintf(swapbuf, sizeof(swapbuf), ".%s.swp", b);
-                    unlink(swapbuf);
+                // home is not current, check if it has unsaved changes
+                if (HaveHomeTab) {
+                    int needs_save = 1;
+                    if (HomeTab.saved_snapshot) {
+                        if (strcmp(HomeTab.snapshot ? HomeTab.snapshot : "", HomeTab.saved_snapshot ? HomeTab.saved_snapshot : "") == 0) needs_save = 0;
+                    }
+                    if (needs_save) {
+                        char __tmpbuf[128]; int __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
+                        if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
+                        const char *tabname = HomeTab.name && HomeTab.name[0] ? HomeTab.name : "(No Name)";
+                        int pn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[1;97mTab\x1b[0m \x1b[96m'%s'\x1b[0m \x1b[1;97mhas unsaved changes\x1b[0m. \x1b[92m(s) Save\x1b[0m / \x1b[94m(d) Discard\x1b[0m / \x1b[93m(c) Cancel\x1b[0m: ", tabname);
+                        if (pn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)pn);
+                        int resp = 0;
+                        while (1) {
+                            int k = readKey(); if (k == -1) continue;
+                            if (k == 's' || k == 'S') { resp = 's'; break; }
+                            if (k == 'd' || k == 'D') { resp = 'd'; break; }
+                            if (k == 'c' || k == 'C' || k == 27) { resp = 'c'; break; }
+                        }
+                        __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
+                        if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
+                        if (resp == 'c') { cancelled = 1; }
+                        if (resp == 's') {
+                            // save home tab: temporarily switch to it, save, switch back
+                            int orig_cur = CurTab;
+                            switch_to_home();
+                            save_to_file(NULL);
+                            if (orig_cur >= 0) switch_to_tab(orig_cur);
+                        }
+                        // resp == 'd': discard, do nothing
+                    }
                 }
-                write(STDOUT_FILENO, "\x1b[2J", 4); write(STDOUT_FILENO, "\x1b[H", 3); disableRawMode(); exit(0);
             }
-        }
-        if (i + 1 < L && strncmp(&cmd[i], "qs", 2) == 0) {
-            char next = (i + 2 < L) ? cmd[i+2] : '\0';
-            if (!(next == '\0' || next == ' ')) { i++; continue; }
-            i += 2;
-            // quit and save: save if needed, then quit
-            save_to_file(NULL);
-            // remove swap file
+            // Now check each stored tab
+            for (int t = 0; t < NumTabs && !cancelled; t++) {
+                int needs_save = 1;
+                if (Tabs[t].saved_snapshot) {
+                    if (strcmp(Tabs[t].snapshot ? Tabs[t].snapshot : "", Tabs[t].saved_snapshot ? Tabs[t].saved_snapshot : "") == 0) needs_save = 0;
+                }
+                if (needs_save) {
+                    char __tmpbuf[128]; int __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
+                    if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
+                    const char *tabname = Tabs[t].name && Tabs[t].name[0] ? Tabs[t].name : "(No Name)";
+                    int pn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[1;97mTab\x1b[0m \x1b[96m'%s'\x1b[0m \x1b[1;97mhas unsaved changes\x1b[0m. \x1b[92m(s) Save\x1b[0m / \x1b[94m(d) Discard\x1b[0m / \x1b[93m(c) Cancel\x1b[0m: ", tabname);
+                    if (pn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)pn);
+                    int resp = 0;
+                    while (1) {
+                        int k = readKey(); if (k == -1) continue;
+                        if (k == 's' || k == 'S') { resp = 's'; break; }
+                        if (k == 'd' || k == 'D') { resp = 'd'; break; }
+                        if (k == 'c' || k == 'C' || k == 27) { resp = 'c'; break; }
+                    }
+                    __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
+                    if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
+                    if (resp == 'c') { cancelled = 1; }
+                    if (resp == 's') {
+                        // save this tab: temporarily switch to it, save, switch back
+                        int orig_cur = CurTab;
+                        switch_to_tab(t);
+                        save_to_file(NULL);
+                        if (orig_cur >= 0 && orig_cur != t) switch_to_tab(orig_cur);
+                        else if (orig_cur == -1) switch_to_home();
+                    }
+                    // resp == 'd': discard, do nothing
+                }
+            }
+            if (cancelled) {
+                snprintf(E.msg, sizeof(E.msg), "Quit cancelled"); E.msg_time = time(NULL);
+                i++; continue;
+            }
+            // Now quit: remove swap files for all tabs
+            // remove swap for home
             if (E.filename) {
                 char *base = strrchr(E.filename, '/');
                 const char *b = base ? base + 1 : E.filename;
@@ -2093,6 +2134,86 @@ static void execute_command(const char *cmd) {
                 if (base) snprintf(swapbuf, sizeof(swapbuf), "%.*s/.%s.swp", (int)(base - E.filename), E.filename, b);
                 else snprintf(swapbuf, sizeof(swapbuf), ".%s.swp", b);
                 unlink(swapbuf);
+            }
+            // remove swap for stored tabs
+            for (int t = 0; t < NumTabs; t++) {
+                if (Tabs[t].name) {
+                    char *base = strrchr(Tabs[t].name, '/');
+                    const char *b = base ? base + 1 : Tabs[t].name;
+                    char swapbuf[1024];
+                    if (base) snprintf(swapbuf, sizeof(swapbuf), "%.*s/.%s.swp", (int)(base - Tabs[t].name), Tabs[t].name, b);
+                    else snprintf(swapbuf, sizeof(swapbuf), ".%s.swp", b);
+                    unlink(swapbuf);
+                }
+            }
+            write(STDOUT_FILENO, "\x1b[2J", 4); write(STDOUT_FILENO, "\x1b[H", 3); disableRawMode(); exit(0);
+        }
+        if (i + 1 < L && strncmp(&cmd[i], "qs", 2) == 0) {
+            char next = (i + 2 < L) ? cmd[i+2] : '\0';
+            if (!(next == '\0' || next == ' ')) { i++; continue; }
+            i += 2;
+            // quit and save: save all unsaved tabs, then quit
+            // First, save home tab if needed
+            if (CurTab == -1) {
+                // home is current
+                char *cur = serialize_buffer();
+                int needs_save = 1;
+                if (E.saved_snapshot) {
+                    if (strcmp(cur ? cur : "", E.saved_snapshot ? E.saved_snapshot : "") == 0) needs_save = 0;
+                }
+                free(cur);
+                if (needs_save) save_to_file(NULL);
+            } else {
+                // home is not current, check if it has unsaved changes
+                if (HaveHomeTab) {
+                    int needs_save = 1;
+                    if (HomeTab.saved_snapshot) {
+                        if (strcmp(HomeTab.snapshot ? HomeTab.snapshot : "", HomeTab.saved_snapshot ? HomeTab.saved_snapshot : "") == 0) needs_save = 0;
+                    }
+                    if (needs_save) {
+                        // save home tab: temporarily switch to it, save, switch back
+                        int orig_cur = CurTab;
+                        switch_to_home();
+                        save_to_file(NULL);
+                        if (orig_cur >= 0) switch_to_tab(orig_cur);
+                    }
+                }
+            }
+            // Now save each stored tab if needed
+            for (int t = 0; t < NumTabs; t++) {
+                int needs_save = 1;
+                if (Tabs[t].saved_snapshot) {
+                    if (strcmp(Tabs[t].snapshot ? Tabs[t].snapshot : "", Tabs[t].saved_snapshot ? Tabs[t].saved_snapshot : "") == 0) needs_save = 0;
+                }
+                if (needs_save) {
+                    // save this tab: temporarily switch to it, save, switch back
+                    int orig_cur = CurTab;
+                    switch_to_tab(t);
+                    save_to_file(NULL);
+                    if (orig_cur >= 0 && orig_cur != t) switch_to_tab(orig_cur);
+                    else if (orig_cur == -1) switch_to_home();
+                }
+            }
+            // Now quit: remove swap files for all tabs
+            // remove swap for home
+            if (E.filename) {
+                char *base = strrchr(E.filename, '/');
+                const char *b = base ? base + 1 : E.filename;
+                char swapbuf[1024];
+                if (base) snprintf(swapbuf, sizeof(swapbuf), "%.*s/.%s.swp", (int)(base - E.filename), E.filename, b);
+                else snprintf(swapbuf, sizeof(swapbuf), ".%s.swp", b);
+                unlink(swapbuf);
+            }
+            // remove swap for stored tabs
+            for (int t = 0; t < NumTabs; t++) {
+                if (Tabs[t].name) {
+                    char *base = strrchr(Tabs[t].name, '/');
+                    const char *b = base ? base + 1 : Tabs[t].name;
+                    char swapbuf[1024];
+                    if (base) snprintf(swapbuf, sizeof(swapbuf), "%.*s/.%s.swp", (int)(base - Tabs[t].name), Tabs[t].name, b);
+                    else snprintf(swapbuf, sizeof(swapbuf), ".%s.swp", b);
+                    unlink(swapbuf);
+                }
             }
             write(STDOUT_FILENO, "\x1b[2J", 4); write(STDOUT_FILENO, "\x1b[H", 3); disableRawMode(); exit(0);
         }
@@ -2311,6 +2432,7 @@ static void draw_help_overlay(void) {
         "\x1b[93mtabs\x1b[0m             List tabs",
         "\x1b[93mtab<N>\x1b[0m           Switch to tab N",
         "\x1b[93mtabc<N>\x1b[0m          Close tab N",
+        "\x1b[93mtabc all\x1b[0m         Close all tabs (prompts to save)",
         "\x1b[93mmd <dir>\x1b[0m        Make directory",
         "\x1b[93mmd -p <dir>\x1b[0m     Make directory (recursive)",
         "\x1b[93mcd <path>\x1b[0m      Change directory",
@@ -2321,7 +2443,6 @@ static void draw_help_overlay(void) {
         "\x1b[93mqs\x1b[0m               Quit & Save",
         "\x1b[93mu\x1b[0m                Undo",
         "\x1b[93mr\x1b[0m                Redo",
-        "\x1b[93mcwl\x1b[0m              Copy Current Line",
         "\x1b[93mcl<N>\x1b[0m            Copy Line(s) N or Range",
         "\x1b[93mp\x1b[0m                Paste at cursor",
         "\x1b[93mpl<N>\x1b[0m            Paste at Line N",
@@ -2480,6 +2601,7 @@ static void open_help_tab(void) {
         "tabs             List tabs",
         "tab<N>           Switch to tab N",
         "tabc<N>          Close tab N",
+        "tabc all         Close all tabs (prompts to save)",
         "md <dir>         Make directory",
         "md -p <dir>      Make directory (recursive)",
         "cd <path>        Change directory",
@@ -2490,7 +2612,6 @@ static void open_help_tab(void) {
         "qs               Quit & Save",
         "u                Undo",
         "r                Redo",
-        "cwl              Copy Current Line",
         "cl<N>            Copy Line(s) N or Range",
         "p                Paste at cursor",
         "pl<N>            Paste at Line N",
@@ -3354,10 +3475,20 @@ static void editorRefreshScreen(void) {
             const char *tname = (Tabs[t].name && *Tabs[t].name) ? Tabs[t].name : "(No Name)";
             int namelen = (int)strlen(tname);
             int unsaved = 0;
-            if (Tabs[t].saved_snapshot && Tabs[t].snapshot) {
-                unsaved = (strcmp(Tabs[t].saved_snapshot, Tabs[t].snapshot) != 0);
-            } else if (Tabs[t].saved_snapshot == NULL && Tabs[t].snapshot) {
-                unsaved = 1;
+            if (t == CurTab) {
+                // for current stored tab, check live buffer vs E.saved_snapshot
+                char *curss = serialize_buffer();
+                if (curss) {
+                    if (!(E.saved_snapshot && strcmp(E.saved_snapshot, curss) == 0)) unsaved = 1;
+                    free(curss);
+                }
+            } else {
+                // for non-current stored tabs, use cached snapshots
+                if (Tabs[t].saved_snapshot && Tabs[t].snapshot) {
+                    unsaved = (strcmp(Tabs[t].saved_snapshot, Tabs[t].snapshot) != 0);
+                } else if (Tabs[t].saved_snapshot == NULL && Tabs[t].snapshot) {
+                    unsaved = 1;
+                }
             }
             int num_digits = snprintf(NULL, 0, "%d", tab_index);
             int bracket_len = 2 + num_digits + 2 + (unsaved ? 1 : 0); // [ N ] or [ * N ]
