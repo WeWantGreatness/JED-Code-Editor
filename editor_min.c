@@ -15,6 +15,7 @@
 #include <pty.h>
 #include <signal.h>
 #include <dirent.h>
+#include <strings.h>  /* for strcasestr */
 
 #define EDIT_KIND_NONE 0
 #define EDIT_KIND_INSERT 1
@@ -66,6 +67,22 @@ struct Editor {
     int browser_from_welcome; // flag if browser was opened from welcome
     int welcome_visible; // welcome/title screen visible flag
 
+    int prompt_visible; // prompt overlay visible flag
+    char prompt_message[256];
+    char prompt_options[256];
+    char pending_path[512];
+    int pending_lineno;
+
+    // Output pane (build/run logs)
+    int output_visible;       // whether output pane is visible
+    char **output_lines;      // NULL-terminated list of colorized lines (allocated)
+    char **output_raw_lines;  // raw lines for parsing
+    int output_n;             // number of lines
+    int output_scroll;        // top line index shown
+    int output_sel;           // selected line index
+    time_t output_last_mtime; // mtime of last loaded config/last_build.log
+
+
     // history snapshots
     char **history;
     int history_count;
@@ -89,6 +106,10 @@ struct Editor {
     // transient message
     char msg[128];
     time_t msg_time;
+
+    // build/run flow helpers
+    int awaiting_buildfile_save; // set when we open buildfile for edit and want to auto-run
+    char post_edit_cmd[512]; // command to execute after saving the buildfile
 } E;
 
 // Simple tab abstraction: each tab stores a serialized snapshot of the buffer and cursor/filename
@@ -100,6 +121,7 @@ struct Tab {
 };
 static struct Tab *Tabs = NULL;
 static int NumTabs = 0;
+#define MAX_TABS 10
 static int CurTab = -1; // index of currently loaded tab (-1 == "home" / current buffer)
 
 // Home tab snapshot: stores the "current buffer" state when the user switches away
@@ -112,6 +134,16 @@ static void editorFreeRows(void);
 static void load_buffer_from_string(const char *s);
 static void editorScroll(void);
 static void getWindowSize(void);
+// Output pane forward declarations
+static void output_append_line(const char *line);
+static void output_clear(void);
+static char *colorize_line_for_display(const char *line);
+static void output_append_colored_line(const char *rawline);
+static void output_clear(void);
+static int parse_error_location(const char *line, char *path, int pathlen, int *lineno, int *colno);
+/* Forward declarations for Build/Run handlers (used by command parsing before definition) */
+static void handle_build_run(int do_run_after);
+static void handle_run_only(int allow_interactive);
 static volatile sig_atomic_t winch_received = 0;
 static volatile sig_atomic_t include_update_received = 0;
 
@@ -176,6 +208,30 @@ static int switch_to_tab(int idx) {
 
 // forward-declare small helpers used by close_tab
 static void editorAppendRow(const char *s);
+
+// Tab management helpers
+static void save_current_to_home(void) {
+    free_tab(&HomeTab);
+    HomeTab = make_tab_from_editor();
+    HaveHomeTab = 1;
+}
+
+static void load_tab_snapshot(int idx) {
+    free(E.filename); E.filename = NULL;
+    editorFreeRows();
+    if (Tabs[idx].snapshot) load_buffer_from_string(Tabs[idx].snapshot);
+    if (Tabs[idx].name && Tabs[idx].name[0]) E.filename = strdup(Tabs[idx].name);
+    free(E.saved_snapshot);
+    E.saved_snapshot = Tabs[idx].saved_snapshot ? strdup(Tabs[idx].saved_snapshot) : NULL;
+    E.cx = Tabs[idx].cx; E.cy = Tabs[idx].cy; E.row_offset = Tabs[idx].row_offset; E.col_offset = Tabs[idx].col_offset;
+    CurTab = idx;
+    editorScroll();
+}
+
+static void editorSeekLine(int lineno) {
+    if (lineno < 1) lineno = 1; if (lineno > E.numrows) lineno = E.numrows;
+    E.cy = lineno - 1; if (E.cy < 0) E.cy = 0; E.cx = 0; editorScroll();
+}
 static void save_snapshot(void);
 static int switch_to_home(void);
 
@@ -457,6 +513,8 @@ static void enableRawMode(void) {
     raw.c_cc[VTIME] = 0;
 
     if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1) die("tcsetattr");
+    // set cursor to blinking bar style
+    write(STDOUT_FILENO, "\x1b[5 q", 5);
     /* switch to alternate screen buffer so editor session doesn't pollute scrollback */
     write(STDOUT_FILENO, "\x1b[?1049h", 8);
 }
@@ -516,6 +574,16 @@ static char *serialize_buffer(void) {
     }
     if (p != s) p[-1] = '\0'; else *p = '\0';
     return s;
+}
+
+// Check if current buffer has unsaved changes
+static int is_unsaved(void) {
+    if (!E.saved_snapshot) return 1; // no saved snapshot means unsaved
+    char *current = serialize_buffer();
+    if (!current) return 1; // error, assume unsaved
+    int unsaved = strcmp(current, E.saved_snapshot) != 0;
+    free(current);
+    return unsaved;
 }
 
 // Simple runtime config (parsed from ~/.jedrc or $XDG_CONFIG_HOME/jed/config)
@@ -754,7 +822,7 @@ static void redo_cmd(void) {
 }
 
 /* forward declarations for functions used by the executor */
-static void execute_command(const char *cmd);
+static int execute_command(const char *cmd);
 static void editorInsertChar(int c);
 static void editorInsertNewline(void);
 static void editorScroll(void);
@@ -1231,12 +1299,130 @@ static void save_to_file(const char *fname) {
         else snprintf(swapbuf, sizeof(swapbuf), ".%s.swp", b);
         unlink(swapbuf);
     }
+    // if we were waiting for the user to save the build file before running
+    if (E.awaiting_buildfile_save && E.post_edit_cmd[0]) {
+        // run the command using internal shim so output is captured in config/last_build.log
+        char runcmd[768]; snprintf(runcmd, sizeof(runcmd), "__run_shell__:%s", E.post_edit_cmd);
+        // clear flag BEFORE running in case run triggers other saves
+        E.awaiting_buildfile_save = 0; E.post_edit_cmd[0] = '\0';
+        int st = execute_command(runcmd);
+        (void)st; // we don't currently have a secondary run command to execute here
+    }
 }
 
-static void execute_command(const char *cmd) {
+static int execute_command(const char *cmd) {
     int i = 0; int L = strlen(cmd);
+    // allow quick build/run shim: "__run_shell__:<shell cmd>" will exec the shell cmd
+    if (strncmp(cmd, "__run_shell__:", 14) == 0) {
+        char shell_cmd[2048];
+        strncpy(shell_cmd, cmd + 14, sizeof(shell_cmd) - 1);
+        shell_cmd[sizeof(shell_cmd)-1] = '\0';
+        // if buffer is unsaved and we have a filename, write current buffer to temp file and modify command
+        if (is_unsaved() && E.filename) {
+            const char *base = strrchr(E.filename, '/');
+            if (base) base++; else base = E.filename;
+            char temp_path[1024];
+            snprintf(temp_path, sizeof(temp_path), "/tmp/editor_build_temp_%s", base);
+            FILE *tf = fopen(temp_path, "w");
+            if (tf) {
+                for (int j = 0; j < E.numrows; j++) {
+                    fprintf(tf, "%s\n", E.rows[j]);
+                }
+                fclose(tf);
+                // replace E.filename in shell_cmd with temp_path
+                char *pos = strstr(shell_cmd, E.filename);
+                if (pos) {
+                    size_t pre_len = pos - shell_cmd;
+                    size_t fname_len = strlen(E.filename);
+                    size_t post_start = pre_len + fname_len;
+                    size_t temp_len = strlen(temp_path);
+                    size_t new_len = pre_len + temp_len + strlen(pos + fname_len);
+                    if (new_len < sizeof(shell_cmd)) {
+                        memmove(pos + temp_len, pos + fname_len, strlen(pos + fname_len) + 1);
+                        memcpy(pos, temp_path, temp_len);
+                    }
+                }
+            }
+        }
+        const char *shell = shell_cmd;
+        // ensure config directory exists (best-effort)
+        mkdir("config", 0755);
+        // remove any existing log file so we create a fresh file/inode for this run
+        (void)unlink("config/last_build.log");
+        // write output to config/last_build.log and open it
+        FILE *out = fopen("config/last_build.log", "w");
+        if (out) {
+            // clear any previous in-editor output so the pane only reflects this run
+            output_clear();
+            // add a timestamp header to the log and the pane so it's clear this run's output
+            time_t _t = time(NULL); struct tm *_tm = localtime(&_t); char _th[128]; if (_tm) strftime(_th, sizeof(_th), "=== Run at %Y-%m-%d %H:%M:%S ===", _tm); else snprintf(_th, sizeof(_th), "=== Run started ==="); fputs(_th, out); fputs("\n", out); output_append_colored_line(_th);
+            // use popen to capture output
+            char pcmd[1024]; snprintf(pcmd, sizeof(pcmd), "%s 2>&1", shell);
+            FILE *p = popen(pcmd, "r");
+            if (p) {
+                char line[1024]; while (fgets(line, sizeof(line), p)) { fputs(line, out); fflush(out); output_append_colored_line(line); }
+                int st = pclose(p);
+                if (out) { fflush(out); fsync(fileno(out)); }
+                if (out) fclose(out);
+                // force reload of on-disk log when rendering
+                E.output_last_mtime = 0;
+                // show output pane in-editor (and keep log file too)
+                E.output_visible = 1; if (E.output_n > 0) { E.output_scroll = 0; E.output_sel = 0; }
+                editorRefreshScreen();
+                int exitcode = WEXITSTATUS(st);
+                snprintf(E.msg, sizeof(E.msg), "Command finished (exit %d)", exitcode); E.msg_time = time(NULL);
+                return exitcode;
+            } else {
+                char emsg[512]; snprintf(emsg, sizeof(emsg), "Failed to run: %s", shell);
+                if (out) { fputs(emsg, out); fputs("\n", out); fflush(out); fsync(fileno(out)); }
+                if (out) fclose(out);
+                // also surface the error in the in-editor output pane
+                output_clear();
+                output_append_colored_line(emsg);
+                // ensure any later render picks up the on-disk log
+                E.output_last_mtime = 0;
+                E.output_visible = 1; E.output_scroll = 0; E.output_sel = 0; editorRefreshScreen();
+                snprintf(E.msg, sizeof(E.msg), "%s", emsg); E.msg_time = time(NULL); return -1;
+            }
+        } else {
+            char emsg[256]; snprintf(emsg, sizeof(emsg), "Failed to create or open 'config/last_build.log': %s", strerror(errno));
+            output_clear();
+            output_append_colored_line(emsg);
+            E.output_last_mtime = 0;
+            E.output_visible = 1; E.output_scroll = 0; E.output_sel = 0; editorRefreshScreen();
+            snprintf(E.msg, sizeof(E.msg), "%s", emsg); E.msg_time = time(NULL); return -1;
+        }
+    }
+
     // be forgiving: allow commands prefixed with ':' and optional space
     while (i < L && (cmd[i] == ':' || cmd[i] == ' ')) i++;
+
+    /* Support short build/run commands typed into the command buffer and executed on Enter:
+       - 'b' or 'B' : build (same as invoking Build flow)
+       - 'br' or 'BR' : build then run (same as BR)
+       - 'r' or 'R' : run only
+       These are only processed when the user presses Enter (so typing is safe).
+    */
+    /* Only accept uppercase B/BR/R as explicit build/run commands (case-sensitive).
+       Lowercase letters will be treated as normal typed commands as you expect. */
+    if (i < L && cmd[i] == 'B') {
+        // check for 'BR'
+        int start = i; i++;
+        int do_run_after = 0;
+        if (i < L && cmd[i] == 'R') { do_run_after = 1; i++; }
+        // consume optional trailing letters and whitespace
+        while (i < L && isalpha((unsigned char)cmd[i])) i++;
+        while (i < L && cmd[i] == ' ') i++;
+        handle_build_run(do_run_after);
+    }
+    else if (i < L && cmd[i] == 'R') {
+        // run-only command (uppercase only)
+        int start = i; i++;
+        while (i < L && isalpha((unsigned char)cmd[i])) i++;
+        while (i < L && cmd[i] == ' ') i++;
+        handle_run_only(0);
+    }
+
     while (i < L) {
         // md <dirname> -> make directory (allow top-level placement)
         if (i + 1 < L && cmd[i] == 'm' && cmd[i+1] == 'd') {
@@ -1694,6 +1880,15 @@ static void execute_command(const char *cmd) {
         // browse - open file browser overlay. Allow single-letter 'b' as alias (e.g. ':b')
         if ((i + 4 < L && strncmp(&cmd[i], "browse", 6) == 0) || (cmd[i] == 'b' && (i+1 >= L || cmd[i+1] == ' '))) {
             if (cmd[i] == 'b') i += 1; else i += 6; show_file_browser(); continue;
+        }
+
+        // log - show output pane
+        if (i + 2 < L && strncmp(&cmd[i], "log", 3) == 0) {
+            i += 3;
+            E.output_visible = 1;
+            if (E.output_n > 0) { E.output_scroll = 0; E.output_sel = 0; }
+            editorRefreshScreen();
+            continue;
         }
 
         // cd <path> - change directory
@@ -2233,6 +2428,7 @@ static void execute_command(const char *cmd) {
         // unknown token: skip
         i++;
     }
+    return 0;
 }
 
 static void editorInsertChar(int c) {
@@ -2780,13 +2976,146 @@ static char **get_fuzzy_matches(const char *dir, const char *pat, int max, int *
 
 static void free_matches(char **m, int n) { if (!m) return; for (int i = 0; i < n; i++) free(m[i]); free(m); }
 
+
+
+/* Search backend: run ripgrep (rg) if available, otherwise grep. Returns
+ * an array of strdup'd strings formatted as "path:lineno: snippet" up to
+ * `max` results. If the query is quoted ("...") a fixed-string exact
+ * match is used. Caller must free returned array via free_matches(). */
+static char **run_search(const char *query, int max, int *out_n) {
+    if (!query || !*query) { if (out_n) *out_n = 0; return NULL; }
+    // detect quoted exact match
+    int exact = 0; char qcopy[512]; size_t qlen = strlen(query);
+    if (qlen >= 2 && query[0] == '"' && query[qlen-1] == '"') {
+        exact = 1; size_t copylen = qlen - 2; if (copylen >= sizeof(qcopy)) copylen = sizeof(qcopy)-1; memcpy(qcopy, &query[1], copylen); qcopy[copylen] = '\0';
+    } else {
+        size_t copylen = qlen; if (copylen >= sizeof(qcopy)) copylen = sizeof(qcopy)-1; memcpy(qcopy, query, copylen); qcopy[copylen] = '\0';
+    }
+
+    int pfd[2]; if (pipe(pfd) == -1) { if (out_n) *out_n = 0; return NULL; }
+    pid_t pid = fork();
+    if (pid == -1) { close(pfd[0]); close(pfd[1]); if (out_n) *out_n = 0; return NULL; }
+    if (pid == 0) {
+        close(pfd[0]); if (dup2(pfd[1], STDOUT_FILENO) == -1) _exit(127); close(pfd[1]);
+        if (exact) {
+            char pattern[512];
+            snprintf(pattern, sizeof(pattern), "\\<%s", qcopy);
+            char *argv[] = {"rg", "--no-heading", "--line-number", "--hidden", "--glob", "!.git", "-i", "-e", pattern, ".", NULL};
+            execvp("rg", argv);
+            char *argv2[] = {"grep", "-RInE", "--exclude-dir=.git", pattern, ".", NULL};
+            execvp("grep", argv2);
+        } else {
+            char *argv[] = {"rg", "--no-heading", "--line-number", "--hidden", "--glob", "!.git", "-S", qcopy, ".", NULL};
+            execvp("rg", argv);
+            char *argv2[] = {"grep", "-RIn", "--exclude-dir=.git", qcopy, ".", NULL};
+            execvp("grep", argv2);
+        }
+        _exit(127);
+    }
+
+    close(pfd[1]); FILE *f = fdopen(pfd[0], "r"); if (!f) { close(pfd[0]); waitpid(pid, NULL, 0); if (out_n) *out_n = 0; return NULL; }
+    int capacity = (max > 0) ? (max + 1) : 64; char **results = malloc(sizeof(char*) * capacity); int n = 0;
+    char buf[1024]; while (fgets(buf, sizeof(buf), f)) {
+        if (n >= max) break;
+        // trim newline
+        size_t L = strlen(buf); while (L > 0 && (buf[L-1] == '\n' || buf[L-1] == '\r')) buf[--L] = '\0';
+        // parse path:lineno:rest
+        const char *p1 = strchr(buf, ':'); if (!p1) continue;
+        size_t pathlen = p1 - buf; const char *p2 = strchr(p1 + 1, ':'); if (!p2) continue;
+        char path[512]; size_t plen = (pathlen < sizeof(path)-1) ? pathlen : (sizeof(path)-1); memcpy(path, buf, plen); path[plen] = '\0';
+        char linenobuf[32]; size_t llen = p2 - (p1 + 1); if (llen >= sizeof(linenobuf)) llen = sizeof(linenobuf)-1; memcpy(linenobuf, p1+1, llen); linenobuf[llen] = '\0';
+        int lineno = atoi(linenobuf);
+        const char *rest = p2 + 1;
+        // find match in rest and highlight
+        char snippet[512]; const char *matchloc = NULL;
+        // case-insensitive search for the query
+        const char *r = rest; size_t ql = strlen(qcopy);
+        while (*r) {
+            size_t i; for (i = 0; i < ql; i++) {
+                char a = r[i]; char b = qcopy[i]; if (!a) { i = ql; break; }
+                if (tolower((unsigned char)a) != tolower((unsigned char)b)) break;
+            }
+            if (i == ql) { matchloc = r; break; }
+            r++;
+        }
+        if (matchloc) {
+            /* ensure match is at word-start when exact quoted query is used */
+            if (exact) {
+                const char *search = rest; const char *ml = NULL;
+                while ((ml = strstr(search, qcopy)) != NULL) {
+                    int before = (int)(ml - rest);
+                    if (before == 0 || !(isalnum((unsigned char)rest[before-1]) || rest[before-1] == '_')) { matchloc = ml; break; }
+                    search = ml + 1; /* continue searching for next occurrence */
+                }
+                if (!matchloc) { /* no suitable word-start match */; }
+            }
+            if (!matchloc) continue;
+            // build context around match (50 chars each side)
+            int before = (int)(matchloc - rest);
+            int start = before - 50; if (start < 0) start = 0;
+            int matchlen = strlen(qcopy);
+            int restlen = (int)strlen(rest);
+            int end = before + matchlen + 50; if (end > restlen) end = restlen;
+            int outlen = end - start; if (outlen >= (int)sizeof(snippet)-1) outlen = (int)sizeof(snippet)-5;
+            if (start > 0) { snprintf(snippet, sizeof(snippet), "...%.*s", outlen, rest + start); } else { snprintf(snippet, sizeof(snippet), "%.*s", outlen, rest + start); }
+            // now find position within snippet to highlight
+            int pos = 0; int found = 0;
+            const char *rr = snippet; size_t ql = strlen(qcopy);
+            while (*rr) {
+                size_t i; for (i = 0; i < ql; i++) {
+                    char a = rr[i]; char b = qcopy[i]; if (!a) { i = ql; break; }
+                    if (tolower((unsigned char)a) != tolower((unsigned char)b)) break;
+                }
+                if (i == ql) { pos = rr - snippet; found = 1; break; }
+                rr++;
+            }
+            if (found) {
+                char out[700]; snprintf(out, sizeof(out), "%.*s\x1b[1;30;42m%.*s\x1b[0m%.*s",
+                    pos, snippet,
+                    (int)strlen(qcopy), snippet + pos,
+                    (int)(strlen(snippet) - pos - strlen(qcopy)), snippet + pos + strlen(qcopy));
+                char full[1024]; snprintf(full, sizeof(full), "%s:%d: %s", path, lineno, out);
+                results[n++] = strdup(full);
+                continue;
+            }
+        }
+        // fallback: include trimmed rest
+        char out[700]; if (L > 600) { buf[597] = '.'; buf[598] = '.'; buf[599] = '.'; buf[600] = '\0'; }
+        snprintf(out, sizeof(out), "%s", buf);
+        results[n++] = strdup(out);
+    }
+    fclose(f); waitpid(pid, NULL, 0);
+    if (n == 0) { free(results); if (out_n) *out_n = 0; return NULL; }
+    if (out_n) *out_n = n; return results;
+}
+
+/* Open file and jump to the given 1-based line number (if valid). */
+static void open_file_and_seek(const char *fname, int lineno) {
+    if (!fname) return;
+    FILE *f = fopen(fname, "r"); if (!f) { snprintf(E.msg, sizeof(E.msg), "Cannot open %s", fname); E.msg_time = time(NULL); return; }
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    char *buf = malloc(sz + 1);
+    if (!buf) { fclose(f); return; }
+    fread(buf, 1, sz, f); buf[sz] = '\0'; fclose(f);
+    load_buffer_from_string(buf); free(buf);
+    free(E.filename); E.filename = strdup(fname);
+    save_snapshot(); free(E.saved_snapshot); E.saved_snapshot = serialize_buffer();
+    set_language_from_filename(fname);
+    /* set cursor to line */
+    if (lineno < 1) lineno = 1; if (lineno > E.numrows) lineno = E.numrows;
+    E.cy = lineno - 1; if (E.cy < 0) E.cy = 0; E.cx = 0; editorScroll();
+    snprintf(E.msg, sizeof(E.msg), "Opened %s", fname); E.msg_time = time(NULL); E.welcome_visible = 0;
+}
+
 // Active suggestion state for live completion
 static char **ActiveMatches = NULL;
 static int ActiveMatchesN = 0;
 static int ActiveMatchSel = 0;
+static int ActiveMatchesPage = 0; /* pagination */
 static int ActiveFilenameStart = -1; // offset in E.command_buf where filename begins
 static int SuggestionsVisible = 0;
 static int SuggestionMax = 8; // default suggestion limit (within 5-10 per design)
+static int SuggestionPageSize = 8; // default page size for suggestion overlay
 
 static void clear_active_suggestions(void) {
     free_matches(ActiveMatches, ActiveMatchesN);
@@ -2817,7 +3146,23 @@ static void update_suggestions_from_command(void) {
             }
         }
     }
-    // not an open/opent command: ensure hidden
+    // support `find` command: show search matches
+    const char *fkw = "find"; size_t fkwlen = strlen(fkw);
+    if (E.command_len >= (int)fkwlen && strncmp(E.command_buf, fkw, fkwlen) == 0) {
+        if (E.command_len > (int)fkwlen && E.command_buf[fkwlen] == ' ') {
+            int pos = (int)fkwlen; while (pos < E.command_len && E.command_buf[pos] == ' ') pos++;
+            char pat[512] = {0}; int plen = 0;
+            if (pos < E.command_len) { plen = E.command_len - pos; if (plen > (int)sizeof(pat)-1) plen = (int)sizeof(pat)-1; memcpy(pat, &E.command_buf[pos], plen); pat[plen] = '\0'; }
+            int n = 0;
+            // allow more results for search
+            char **matches = run_search(pat, 50, &n);
+            if (n > 0) {
+                ActiveMatches = matches; ActiveMatchesN = n; ActiveMatchSel = 0; ActiveFilenameStart = -1; SuggestionsVisible = 1; return;
+            } else { clear_active_suggestions(); return; }
+        }
+    }
+
+    // not an open/opent/find command: ensure hidden
     clear_active_suggestions();
 }
 
@@ -2827,51 +3172,165 @@ static void render_suggestions_overlay(void) {
     int n = ActiveMatchesN;
     int sel = ActiveMatchSel;
     if (sel < 0) sel = 0; if (sel >= n) sel = n - 1;
-    int maxlen = 0; for (int i = 0; i < n; i++) { int l = (int)strlen(ActiveMatches[i]); if (l > maxlen) maxlen = l; }
-    int boxw = maxlen + 6; if (boxw > E.screencols) boxw = E.screencols;
-    int boxh = n + 4; if (boxh > E.screenrows) boxh = E.screenrows;
-    int sx = (E.screencols - boxw) / 2; int sy = (E.screenrows - boxh) / 2;
+    int maxlen = 0; for (int i = 0; i < n; i++) { int l = visible_len(ActiveMatches[i]); if (l > maxlen) maxlen = l; }
+    int full_page = (ActiveFilenameStart < 0); // full page for search
+    int boxw, boxh, sx, sy;
+    if (full_page) {
+        boxw = E.screencols;
+        boxh = E.screenrows;
+        sx = 0; sy = 0;
+    } else {
+        boxw = maxlen + 6; if (boxw > E.screencols) boxw = E.screencols;
+        boxh = n + 4; if (boxh > E.screenrows) boxh = E.screenrows;
+        sx = (E.screencols - boxw) / 2; sy = (E.screenrows - boxh) / 2;
+    }
     // clear box area
-    for (int y = 0; y < boxh; y++) {
-        char buf[128]; int ln = sy + y + 1;
-        int written = snprintf(buf, sizeof(buf), "\x1b[%d;%dH", ln, sx + 1);
-        if (written > 0) write(STDOUT_FILENO, buf, (size_t)written);
-        for (int x = 0; x < boxw; x++) write(STDOUT_FILENO, " ", 1);
+    if (full_page) {
+        write(STDOUT_FILENO, "\x1b[2J", 4); // clear entire screen
+        write(STDOUT_FILENO, "\x1b[H", 3);  // move to top-left
+    } else {
+        for (int y = 0; y < boxh; y++) {
+            char buf[128]; int ln = sy + y + 1;
+            int written = snprintf(buf, sizeof(buf), "\x1b[%d;%dH", ln, sx + 1);
+            if (written > 0) write(STDOUT_FILENO, buf, (size_t)written);
+            for (int x = 0; x < boxw; x++) write(STDOUT_FILENO, " ", 1);
+        }
     }
     // title
-    char title[128]; snprintf(title, sizeof(title), "Suggestions (%d)", n);
-    int col = sx + 2; int ln = sy + 1; char linebuf[256]; int pn = snprintf(linebuf, sizeof(linebuf), "\x1b[%d;%dH%s", ln, col, title); if (pn>0) write(STDOUT_FILENO, linebuf, (size_t)pn);
-    // list entries
-    for (int i = 0; i < n; i++) {
-        int ln2 = sy + 2 + i;
-        int col2 = sx + 2;
+    char title[256];
+    if (ActiveFilenameStart < 0 && E.command_len > 0) {
+        // search: include command in white
+        snprintf(title, sizeof(title), "Suggestions (%d) : \x1b[37m%s\x1b[0m", n, E.command_buf);
+    } else {
+        snprintf(title, sizeof(title), "Suggestions (%d)", n);
+    }
+    int col = full_page ? 1 : sx + 2; int ln = full_page ? 1 : sy + 1; char linebuf[512]; int pn = snprintf(linebuf, sizeof(linebuf), "\x1b[%d;%dH%s", ln, col, title); if (pn>0) write(STDOUT_FILENO, linebuf, (size_t)pn);
+    // list entries (with pagination)
+    int pageSize = full_page ? (E.screenrows - 4) : ((E.screenrows - 4 > 3) ? (E.screenrows - 4) : SuggestionPageSize); if (pageSize < 3) pageSize = 3;
+    int pages = (n + pageSize - 1) / pageSize; if (ActiveMatchesPage >= pages) ActiveMatchesPage = pages ? pages - 1 : 0;
+    int start = ActiveMatchesPage * pageSize; int end = start + pageSize; if (end > n) end = n;
+
+    for (int idx = start, linei = 0; idx < end; idx++, linei++) {
+        int ln2 = full_page ? (ln + 2 + linei) : (sy + 2 + linei);
+        int col2 = full_page ? 1 : (sx + 2);
         char buf[512]; int rn = snprintf(buf, sizeof(buf), "\x1b[%d;%dH", ln2, col2);
         if (rn>0) write(STDOUT_FILENO, buf, (size_t)rn);
-        if (i == sel) write(STDOUT_FILENO, "\x1b[7m", 4);
-        int is_dir = (ActiveMatches[i][strlen(ActiveMatches[i]) - 1] == '/');
-        if (is_dir) write(STDOUT_FILENO, "\x1b[32m", 5);
-        else write(STDOUT_FILENO, "\x1b[93m", 5);
-        write(STDOUT_FILENO, ActiveMatches[i], strlen(ActiveMatches[i]));
-        write(STDOUT_FILENO, "\x1b[0m", 4);
-        int pad = boxw - 4 - (int)strlen(ActiveMatches[i]); if (pad > 0) { for (int p = 0; p < pad; p++) write(STDOUT_FILENO, " ", 1); }
-        if (i == sel) write(STDOUT_FILENO, "\x1b[m", 3);
+        int isSel = (idx == sel);
+        if (isSel) write(STDOUT_FILENO, "\x1b[7m", 4);
+        /* If this is a search result (ActiveFilenameStart < 0) the entry is
+           formatted as "path:lineno: snippet"; print path in green then snippet
+           (which may contain ANSI highlighting already). */
+        if (ActiveFilenameStart < 0) {
+            const char *ent = ActiveMatches[idx]; const char *c1 = strchr(ent, ':');
+            if (c1) {
+                size_t plen = c1 - ent; write(STDOUT_FILENO, "\x1b[32m", 5); write(STDOUT_FILENO, ent, plen); write(STDOUT_FILENO, "\x1b[0m", 4);
+                // write remainder including ':' and snippet
+                write(STDOUT_FILENO, c1, strlen(c1));
+            } else {
+                write(STDOUT_FILENO, ActiveMatches[idx], strlen(ActiveMatches[idx]));
+            }
+        } else {
+            int is_dir = (ActiveMatches[idx][strlen(ActiveMatches[idx]) - 1] == '/');
+            if (is_dir) write(STDOUT_FILENO, "\x1b[32m", 5);
+            else write(STDOUT_FILENO, "\x1b[32m", 5); /* make non-dir green instead of yellow */
+            write(STDOUT_FILENO, ActiveMatches[idx], strlen(ActiveMatches[idx]));
+            write(STDOUT_FILENO, "\x1b[0m", 4);
+        }
+        int pad = boxw - 4 - visible_len(ActiveMatches[idx]); if (pad > 0) { for (int p = 0; p < pad; p++) write(STDOUT_FILENO, " ", 1); }
+        if (isSel) write(STDOUT_FILENO, "\x1b[m", 3);
     }
-    // position cursor out of way
-    char cur[64]; int m = snprintf(cur, sizeof(cur), "\x1b[%d;%dH", sy + boxh, sx + 1); if (m>0) write(STDOUT_FILENO, cur, (size_t)m);
+    // footer showing page info
+    int foot_ln = full_page ? (E.screenrows) : (sy + boxh - 1);
+    int foot_col = full_page ? 1 : (sx + 2);
+    char foot[128]; int fp = snprintf(foot, sizeof(foot), "\x1b[%d;%dHPage %d/%d (%d results)", foot_ln, foot_col, ActiveMatchesPage + 1, pages ? pages : 1, n);
+    if (fp > 0) write(STDOUT_FILENO, foot, (size_t)fp);
+    // position cursor and show it
+    write(STDOUT_FILENO, "\x1b[?25h", 6); // show cursor
+    if (E.mode == MODE_VIEW && ActiveFilenameStart < 0) {
+        // position cursor at end of visible title (account for ANSI codes)
+        int cursor_col = col + visible_len(title);
+        if (cursor_col < 1) cursor_col = 1;
+        if (cursor_col > E.screencols) cursor_col = E.screencols;
+        char cur[64]; int m = snprintf(cur, sizeof(cur), "\x1b[%d;%dH", ln, cursor_col);
+        if (m > 0) write(STDOUT_FILENO, cur, (size_t)m);
+    } else {
+        // position cursor out of way
+        int out_ln = full_page ? E.screenrows : (sy + boxh);
+        int out_col = full_page ? E.screencols : (sx + 1);
+        char cur[64]; int m = snprintf(cur, sizeof(cur), "\x1b[%d;%dH", out_ln, out_col);
+        if (m > 0) write(STDOUT_FILENO, cur, (size_t)m);
+    }
 }
 
 // accept current active suggestion and insert into command buffer (does not execute command)
 static void accept_active_suggestion(void) {
-    if (!SuggestionsVisible || ActiveMatchesN <= 0 || ActiveFilenameStart < 0) return;
+    if (!SuggestionsVisible || ActiveMatchesN <= 0) return;
     int sel = ActiveMatchSel; if (sel < 0 || sel >= ActiveMatchesN) sel = 0;
-    int addlen = (int)strlen(ActiveMatches[sel]);
-    int pre = ActiveFilenameStart;
-    int newlen = pre + addlen;
-    if (newlen + 1 < (int)sizeof(E.command_buf)) {
-        memcpy(&E.command_buf[pre], ActiveMatches[sel], addlen);
-        E.command_len = newlen; E.command_buf[E.command_len] = '\0';
+    if (ActiveFilenameStart >= 0) {
+        /* filename completion into command buffer */
+        int addlen = (int)strlen(ActiveMatches[sel]);
+        int pre = ActiveFilenameStart;
+        int newlen = pre + addlen;
+        if (newlen + 1 < (int)sizeof(E.command_buf)) {
+            memcpy(&E.command_buf[pre], ActiveMatches[sel], addlen);
+            E.command_len = newlen; E.command_buf[E.command_len] = '\0';
+        }
+        clear_active_suggestions();
+        return;
     }
-    clear_active_suggestions();
+    /* if ActiveFilenameStart < 0, treat matches as search results of form "path:lineno: snippet" */
+    const char *entry = ActiveMatches[sel];
+    if (!entry) { clear_active_suggestions(); return; }
+    /* parse path and lineno
+       formats: path:lineno:rest  OR path:lineno:col:rest (handle first two parts) */
+    const char *p = entry;
+    const char *c1 = strchr(p, ':'); if (!c1) { clear_active_suggestions(); return; }
+    size_t pathlen = c1 - p;
+    char pathbuf[512]; if (pathlen >= sizeof(pathbuf)) pathlen = sizeof(pathbuf)-1;
+    memcpy(pathbuf, p, pathlen); pathbuf[pathlen] = '\0';
+    const char *p2 = c1 + 1; const char *c2 = strchr(p2, ':'); int lineno = 1;
+    if (c2) {
+        char numbuf[32]; size_t nlen = c2 - p2; if (nlen >= sizeof(numbuf)) nlen = sizeof(numbuf)-1;
+        memcpy(numbuf, p2, nlen); numbuf[nlen] = '\0'; lineno = atoi(numbuf);
+    }
+    // check if file is already open in some tab or current
+    int already_open = 0;
+    if (E.filename && strcmp(E.filename, pathbuf) == 0) {
+        already_open = 1;
+    } else {
+        for (int i = 0; i < NumTabs; i++) {
+            if (Tabs[i].name && strcmp(Tabs[i].name, pathbuf) == 0) {
+                already_open = 1;
+                // switch to that tab
+                if (CurTab != i) {
+                    if (CurTab == -1) save_current_to_home();
+                    CurTab = i;
+                    load_tab_snapshot(i);
+                }
+                break;
+            }
+        }
+    }
+    if (already_open) {
+        // seek to line
+        editorSeekLine(lineno);
+        clear_active_suggestions();
+        // clear command buffer after opening
+        E.command_len = 0;
+        E.command_buf[0] = '\0';
+    } else {
+        // prompt to open
+        clear_active_suggestions();
+        E.prompt_visible = 1;
+        snprintf(E.prompt_message, sizeof(E.prompt_message), "File '%s' is not open. Open it?", pathbuf);
+        /* use themed bold colors and color the descriptive words too */
+        snprintf(E.prompt_options, sizeof(E.prompt_options), "\x1b[1;92mo\x1b[0m: \x1b[92mcurrent tab\x1b[0m, \x1b[1;94mt\x1b[0m: \x1b[94mnew tab\x1b[0m, \x1b[1;93mc\x1b[0m: \x1b[93mcancel\x1b[0m");
+        strcpy(E.pending_path, pathbuf);
+        E.pending_lineno = lineno;
+        // clear command buffer
+        E.command_len = 0;
+        E.command_buf[0] = '\0';
+    }
 }
 
 // Blocking picker (used by Tab-triggered flow). Returns selected index or -1 if cancelled.
@@ -2880,43 +3339,123 @@ static int pick_from_matches(char **matches, int n) {
     int sel = 0;
     while (1) {
         if (winch_received) { getWindowSize(); editorRefreshScreen(); winch_received = 0; }
-        // compute box dimensions
-        int maxlen = 0; for (int i = 0; i < n; i++) { int l = (int)strlen(matches[i]); if (l > maxlen) maxlen = l; }
-        int boxw = maxlen + 6; if (boxw > E.screencols) boxw = E.screencols;
-        int boxh = n + 4; if (boxh > E.screenrows) boxh = E.screenrows;
+        // compute max visible length (account for ANSI sequences)
+        int maxlen = 0; for (int i = 0; i < n; i++) { int l = visible_len(matches[i]); if (l > maxlen) maxlen = l; }
+        int colw = maxlen + 6; if (colw < 18) colw = 18; // minimum column width
+        int cols = E.screencols / colw; if (cols < 1) cols = 1; if (cols > n) cols = n;
+        int rows = (n + cols - 1) / cols;
+        int boxw = cols * colw; if (boxw > E.screencols) boxw = E.screencols;
+        int boxh = rows + 4; if (boxh > E.screenrows) boxh = E.screenrows;
         int sx = (E.screencols - boxw) / 2; int sy = (E.screenrows - boxh) / 2;
-        // clear box area
+        // clear the full screen to avoid overlay artifacts from previous popups
+        write(STDOUT_FILENO, "\x1b[2J", 4); // clear entire screen
+        write(STDOUT_FILENO, "\x1b[H", 3);    // move to top-left
+        // draw box background (clear box region explicitly for clarity)
         for (int y = 0; y < boxh; y++) {
             char buf[128]; int ln = sy + y + 1;
             int written = snprintf(buf, sizeof(buf), "\x1b[%d;%dH", ln, sx + 1);
             if (written > 0) write(STDOUT_FILENO, buf, (size_t)written);
             for (int x = 0; x < boxw; x++) write(STDOUT_FILENO, " ", 1);
         }
-        // title
-        char title[128]; snprintf(title, sizeof(title), "Suggestions (%d)", n);
+        // title (bold white) + small hint (dim)
+        char title[128]; snprintf(title, sizeof(title), "\x1b[1;97mSelect an option\x1b[0m \x1b[90m(use arrows, Enter to select, q to cancel)\x1b[0m");
         int col = sx + 2; int ln = sy + 1; char linebuf[256]; int pn = snprintf(linebuf, sizeof(linebuf), "\x1b[%d;%dH%s", ln, col, title); if (pn>0) write(STDOUT_FILENO, linebuf, (size_t)pn);
-        // list entries
-        for (int i = 0; i < n; i++) {
-            int ln2 = sy + 2 + i;
-            int col2 = sx + 2;
-            char buf[512]; int rn = snprintf(buf, sizeof(buf), "\x1b[%d;%dH", ln2, col2);
-            if (rn>0) write(STDOUT_FILENO, buf, (size_t)rn);
-            if (i == sel) write(STDOUT_FILENO, "\x1b[7m", 4);
-            int is_dir = (matches[i][strlen(matches[i]) - 1] == '/');
-            if (is_dir) write(STDOUT_FILENO, "\x1b[32m", 5);
-            else write(STDOUT_FILENO, "\x1b[93m", 5);
-            write(STDOUT_FILENO, matches[i], strlen(matches[i]));
-            write(STDOUT_FILENO, "\x1b[0m", 4);
-            int pad = boxw - 4 - (int)strlen(matches[i]); if (pad > 0) { for (int p = 0; p < pad; p++) write(STDOUT_FILENO, " ", 1); }
-            if (i == sel) write(STDOUT_FILENO, "\x1b[m", 3);
+        // draw items in columns (column-major ordering for balanced display)
+        for (int r = 0; r < rows; r++) {
+            int ln2 = sy + 2 + r;
+            for (int c = 0; c < cols; c++) {
+                int idx = r + c * rows; if (idx >= n) continue;
+                int colstart = sx + 2 + c * colw;
+                char buf[1024]; int rn = snprintf(buf, sizeof(buf), "\x1b[%d;%dH", ln2, colstart);
+                if (rn > 0) write(STDOUT_FILENO, buf, (size_t)rn);
+                int isSel = (idx == sel);
+                if (isSel) write(STDOUT_FILENO, "\x1b[7m", 4); // reverse for selection
+                // number (cyan) then item (yellow/green for dirs)
+                char numbuf[32]; snprintf(numbuf, sizeof(numbuf), "\x1b[96m%2d)\x1b[0m ", idx+1);
+                write(STDOUT_FILENO, numbuf, strlen(numbuf));
+                int is_dir = (matches[idx][strlen(matches[idx]) - 1] == '/');
+                if (is_dir) write(STDOUT_FILENO, "\x1b[92m", 5);
+                else write(STDOUT_FILENO, "\x1b[37m", 5);
+                write(STDOUT_FILENO, matches[idx], strlen(matches[idx]));
+                write(STDOUT_FILENO, "\x1b[0m", 4);
+                // pad to column width
+                int pad = colw - 4 - visible_len(matches[idx]); if (pad > 0) { for (int p = 0; p < pad; p++) write(STDOUT_FILENO, " ", 1); }
+                if (isSel) write(STDOUT_FILENO, "\x1b[m", 3);
+            }
         }
+        // footer: show index hint
+        int foot_ln = sy + boxh - 1; int foot_col = sx + 2;
+        char foot[128]; int fp = snprintf(foot, sizeof(foot), "\x1b[%d;%dH\x1b[90mPress number to jump directly, arrows to move, Enter to pick\x1b[0m", foot_ln, foot_col);
+        if (fp > 0) write(STDOUT_FILENO, foot, (size_t)fp);
         // position cursor out of way
         char cur[64]; int m = snprintf(cur, sizeof(cur), "\x1b[%d;%dH", sy + boxh, sx + 1); if (m>0) write(STDOUT_FILENO, cur, (size_t)m);
         // read key
         int k = readKey(); if (k == -1) continue;
-        if (k == ARROW_DOWN) { sel = (sel + 1) % n; continue; }
-        if (k == ARROW_UP) { sel = (sel - 1 + n) % n; continue; }
-        if (k == '\r' || k == '\n' || k == '\t') { return sel; }
+        if (k >= '1' && k <= '9') {
+            int v = k - '0'; if (v >= 1 && v <= n) return v - 1; continue;
+        }
+        if (k == ARROW_DOWN) {
+            // move down by one row (wrap)
+            int r = sel % rows; int c = sel / rows; r = (r + 1) % rows; int newsel = r + c * rows; if (newsel >= n) newsel = sel; sel = newsel; continue;
+        }
+        if (k == ARROW_UP) {
+            int r = sel % rows; int c = sel / rows; r = (r - 1 + rows) % rows; int newsel = r + c * rows; if (newsel >= n) newsel = sel; sel = newsel; continue;
+        }
+        if (k == ARROW_LEFT) {
+            int r = sel % rows; int c = sel / rows; c = (c - 1 + cols) % cols; int newsel = r + c * rows; if (newsel < n) sel = newsel; continue;
+        }
+        if (k == ARROW_RIGHT) {
+            int r = sel % rows; int c = sel / rows; c = (c + 1) % cols; int newsel = r + c * rows; if (newsel < n) sel = newsel; continue;
+        }
+        if (k == '\r' || k == '\n' || k == '\t') { 
+            // restore screen and refresh before returning
+            write(STDOUT_FILENO, "\x1b[2J", 4); write(STDOUT_FILENO, "\x1b[H", 3); editorRefreshScreen();
+            return sel; 
+        }
+        if (k == 27 || k == 'q' || k == 'Q') { return -1; }
+    }
+}
+
+// Multi-select picker (implementation placed after single-select picker)
+static int pick_multi_from_matches_with_desc(char **labels, char **descs, int n, int *out_flags) {
+    if (!labels || n <= 0 || !out_flags) return -1;
+    for (int i = 0; i < n; i++) out_flags[i] = 0;
+    int sel = 0;
+    while (1) {
+        if (winch_received) { getWindowSize(); editorRefreshScreen(); winch_received = 0; }
+        int maxlabel = 0; int maxdesc = 0; for (int i = 0; i < n; i++) { int lv = visible_len(labels[i]); if (lv > maxlabel) maxlabel = lv; if (descs && descs[i]) { int dv = visible_len(descs[i]); if (dv > maxdesc) maxdesc = dv; } }
+        int colw = maxlabel + maxdesc + 12; if (colw < 40) colw = 40; if (colw > E.screencols - 4) colw = E.screencols - 4;
+        int rows = (n < (E.screenrows - 6)) ? n : (E.screenrows - 6);
+        int boxh = rows + 4; int boxw = colw; int sx = (E.screencols - boxw) / 2; int sy = (E.screenrows - boxh) / 2;
+        // clear the full screen to avoid overlay artifacts from previous popups
+        write(STDOUT_FILENO, "\x1b[2J", 4); // clear entire screen
+        write(STDOUT_FILENO, "\x1b[H", 3);    // move to top-left
+        // draw box background (clear box region explicitly for clarity)
+        for (int y = 0; y < boxh; y++) {
+            char buf[128]; int ln = sy + y + 1; int written = snprintf(buf, sizeof(buf), "\x1b[%d;%dH", ln, sx + 1); if (written > 0) write(STDOUT_FILENO, buf, (size_t)written);
+            for (int x = 0; x < boxw; x++) write(STDOUT_FILENO, " ", 1);
+        }
+        // title
+        char title[256]; snprintf(title, sizeof(title), "\x1b[1;97mSelect options (Space to toggle, Enter to accept)\x1b[0m"); int col = sx + 2; int ln = sy + 1; char linebuf[256]; int pn = snprintf(linebuf, sizeof(linebuf), "\x1b[%d;%dH%s", ln, col, title); if (pn>0) write(STDOUT_FILENO, linebuf, (size_t)pn);
+        // list (simple scrolling)
+        int start = 0; if (sel >= rows) start = sel - rows + 1; int end = start + rows; if (end > n) end = n;
+        for (int i = start; i < end; i++) {
+            int ln2 = sy + 2 + (i - start); int col2 = sx + 2; char buf[1024]; int rn = snprintf(buf, sizeof(buf), "\x1b[%d;%dH", ln2, col2); if (rn>0) write(STDOUT_FILENO, buf, (size_t)rn);
+            int isSel = (i == sel); if (isSel) write(STDOUT_FILENO, "\x1b[7m", 4);
+            if (out_flags[i]) write(STDOUT_FILENO, "[\x1b[92mx\x1b[0m] ", 9); else write(STDOUT_FILENO, "[ ] ", 3);
+            char labbuf[512]; snprintf(labbuf, sizeof(labbuf), "\x1b[96m%s\x1b[0m", labels[i]); write(STDOUT_FILENO, labbuf, strlen(labbuf));
+            int pad = 2 + maxlabel - visible_len(labels[i]); for (int p = 0; p < pad; p++) write(STDOUT_FILENO, " ", 1);
+            if (descs && descs[i]) { char descbuf[512]; snprintf(descbuf, sizeof(descbuf), "\x1b[90m%s\x1b[0m", descs[i]); write(STDOUT_FILENO, descbuf, strlen(descbuf)); }
+            if (isSel) write(STDOUT_FILENO, "\x1b[m", 3);
+        }
+        int foot_ln = sy + boxh - 1; int foot_col = sx + 2; char foot[128]; int fp = snprintf(foot, sizeof(foot), "\x1b[%d;%dH\x1b[90mSpace toggles • Enter accepts • Esc cancels\x1b[0m", foot_ln, foot_col); if (fp>0) write(STDOUT_FILENO, foot, (size_t)fp);
+        char cur[64]; int m = snprintf(cur, sizeof(cur), "\x1b[%d;%dH", sy + boxh, sx + 1); if (m>0) write(STDOUT_FILENO, cur, (size_t)m);
+        int k = readKey(); if (k == -1) continue;
+        if (k == ARROW_DOWN) { if (sel + 1 < n) sel++; if (sel >= end) { start++; end++; if (end > n) { end = n; start = end - rows; if (start < 0) start = 0; } } continue; }
+        if (k == ARROW_UP) { if (sel > 0) sel--; if (sel < start) { start--; if (start < 0) start = 0; end = start + rows; if (end > n) end = n; } continue; }
+        if (k == ' ') { out_flags[sel] = !out_flags[sel]; continue; }
+        if (k == '\r' || k == '\n') { int cnt = 0; for (int i = 0; i < n; i++) if (out_flags[i]) cnt++; // restore screen and refresh before returning
+            write(STDOUT_FILENO, "\x1b[2J", 4); write(STDOUT_FILENO, "\x1b[H", 3); editorRefreshScreen(); return cnt; }
         if (k == 27 || k == 'q' || k == 'Q') { return -1; }
     }
 }
@@ -2986,8 +3525,729 @@ static void open_file_in_new_tab(const char *fname) {
         fclose(f);
         t.saved_snapshot = t.snapshot ? strdup(t.snapshot) : NULL;
     }
+    /* OPEN_TAB_IMPL */
     int idx = append_tab(t);
     if (idx >= 0) switch_to_tab(idx);
+}
+
+// detect available build system in CWD
+typedef enum { BS_NONE=0, BS_MAKE=1, BS_CMAKE=2, BS_CARGO=3 } BuildSystem;
+static BuildSystem detect_build_system(char *outpath, int outpath_len) {
+    char cwd[512]; getcwd(cwd, sizeof(cwd));
+    (void)cwd;
+    if (access("Makefile", F_OK) == 0) { if (outpath) strncpy(outpath, "Makefile", outpath_len); return BS_MAKE; }
+    if (access("CMakeLists.txt", F_OK) == 0) { if (outpath) strncpy(outpath, "CMakeLists.txt", outpath_len); return BS_CMAKE; }
+    if (access("Cargo.toml", F_OK) == 0) { if (outpath) strncpy(outpath, "Cargo.toml", outpath_len); return BS_CARGO; }
+    return BS_NONE;
+}
+
+// parse Makefile for simple targets: lines of form "name:"
+static char **get_make_targets(int *out_n) {
+    *out_n = 0; FILE *f = fopen("Makefile", "r"); if (!f) return NULL;
+    char line[512]; char **arr = NULL; int cnt = 0;
+    while (fgets(line, sizeof(line), f)) {
+        // ignore leading whitespace
+        int i = 0; while (line[i] == ' ' || line[i] == '\t') i++;
+        // target line if it contains ':' and no '=' before it
+        char *c = strchr(&line[i], ':'); if (!c) continue;
+        // ensure name is valid (no spaces)
+        int len = (int)(c - &line[i]); if (len <= 0 || len > 128) continue;
+        int ok = 1; for (int j = 0; j < len; j++) { char ch = line[i+j]; if (!(isalnum((unsigned char)ch) || ch=='_' || ch=='.' || ch=='-' )) { ok = 0; break; } }
+        if (!ok) continue;
+        char tmp[256]; int sl = len < (int)sizeof(tmp)-1 ? len : (int)sizeof(tmp)-1; memcpy(tmp, &line[i], sl); tmp[sl] = '\0';
+        if (strcmp(tmp, ".PHONY") == 0) continue; // skip .PHONY: ...
+        char **nar = realloc(arr, sizeof(char*) * (cnt + 1)); if (!nar) break; arr = nar; arr[cnt++] = strdup(tmp);
+        if (cnt >= 200) break;
+    }
+    fclose(f);
+    *out_n = cnt; return arr;
+}
+
+// blocking text input prompt at bottom of screen; returns allocated string (caller must free) or NULL on cancel
+static char *prompt_input(const char *prompt) {
+    char buf[512] = {0}; int len = 0;
+    int row = E.screenrows;
+    /* Print colored prompt: bold white message + dim hint that Enter cancels if nothing entered */
+    char tmp[1024]; int pn = snprintf(tmp, sizeof(tmp), "\x1b[%d;1H\x1b[K\x1b[1;97m%s\x1b[0m \x1b[90m<Enter to cancel>\x1b[0m \x1b[96m", row, prompt);
+    if (pn>0) write(STDOUT_FILENO, tmp, (size_t)pn);
+    while (1) {
+        int k = readKey(); if (k == -1) continue;
+        if (k == '\r' || k == '\n') { if (len == 0) { // nothing entered -> treat as cancel
+                char clr[64]; int cn = snprintf(clr, sizeof(clr), "\x1b[%d;1H\x1b[K", row); if (cn>0) write(STDOUT_FILENO, clr, (size_t)cn); return NULL; }
+            char *out = strdup(buf); char clr[64]; int cn = snprintf(clr, sizeof(clr), "\x1b[%d;1H\x1b[K", row); if (cn>0) write(STDOUT_FILENO, clr, (size_t)cn); return out; }
+        if (k == 127 || k == 8) { if (len>0) { len--; buf[len] = '\0'; /* reflect back */ char clr[64]; int cn = snprintf(clr, sizeof(clr), "\x1b[%d;1H\x1b[K\x1b[1;97m%s\x1b[0m \x1b[90m<Enter to cancel>\x1b[0m \x1b[96m%s\x1b[0m", row, prompt, buf); if (cn>0) write(STDOUT_FILENO, clr, (size_t)cn); } continue; }
+        if (k >= 32 && k <= 126) { if (len < (int)sizeof(buf)-1) { buf[len++] = (char)k; buf[len] = '\0'; /* reflect back */ char clr[64]; int cn = snprintf(clr, sizeof(clr), "\x1b[%d;1H\x1b[K\x1b[1;97m%s\x1b[0m \x1b[90m<Enter to cancel>\x1b[0m \x1b[96m%s\x1b[0m", row, prompt, buf); if (cn>0) write(STDOUT_FILENO, clr, (size_t)cn); } }
+    }
+} 
+
+// ask yes/no prompt; returns 1 for yes, 0 for no
+static int prompt_yesno(const char *msg) {
+    int row = E.screenrows; char tmp[1024]; int pn = snprintf(tmp, sizeof(tmp), "\x1b[%d;1H\x1b[K%s \x1b[92m(y)\x1b[0m / \x1b[91m(n)\x1b[0m: ", row, msg);
+    if (pn>0) write(STDOUT_FILENO, tmp, (size_t)pn);
+    int resp = 0; while (1) { int k = readKey(); if (k == -1) continue; if (k=='y'||k=='Y') { resp = 'y'; break; } if (k=='n'||k=='N'||k==27) { resp = 'n'; break; } }
+    pn = snprintf(tmp, sizeof(tmp), "\x1b[%d;1H\x1b[K", row); if (pn>0) write(STDOUT_FILENO, tmp, (size_t)pn);
+    return resp == 'y';
+}
+
+static void free_string_array(char **a, int n) { if (!a) return; for (int i=0;i<n;i++) free(a[i]); free(a); }
+
+// simple per-project build config
+typedef struct {
+    char buildfile[256];
+    char build_cmd[512];
+    char run_cmd[512];
+    time_t saved_at;
+} BuildConfig;
+
+// helper: extract a JSON string value for a simple flat JSON file
+static int json_get_str(const char *buf, const char *key, char *out, int outlen) {
+    if (!buf || !key || !out) return 0;
+    char *p = strstr(buf, key);
+    if (!p) return 0;
+    p = strchr(p, ':'); if (!p) return 0; p++;
+    while (*p && isspace((unsigned char)*p)) p++;
+    if (*p != '"') return 0; p++;
+    int i = 0;
+    while (*p && *p != '"' && i < outlen - 1) {
+        if (*p == '\\' && *(p+1)) { p++; out[i++] = *p++; }
+        else out[i++] = *p++;
+    }
+    out[i] = '\0';
+    return 1;
+}
+
+static int load_build_config(BuildConfig *cfg) {
+    if (!cfg) return 0;
+    FILE *f = fopen("config/build.json", "r"); if (!f) return 0;
+    fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
+    char *buf = malloc(sz + 1);
+    if (!buf) { fclose(f); return 0; }
+    fread(buf, 1, sz, f); buf[sz] = '\0'; fclose(f);
+    memset(cfg, 0, sizeof(*cfg));
+    json_get_str(buf, "\"buildfile\"", cfg->buildfile, sizeof(cfg->buildfile));
+    json_get_str(buf, "\"build_cmd\"", cfg->build_cmd, sizeof(cfg->build_cmd));
+    json_get_str(buf, "\"run_cmd\"", cfg->run_cmd, sizeof(cfg->run_cmd));
+    struct stat st; if (stat("config/build.json", &st) == 0) cfg->saved_at = st.st_mtime; else cfg->saved_at = time(NULL);
+    free(buf);
+    return 1;
+}
+
+static int save_build_config(const BuildConfig *cfg) {
+    if (!cfg) return 0;
+    // ensure config dir exists
+    mkdir("config", 0755);
+    FILE *f = fopen("config/build.json", "w"); if (!f) return 0;
+    fprintf(f, "{\n");
+    fprintf(f, "  \"buildfile\": \"%s\",\n", cfg->buildfile[0] ? cfg->buildfile : "");
+    fprintf(f, "  \"build_cmd\": \"%s\",\n", cfg->build_cmd[0] ? cfg->build_cmd : "");
+    fprintf(f, "  \"run_cmd\": \"%s\",\n", cfg->run_cmd[0] ? cfg->run_cmd : "");
+    fprintf(f, "  \"saved_at\": %ld\n", (long)time(NULL));
+    fprintf(f, "}\n");
+    fclose(f);
+    return 1;
+}
+
+// helper: find an executable by name in $PATH; returns 1 and writes path to out if found
+static int find_in_path(const char *name, char *out, int outlen) {
+    if (!name || !out) return 0;
+    char *path = getenv("PATH"); if (!path) return 0;
+    char *p = strdup(path);
+    char *tok = strtok(p, ":");
+    while (tok) {
+        char fnbuf[512]; int n = snprintf(fnbuf, sizeof(fnbuf), "%s/%s", tok, name);
+        if (n > 0 && n < (int)sizeof(fnbuf)) {
+            if (access(fnbuf, X_OK) == 0) { strncpy(out, fnbuf, outlen-1); out[outlen-1] = '\0'; free(p); return 1; }
+        }
+        tok = strtok(NULL, ":");
+    }
+    free(p);
+    return 0;
+}
+
+// helper: detect default compiler name/path for C or C++ (is_cxx=1 for C++)
+// Behavior: prefer $CC/$CXX if set and found, then try cc/c++ then gcc/g++ then clang/clang++
+static void detect_compiler(int is_cxx, char *out, int outlen) {
+    if (!out || outlen <= 0) return;
+    out[0] = '\0';
+    const char *env = getenv(is_cxx ? "CXX" : "CC");
+    if (env && env[0]) {
+        // if env contains a slash, assume it's a path
+        if (strchr(env, '/')) { if (access(env, X_OK) == 0) { strncpy(out, env, outlen-1); out[outlen-1] = '\0'; return; } }
+        else {
+            char full[512]; if (find_in_path(env, full, sizeof(full))) { strncpy(out, env, outlen-1); out[outlen-1] = '\0'; return; }
+        }
+    }
+    // try standard commands in order
+    const char *cands[] = { is_cxx ? "c++" : "cc", is_cxx ? "g++" : "gcc", is_cxx ? "clang++" : "clang", NULL };
+    for (int i = 0; cands[i]; i++) {
+        char full[512]; if (find_in_path(cands[i], full, sizeof(full))) { strncpy(out, cands[i], outlen-1); out[outlen-1] = '\0'; return; }
+    }
+    // fallback to generic names
+    strncpy(out, is_cxx ? "c++" : "cc", outlen-1); out[outlen-1] = '\0';
+}
+
+// Probe whether the given compiler accepts a specific -std option for C/C++
+static int probe_compile_check(const char *compiler, int is_cxx, const char *stdname) {
+    if (!compiler || !stdname) return 0;
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd), "printf 'int main() { return 0; }' | %s -x %s - -std=%s -fsyntax-only -o /dev/null 2>/dev/null", compiler, is_cxx ? "c++" : "c", stdname);
+    int st = system(cmd);
+    return (st == 0);
+}
+
+// Probe whether the given compiler accepts an arbitrary flag (like -Wall, -fsanitize=address, -g, -pthread).
+static int probe_flag_supported(const char *compiler, int is_cxx, const char *flag) {
+    if (!compiler || !flag) return 0;
+    char cmd[1024];
+    /* Try a full compile/link to exercise flags that affect linking as well (e.g., -lm).
+       Use -x c/c++ and pipe a tiny program to avoid disk I/O. */
+    snprintf(cmd, sizeof(cmd), "printf 'int main() { return 0; }' | %s -x %s - %s -o /dev/null 2>/dev/null", compiler, is_cxx ? "c++" : "c", flag);
+    int st = system(cmd);
+    return (st == 0);
+}
+
+// Detect supported -std options (returns allocated array of strings; caller must free each and free the array)
+static char **detect_supported_standards(const char *compiler, int is_cxx, int *out_n) {
+    *out_n = 0; if (!compiler) return NULL;
+    const char *c_stds[] = {"c89","c99","c11","c17","c2x", NULL};
+    const char *cpp_stds[] = {"c++98","c++03","c++11","c++14","c++17","c++20","c++23", NULL};
+    const char **cand = is_cxx ? cpp_stds : c_stds;
+    char **res = NULL; int cnt = 0;
+    for (int i = 0; cand[i]; i++) {
+        if (probe_compile_check(compiler, is_cxx, cand[i])) {
+            char *s = strdup(cand[i]); if (!s) continue;
+            char **n = realloc(res, sizeof(char*) * (cnt + 1)); if (!n) { free(s); break; }
+            res = n; res[cnt++] = s;
+        }
+    }
+    *out_n = cnt; return res;
+}
+
+// Helper: parse comma-separated numbers into a boolean array (1-indexed options)
+// Returns number of options parsed; 'flags' must be sized at least max_opts and will be 1 for selected.
+static int parse_number_list(const char *in, int *flags, int max_opts) {
+    if (!in || !flags) return 0;
+    for (int i = 0; i < max_opts; i++) flags[i] = 0;
+    int count = 0;
+    const char *p = in;
+    while (*p) {
+        while (*p && isspace((unsigned char)*p)) p++;
+        int v = 0; int n = 0; if (sscanf(p, "%d%n", &v, &n) == 1) {
+            if (v >= 1 && v <= max_opts) { flags[v-1] = 1; count++; }
+            p += n;
+        } else { p++; }
+        while (*p && (*p == ' ' || *p == ',')) p++;
+    }
+    return count;
+}
+
+
+
+
+static void output_clear(void) {
+    if (E.output_lines) {
+        for (int i = 0; i < E.output_n; i++) free(E.output_lines[i]);
+        free(E.output_lines); E.output_lines = NULL;
+    }
+    if (E.output_raw_lines) {
+        for (int i = 0; i < E.output_n; i++) free(E.output_raw_lines[i]);
+        free(E.output_raw_lines); E.output_raw_lines = NULL;
+    }
+    E.output_n = 0; E.output_scroll = 0; E.output_sel = 0;
+}
+
+// simple colorization for display only (log file remains raw)
+static char *colorize_line_for_display(const char *line) {
+    if (!line) return NULL;
+    const char *RED = "\x1b[31m"; const char *YEL = "\x1b[33m"; const char *MAG = "\x1b[35m"; const char *RESET = "\x1b[0m";
+    // prefer case-insensitive search if available
+    if (strcasestr(line, "error:")) {
+        size_t n = strlen(line) + 32; char *buf = malloc(n); if (!buf) return strdup(line); snprintf(buf, n, "%s%s%s", RED, line, RESET); return buf;
+    } else if (strcasestr(line, "warning:")) {
+        size_t n = strlen(line) + 32; char *buf = malloc(n); if (!buf) return strdup(line); snprintf(buf, n, "%s%s%s", YEL, line, RESET); return buf;
+    } else if (strstr(line, "Run skipped:")) {
+        size_t n = strlen(line) + 32; char *buf = malloc(n); if (!buf) return strdup(line); snprintf(buf, n, "%s%s%s", MAG, line, RESET); return buf;
+    }
+    return strdup(line);
+}
+
+static void output_append_colored_line(const char *rawline) {
+    if (!rawline) return;
+    // trim trailing newline
+    size_t L = strlen(rawline);
+    while (L > 0 && (rawline[L-1] == '\n' || rawline[L-1] == '\r')) L--;
+    // store raw
+    char *raw = malloc(L + 1); if (!raw) return; memcpy(raw, rawline, L); raw[L] = '\0';
+    char **rn = realloc(E.output_raw_lines, sizeof(char*) * (E.output_n + 1)); if (!rn) { free(raw); return; }
+    E.output_raw_lines = rn; E.output_raw_lines[E.output_n] = raw;
+    // store colorized
+    char *c = colorize_line_for_display(raw);
+    char *col = c ? c : strdup(raw);
+    char **n = realloc(E.output_lines, sizeof(char*) * (E.output_n + 1)); if (!n) { free(col); if (c) free(c); return; }
+    E.output_lines = n; E.output_lines[E.output_n++] = col;
+    // bound lines to avoid unbounded growth (keep last 5000)
+    if (E.output_n > 5000) {
+        free(E.output_raw_lines[0]); free(E.output_lines[0]);
+        memmove(E.output_raw_lines, E.output_raw_lines + 1, sizeof(char*) * (E.output_n - 1));
+        memmove(E.output_lines, E.output_lines + 1, sizeof(char*) * (E.output_n - 1));
+        E.output_n--;
+        char **rr = realloc(E.output_raw_lines, sizeof(char*) * E.output_n); if (rr) E.output_raw_lines = rr;
+        char **r = realloc(E.output_lines, sizeof(char*) * E.output_n); if (r) E.output_lines = r;
+        if (E.output_scroll > 0) E.output_scroll--;
+        if (E.output_sel > 0) E.output_sel--;
+    }
+}
+
+// Load `config/last_build.log` into the in-memory output pane if it changed.
+static void output_load_last_log(void) {
+    const char *path = "config/last_build.log";
+    struct stat st;
+    if (stat(path, &st) != 0) return; // no file
+    if (E.output_last_mtime != 0 && E.output_last_mtime == st.st_mtime && E.output_n > 0) return; // no change
+    FILE *f = fopen(path, "r"); if (!f) return;
+    output_clear();
+    char line[2048];
+    while (fgets(line, sizeof(line), f)) {
+        output_append_colored_line(line);
+    }
+    fclose(f);
+    E.output_last_mtime = st.st_mtime;
+    E.output_scroll = 0; E.output_sel = 0;
+}
+
+// Append a raw (uncolored) line to the on-disk log, flush and fsync so it's durable
+static void output_write_raw_to_log(const char *line) {
+    if (!line) return;
+    mkdir("config", 0755); // best-effort ensure dir exists
+    FILE *f = fopen("config/last_build.log", "a"); if (!f) return;
+    fputs(line, f); fputs("\n", f);
+    fflush(f); fsync(fileno(f)); fclose(f);
+    /* Force next render to reload from disk */
+    E.output_last_mtime = 0;
+}
+
+// crude parser: find first substring of the form PATH:LINE[:COL]
+// returns 1 and fills path/lineno/col if found
+static int parse_error_location(const char *line, char *path, int pathlen, int *lineno, int *colno) {
+    if (!line || !path || !lineno) return 0;
+    const char *p = line;
+    while (*p) {
+        // look for ':' then digits
+        const char *c = strchr(p, ':'); if (!c) break;
+        // ensure there is at least one digit after ':'
+        const char *d = c + 1; if (!isdigit((unsigned char)*d)) { p = c + 1; continue; }
+        // backtrack to start of path token
+        const char *s = c - 1; while (s > line && *s != ' ' && *s != '\t' && *s != '(' && *s != '"') s--; if (s != line) s++;
+        int plen = (int)(c - s);
+        if (plen <= 0 || plen >= pathlen) { p = c + 1; continue; }
+        // copy path candidate
+        char cand[512]; int cp = plen < (int)sizeof(cand)-1 ? plen : (int)sizeof(cand)-1; memcpy(cand, s, cp); cand[cp] = '\0';
+        // parse number after ':'
+        int ln = 0; int col = 0; int consumed = 0;
+        if (sscanf(c + 1, "%d%n", &ln, &consumed) != 1) { p = c + 1; continue; }
+        const char *after = c + 1 + consumed;
+        if (*after == ':') {
+            int cc = 0; int cons2 = 0; if (sscanf(after + 1, "%d%n", &cc, &cons2) == 1) { col = cc; after = after + 1 + cons2; }
+        }
+        // verify the path exists (attempt) — try as-is and also try relative path (same dir)
+        if (access(cand, R_OK) == 0) { strncpy(path, cand, pathlen-1); path[pathlen-1] = '\0'; *lineno = ln; if (colno) *colno = col; return 1; }
+        // try trimming leading './'
+        if (strncmp(cand, "./", 2) == 0) {
+            if (access(cand + 2, R_OK) == 0) { strncpy(path, cand + 2, pathlen-1); path[pathlen-1] = '\0'; *lineno = ln; if (colno) *colno = col; return 1; }
+        }
+        // maybe path is relative without dir; try as basename matching in cwd
+        DIR *dirp = opendir("."); if (dirp) {
+            struct dirent *de; while ((de = readdir(dirp))) {
+                if (strcmp(de->d_name, cand) == 0) { strncpy(path, de->d_name, pathlen-1); path[pathlen-1] = '\0'; closedir(dirp); *lineno = ln; if (colno) *colno = col; return 1; }
+            }
+            closedir(dirp);
+        }
+        // also try matching against open tabs (full path or basename)
+        for (int t = 0; t < NumTabs; t++) {
+            if (!Tabs[t].name) continue;
+            const char *tn = Tabs[t].name;
+            if (strcmp(tn, cand) == 0) { strncpy(path, tn, pathlen-1); path[pathlen-1] = '\0'; *lineno = ln; if (colno) *colno = col; return 1; }
+            char *bn = strrchr(tn, '/'); const char *bname = bn ? bn + 1 : tn;
+            if (strcmp(bname, cand) == 0) { strncpy(path, tn, pathlen-1); path[pathlen-1] = '\0'; *lineno = ln; if (colno) *colno = col; return 1; }
+        }
+        p = c + 1;
+    }
+    return 0;
+}
+
+// interactive setup for projects without a detected build system
+// fills outcfg and returns 1 on success, 0 on cancel/failure
+static int interactive_setup(BuildConfig *outcfg) {
+    if (!outcfg) return 0;
+    char **cands = NULL; int nc = 0;
+    DIR *d = opendir("."); if (!d) { snprintf(E.msg, sizeof(E.msg), "Cannot open cwd: %s", strerror(errno)); E.msg_time = time(NULL); return 0; }
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+        struct stat st; if (stat(de->d_name, &st) != 0) continue;
+        if (!S_ISREG(st.st_mode)) continue;
+        const char *ext = strrchr(de->d_name, '.');
+        if (!ext) continue;
+        if (strcmp(ext, ".c") == 0 || strcmp(ext, ".cpp") == 0 || strcmp(ext, ".rs") == 0 || strcmp(ext, ".go") == 0 || strcmp(ext, ".py") == 0 || strcmp(ext, ".java") == 0 || strcmp(ext, ".js") == 0) {
+            char **n = realloc(cands, sizeof(char*) * (nc + 1)); if (!n) continue; cands = n; cands[nc++] = strdup(de->d_name);
+        }
+    }
+    closedir(d);
+    if (nc == 0) { snprintf(E.msg, sizeof(E.msg), "No candidate source files found"); E.msg_time = time(NULL); return 0; }
+    int idx = pick_from_matches(cands, nc);
+    if (idx < 0) { free_string_array(cands, nc); return 0; }
+    char *src = strdup(cands[idx]); free_string_array(cands, nc);
+    memset(outcfg, 0, sizeof(*outcfg)); strncpy(outcfg->buildfile, src, sizeof(outcfg->buildfile)-1);
+    // heuristics based on extension
+    const char *ext = strrchr(src, '.');
+    char exe_default[128]; snprintf(exe_default, sizeof(exe_default), "%s", src);
+    char *dot = strrchr(exe_default, '.'); if (dot) *dot = '\0';
+    char exe_name[128]; exe_name[0] = '\0';
+    if (ext && (strcmp(ext, ".c") == 0 || strcmp(ext, ".cpp") == 0)) {
+        int is_cxx = (strcmp(ext, ".cpp") == 0);
+        char compiler_name[256] = {0}; detect_compiler(is_cxx, compiler_name, sizeof(compiler_name));
+        // allow user to override detected compiler if desired
+        char probe_msg[512]; snprintf(probe_msg, sizeof(probe_msg), "Use detected compiler %s?", compiler_name);
+        if (!prompt_yesno(probe_msg)) {
+            char *in = prompt_input("Enter compiler (name or path): "); if (!in) { free(src); return 0; } strncpy(compiler_name, in, sizeof(compiler_name)-1); free(in);
+        }
+        // probe supported standards
+        int std_n = 0; char **stds = detect_supported_standards(compiler_name, is_cxx, &std_n);
+        int std_idx = -1;
+        if (std_n > 0) {
+            std_idx = pick_from_matches((char**)stds, std_n);
+            if (std_idx < 0) { for (int ii=0; ii<std_n; ii++) free(stds[ii]); free(stds); free(src); return 0; }
+        } else {
+            // fallback static list
+            const char *defaults[] = { is_cxx ? "c++17" : "c99", is_cxx ? "c++20" : "c11", is_cxx ? "c++23" : "c2x", NULL };
+            // copy defaults into dynamic array for pick_from_matches
+            int di = 0; while (defaults[di]) di++;
+            char **dlist = malloc(sizeof(char*) * di);
+            for (int i = 0; i < di; i++) dlist[i] = strdup(defaults[i]);
+            std_idx = pick_from_matches(dlist, di);
+            if (std_idx < 0) { for (int i = 0; i < di; i++) free(dlist[i]); free(dlist); free(src); return 0; }
+            // convert selected into stds so downstream cleanup is uniform
+            stds = dlist; std_n = di;
+        }
+        const char *chosen_std = stds[std_idx];
+        // warnings menu (multi-select via numeric input)
+        /* Warning flags: probe compiler support and present a multi-select chooser with descriptions */
+        const char *warn_opts[] = {"-Wall","-Wextra","-Werror","-Wpedantic"};
+        const char *warn_descs[] = {"Enable common warnings","Additional useful warnings","Treat warnings as errors","Extra pedantic checks"};
+        int warn_count = 4;
+        char *wlabels[8]; char *wdescs[8]; int wcnt = 0; int wflags[8] = {0};
+        for (int i = 0; i < warn_count; i++) {
+            if (probe_flag_supported(compiler_name, is_cxx, warn_opts[i])) {
+                wlabels[wcnt] = strdup(warn_opts[i]); wdescs[wcnt] = strdup(warn_descs[i]); wcnt++;
+            }
+        }
+        if (wcnt == 0) { // fallback: include defaults
+            for (int i = 0; i < warn_count && i < 8; i++) { wlabels[wcnt] = strdup(warn_opts[i]); wdescs[wcnt] = strdup(warn_descs[i]); wcnt++; }
+        }
+        // default selection: -Wall + -Wextra if available
+        for (int i = 0; i < wcnt; i++) { if (strcmp(wlabels[i], "-Wall") == 0 || strcmp(wlabels[i], "-Wextra") == 0) wflags[i] = 1; }
+        // show picker
+        int sel = pick_multi_from_matches_with_desc(wlabels, wdescs, wcnt, wflags);
+        if (sel < 0) { // cancelled; free and abort
+            for (int i=0;i<wcnt;i++) { free(wlabels[i]); free(wdescs[i]); }
+            for (int ii = 0; ii < std_n; ii++) free(stds[ii]); free(stds); free(src); return 0; }
+        char warnstr[256] = {0}; for (int i=0;i<wcnt;i++) if (wflags[i]) { if (warnstr[0]) strncat(warnstr, " ", sizeof(warnstr)-strlen(warnstr)-1); strncat(warnstr, wlabels[i], sizeof(warnstr)-strlen(warnstr)-1); }
+        for (int i=0;i<wcnt;i++) { free(wlabels[i]); free(wdescs[i]); }
+        // optimization menu (single choice)
+        const char *opt_opts[] = {"-O0","-O1","-O2","-O3"}; int optc = 4; int opti = pick_from_matches((char**)opt_opts, optc); if (opti < 0) opti = 2; const char *optflag = opt_opts[opti];
+        // Extra flags: probe common extras and present multi-select including 'Custom...'
+        const char *extra_opts[] = {"-g","-fsanitize=address","-march=native","-pthread","-lm","Custom..."}; int extra_cand = 6;
+        char *elabels[8]; char *edescs[8]; int ecnt = 0; int eflags[8] = {0};
+        const char *extra_descs[] = {"Include debug symbols","AddressSanitizer (memory checks)","CPU-specific tuning","Enable pthreads","Link math library","Type custom flags"};
+        for (int i = 0; i < extra_cand - 1; i++) {
+            if (probe_flag_supported(compiler_name, is_cxx, extra_opts[i])) {
+                elabels[ecnt] = strdup(extra_opts[i]); edescs[ecnt] = strdup(extra_descs[i]); ecnt++;
+            }
+        }
+        // always add Custom... option
+        elabels[ecnt] = strdup("Custom..."); edescs[ecnt] = strdup("Type custom flags (space-separated)"); ecnt++;
+        int ecount = pick_multi_from_matches_with_desc(elabels, edescs, ecnt, eflags);
+        char extrabuf[256] = {0};
+        if (ecount > 0) {
+            for (int i=0;i<ecnt;i++) {
+                if (!eflags[i]) continue;
+                if (strcmp(elabels[i], "Custom...") == 0) {
+                    char *custom = prompt_input("Custom extra flags (space-separated, optional): ");
+                    if (custom && custom[0]) { strncat(extrabuf, custom, sizeof(extrabuf)-strlen(extrabuf)-1); strncat(extrabuf, " ", sizeof(extrabuf)-strlen(extrabuf)-1); }
+                    if (custom) free(custom);
+                } else {
+                    strncat(extrabuf, elabels[i], sizeof(extrabuf)-strlen(extrabuf)-1);
+                    strncat(extrabuf, " ", sizeof(extrabuf)-strlen(extrabuf)-1);
+                }
+            }
+        }
+        for (int i=0;i<ecnt;i++) { free(elabels[i]); free(edescs[i]); }
+        // determine executable name
+        char *en = prompt_input("Executable name (leave empty for default): "); if (en) { if (en[0]) strncpy(exe_name, en, sizeof(exe_name)-1); free(en); }
+        if (!exe_name[0]) strncpy(exe_name, exe_default, sizeof(exe_name)-1);
+        // assemble build command
+        char buildbuf[1024] = {0}; snprintf(buildbuf, sizeof(buildbuf), "%s -std=%s %s %s -o %s %s", compiler_name, chosen_std, warnstr, optflag, exe_name, src);
+        if (extrabuf[0]) { strncat(buildbuf, " ", sizeof(buildbuf)-strlen(buildbuf)-1); strncat(buildbuf, extrabuf, sizeof(buildbuf)-strlen(buildbuf)-1); }
+        strncpy(outcfg->build_cmd, buildbuf, sizeof(outcfg->build_cmd)-1);
+        snprintf(outcfg->run_cmd, sizeof(outcfg->run_cmd), "./%s", exe_name);
+        // cleanup
+        for (int ii = 0; ii < std_n; ii++) { free(stds[ii]); }
+        free(stds); stds = NULL;
+    } else if (ext && strcmp(ext, ".rs") == 0) {
+        // rust: use rustc direct compile for single file
+        char *en = prompt_input("Executable name (leave empty for default): "); if (en) { if (en[0]) strncpy(exe_name, en, sizeof(exe_name)-1); free(en); }
+        if (!exe_name[0]) strncpy(exe_name, exe_default, sizeof(exe_name)-1);
+        snprintf(outcfg->build_cmd, sizeof(outcfg->build_cmd), "rustc -o %s %s", exe_name, src);
+        snprintf(outcfg->run_cmd, sizeof(outcfg->run_cmd), "./%s", exe_name);
+    } else if (ext && strcmp(ext, ".go") == 0) {
+        char *en = prompt_input("Executable name (leave empty for default): "); if (en) { if (en[0]) strncpy(exe_name, en, sizeof(exe_name)-1); free(en); }
+        if (!exe_name[0]) strncpy(exe_name, exe_default, sizeof(exe_name)-1);
+        snprintf(outcfg->build_cmd, sizeof(outcfg->build_cmd), "go build -o %s %s", exe_name, src);
+        snprintf(outcfg->run_cmd, sizeof(outcfg->run_cmd), "./%s", exe_name);
+    } else if (ext && strcmp(ext, ".py") == 0) {
+        outcfg->build_cmd[0] = '\0';
+        snprintf(outcfg->run_cmd, sizeof(outcfg->run_cmd), "python3 %s", src);
+    } else if (ext && strcmp(ext, ".java") == 0) {
+        char *en = prompt_input("Main class name (leave empty to derive from file): "); if (en) { if (en[0]) strncpy(exe_name, en, sizeof(exe_name)-1); free(en); }
+        if (!exe_name[0]) strncpy(exe_name, exe_default, sizeof(exe_name)-1);
+        snprintf(outcfg->build_cmd, sizeof(outcfg->build_cmd), "javac %s", src);
+        snprintf(outcfg->run_cmd, sizeof(outcfg->run_cmd), "java %s", exe_name);
+    } else {
+        // fallback: ask for explicit build and run commands
+        char *b = prompt_input("Enter build command (empty to skip): "); if (b) { strncpy(outcfg->build_cmd, b, sizeof(outcfg->build_cmd)-1); free(b); }
+        char *r = prompt_input("Enter run command (empty to skip): "); if (r) { strncpy(outcfg->run_cmd, r, sizeof(outcfg->run_cmd)-1); free(r); }
+    }
+
+    // ask to save
+    if (prompt_yesno("Save this configuration for future builds?")) {
+        save_build_config(outcfg);
+        snprintf(E.msg, sizeof(E.msg), "Saved build config"); E.msg_time = time(NULL);
+    }
+
+    free(src);
+    return 1;
+}
+
+// choose a target/command then run or set for post-save
+static void handle_build_run(int do_run_after) {
+    char path[256] = {0}; BuildSystem bs = detect_build_system(path, sizeof(path));
+    if (bs != BS_NONE) {
+        // prompt to edit build file
+        char q[512]; int pn = snprintf(q, sizeof(q), "Build system found: %s. Edit it?", path);
+        if (prompt_yesno(q)) {
+            // let user pick which target to run after save
+            char *selcmd = NULL;
+            if (bs == BS_MAKE) {
+                int tn=0; char **t = get_make_targets(&tn);
+                if (tn>0) {
+                    int idx = pick_from_matches(t, tn);
+                    if (idx >= 0) { selcmd = malloc(256); snprintf(selcmd, 256, "make %s", t[idx]); }
+                    free_string_array(t, tn);
+                }
+            } else if (bs == BS_CARGO) {
+                const char *opts[] = {"build","run","test","clean"}; int optc = 4;
+                int idx = pick_from_matches((char**)opts, optc);
+                if (idx >= 0) { selcmd = malloc(256); snprintf(selcmd, 256, "cargo %s", opts[idx]); }
+            } else if (bs == BS_CMAKE) {
+                const char *opts[] = {"build","clean","test"}; int optc = 3;
+                int idx = pick_from_matches((char**)opts, optc);
+                if (idx >= 0) { if (strcmp(opts[idx], "build") == 0) snprintf((selcmd=malloc(256)),256, "cmake --build ."); else snprintf((selcmd=malloc(256)),256, "cmake --build . --target %s", opts[idx]); }
+            }
+            if (!selcmd) { // allow custom
+                char *in = prompt_input("Enter custom command (empty to cancel): "); if (in) { selcmd = in; } 
+            }
+            if (selcmd) {
+                // set post-edit command and open file for editing
+                strncpy(E.post_edit_cmd, selcmd, sizeof(E.post_edit_cmd)-1); E.post_edit_cmd[sizeof(E.post_edit_cmd)-1] = '\0';
+                E.awaiting_buildfile_save = 1; free(selcmd);
+                open_file_in_current_window_no_push(path);
+                return;
+            } else {
+                snprintf(E.msg, sizeof(E.msg), "No command selected"); E.msg_time = time(NULL); return;
+            }
+        } else {
+            // don't edit: pick target and run now
+            char *cmd = NULL;
+            if (bs == BS_MAKE) {
+                int tn=0; char **t = get_make_targets(&tn);
+                if (tn>0) {
+                    int idx = pick_from_matches(t, tn);
+                    if (idx >= 0) { cmd = malloc(256); snprintf(cmd, 256, "make %s", t[idx]); }
+                    free_string_array(t, tn);
+                }
+            } else if (bs == BS_CARGO) {
+                const char *opts[] = {"build","run","test","clean"}; int optc = 4;
+                int idx = pick_from_matches((char**)opts, optc);
+                if (idx >= 0) { cmd = malloc(256); snprintf(cmd, 256, "cargo %s", opts[idx]); }
+            } else if (bs == BS_CMAKE) {
+                const char *opts[] = {"build","clean","test"}; int optc = 3;
+                int idx = pick_from_matches((char**)opts, optc);
+                if (idx >= 0) { cmd = malloc(256); if (strcmp(opts[idx], "build") == 0) snprintf(cmd,256, "cmake --build ."); else snprintf(cmd,256, "cmake --build . --target %s", opts[idx]); }
+            }
+            if (!cmd) { char *in = prompt_input("Enter custom command (empty to cancel): "); if (in) { cmd = in; } }
+            if (cmd) {
+                char runcmd[768]; snprintf(runcmd, sizeof(runcmd), "__run_shell__:%s", cmd);
+                int st = execute_command(runcmd);
+                if (do_run_after) {
+                    // If the selected command already contains 'run' we assume it executed the run step.
+                    if (!strstr(cmd, "run")) {
+                        // Otherwise, attempt to use saved project run command if present and only run on successful build
+                        BuildConfig cfg2 = {0}; if (load_build_config(&cfg2) && cfg2.run_cmd[0] && st == 0) {
+                            char rc[1024]; snprintf(rc, sizeof(rc), "__run_shell__:%s", cfg2.run_cmd); execute_command(rc);
+                        }
+                    }
+                }
+                free(cmd);
+                return;
+            } else { snprintf(E.msg, sizeof(E.msg), "Command cancelled"); E.msg_time = time(NULL); return; }
+        }
+    } else {
+        // no build system: try saved config
+        BuildConfig cfg = {0};
+        if (load_build_config(&cfg)) {
+            if (prompt_yesno("Saved build config found. Use it?")) {
+                if (cfg.build_cmd[0]) {
+                    char runcmd[1024]; snprintf(runcmd, sizeof(runcmd), "__run_shell__:%s", cfg.build_cmd);
+                    int st = execute_command(runcmd);
+                    if (do_run_after && cfg.run_cmd[0]) {
+                        if (st == 0) {
+                            char rc[1024]; snprintf(rc, sizeof(rc), "__run_shell__:%s", cfg.run_cmd); execute_command(rc);
+                        } else {
+                            char emsg[256]; snprintf(emsg, sizeof(emsg), "Run skipped: build failed (exit %d)", st);
+                            output_append_colored_line(emsg);
+                            output_write_raw_to_log(emsg);
+                            E.output_visible = 1; E.output_scroll = 0; E.output_sel = 0; editorRefreshScreen();
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+        // fallback to interactive flow
+        if (prompt_yesno("No build system found. Run interactive setup?")) {
+            BuildConfig nc = {0};
+            if (interactive_setup(&nc)) {
+                // after setup, run the build (and run if requested)
+                int st = 0;
+                if (nc.build_cmd[0]) { char bcmd[1024]; snprintf(bcmd, sizeof(bcmd), "__run_shell__:%s", nc.build_cmd); st = execute_command(bcmd); }
+                if (do_run_after && nc.run_cmd[0]) {
+                    if (st == 0) {
+                        char rc[1024]; snprintf(rc, sizeof(rc), "__run_shell__:%s", nc.run_cmd); execute_command(rc);
+                    } else {
+                        char emsg[256]; snprintf(emsg, sizeof(emsg), "Run skipped: build failed (exit %d)", st);
+                        output_append_colored_line(emsg);
+                        output_write_raw_to_log(emsg);
+                        E.output_visible = 1; E.output_scroll = 0; E.output_sel = 0; editorRefreshScreen();
+                    }
+                }
+                return;
+            } else {
+                snprintf(E.msg, sizeof(E.msg), "Interactive setup cancelled"); E.msg_time = time(NULL);
+            }
+        }
+    }
+}
+
+static void handle_run_only(int allow_interactive) {
+    char path[256] = {0}; BuildSystem bs = detect_build_system(path, sizeof(path));
+    if (bs != BS_NONE) {
+        // list typical run targets
+        char *cmd = NULL;
+        if (bs == BS_MAKE) {
+            int tn=0; char **t = get_make_targets(&tn);
+            // try to find 'run' target
+            int found = -1; for (int i=0;i<tn;i++) if (strcmp(t[i], "run")==0) { found = i; break; }
+            if (found >= 0) cmd = malloc(128), snprintf(cmd,128, "make %s", t[found]);
+            free_string_array(t, tn);
+        } else if (bs == BS_CARGO) {
+            cmd = strdup("cargo run");
+        } else if (bs == BS_CMAKE) {
+            cmd = strdup("ctest --output-on-failure");
+        }
+        if (!cmd) { char *in = prompt_input("Enter command to run: "); if (in) { cmd = in; } }
+        if (cmd) { char runcmd[768]; snprintf(runcmd, sizeof(runcmd), "__run_shell__:%s", cmd); execute_command(runcmd); free(cmd); return; }
+    } else {
+        // no build system found: check config
+        BuildConfig cfg = {0};
+        if (load_build_config(&cfg)) {
+            if (prompt_yesno("Saved build config found. Run it?")) {
+                if (cfg.run_cmd[0]) { char rc[1024]; snprintf(rc, sizeof(rc), "__run_shell__:%s", cfg.run_cmd); execute_command(rc); }
+                else if (cfg.build_cmd[0]) { char bc[1024]; snprintf(bc, sizeof(bc), "__run_shell__:%s", cfg.build_cmd); execute_command(bc); }
+            }
+            // In all cases when a saved config is present, we won't fall through to interactive setup for run-only
+            return;
+        }
+        // No saved config: only prompt to do interactive setup if allowed (B/BR flows). For run-only (allow_interactive==0) just return.
+        if (allow_interactive && prompt_yesno("No build system found. Run interactive setup?")) {
+            BuildConfig nc = {0};
+            if (interactive_setup(&nc)) {
+                if (nc.run_cmd[0]) { char rc[1024]; snprintf(rc, sizeof(rc), "__run_shell__:%s", nc.run_cmd); execute_command(rc); }
+                else if (nc.build_cmd[0]) { char bc[1024]; snprintf(bc, sizeof(bc), "__run_shell__:%s", nc.build_cmd); execute_command(bc); }
+                return;
+            } else {
+                snprintf(E.msg, sizeof(E.msg), "Interactive setup cancelled"); E.msg_time = time(NULL);
+            }
+        }
+        // If we didn't run saved config and interactive setup isn't allowed (typical for R), try to run executable based on current file
+        if (!allow_interactive) {
+            // Try to run (or auto-build then run) executable based on current file
+            if (E.filename && E.filename[0]) {
+                char exe[256];
+                const char *base = strrchr(E.filename, '/');
+                base = base ? base + 1 : E.filename;
+                char *dot = strrchr(base, '.');
+                if (dot) {
+                    int len = dot - base;
+                    if (len > 0 && len < (int)sizeof(exe) - 3) {
+                        memcpy(exe, base, len);
+                        exe[len] = '\0';
+                        char full[512];
+                        snprintf(full, sizeof(full), "./%s", exe);
+
+                        struct stat ssrc, sexe; int has_src = (stat(E.filename, &ssrc) == 0);
+                        int has_exe = (stat(full, &sexe) == 0);
+
+                        // Helper to attempt simple single-file build based on extension
+                        char buildcmd[1024] = {0};
+                        const char *ext = dot;
+                        if (ext) {
+                            if (strcmp(ext, ".c") == 0) snprintf(buildcmd, sizeof(buildcmd), "gcc -o %s %s", exe, E.filename);
+                            else if (strcmp(ext, ".cpp") == 0 || strcmp(ext, ".cc") == 0) snprintf(buildcmd, sizeof(buildcmd), "g++ -o %s %s", exe, E.filename);
+                            else if (strcmp(ext, ".rs") == 0) snprintf(buildcmd, sizeof(buildcmd), "rustc -o %s %s", exe, E.filename);
+                            else if (strcmp(ext, ".go") == 0) snprintf(buildcmd, sizeof(buildcmd), "go build -o %s %s", exe, E.filename);
+                            else if (strcmp(ext, ".py") == 0) buildcmd[0] = '\0';
+                            else if (strcmp(ext, ".java") == 0) snprintf(buildcmd, sizeof(buildcmd), "javac %s && java %s", E.filename, exe);
+                        }
+
+                        // If executable exists and is newer than source, just run it
+                        if (has_exe && has_src && difftime(sexe.st_mtime, ssrc.st_mtime) >= 0) {
+                            char runcmd[768]; snprintf(runcmd, sizeof(runcmd), "__run_shell__:%s", full);
+                            execute_command(runcmd); return;
+                        }
+
+                        // If executable missing but we have a sensible build command, try to build
+                        if ((!has_exe || (has_src && has_exe && difftime(sexe.st_mtime, ssrc.st_mtime) < 0)) && buildcmd[0]) {
+                            char bcmd[1024]; snprintf(bcmd, sizeof(bcmd), "__run_shell__:%s", buildcmd);
+                            int st = execute_command(bcmd);
+                            if (st == 0) {
+                                // build succeeded; run
+                                char runcmd[768]; snprintf(runcmd, sizeof(runcmd), "__run_shell__:%s", full);
+                                execute_command(runcmd); return;
+                            } else {
+                                // build failed; do not run old binary
+                                snprintf(E.msg, sizeof(E.msg), "Build failed; run cancelled"); E.msg_time = time(NULL);
+                                return;
+                            }
+                        }
+
+                        // If no buildcmd available but executable exists, run it (best effort)
+                        if (has_exe) { char runcmd[768]; snprintf(runcmd, sizeof(runcmd), "__run_shell__:%s", full); execute_command(runcmd); return; }
+                    }
+                }
+            }
+            snprintf(E.msg, sizeof(E.msg), "No build config found; run cancelled"); E.msg_time = time(NULL);
+        }
+    }
 }
 
 static void show_file_browser(void) {
@@ -3712,10 +4972,65 @@ static void editorRefreshScreen(void) {
         return;
     }
 
+    // If output pane is visible, render it full-page and return
+    if (E.output_visible) {
+        // Ensure we're showing the latest on-disk log when rendering output pane
+        output_load_last_log();
+        // clear and draw full page
+        write(STDOUT_FILENO, "\x1b[2J", 4);
+        write(STDOUT_FILENO, "\x1b[H", 3);
+        // header
+        char hdr[256]; int hn = snprintf(hdr, sizeof(hdr), "Output (%d lines)", E.output_n);
+        char buf[512]; int pn = snprintf(buf, sizeof(buf), "\x1b[1;37m%s\x1b[0m", hdr);
+        if (pn>0) write(STDOUT_FILENO, buf, (size_t)pn);
+        // list available rows
+        int pageSize = E.screenrows - 4; if (pageSize < 1) pageSize = 1;
+        int start = E.output_scroll; if (start < 0) start = 0; if (start > E.output_n - 1) start = (E.output_n > 0) ? E.output_n - 1 : 0;
+        int end = start + pageSize; if (end > E.output_n) end = E.output_n;
+        for (int i = start; i < end; i++) {
+            int ln = 2 + (i - start);
+            char idxbuf[64]; int in = snprintf(idxbuf, sizeof(idxbuf), "\x1b[%d;1H", ln);
+            if (in>0) write(STDOUT_FILENO, idxbuf, (size_t)in);
+            if (i == E.output_sel) write(STDOUT_FILENO, "\x1b[7m", 4);
+            // print line (truncate to screen width)
+            const char *l = E.output_lines[i]; if (!l) l = "";
+            int w = E.screencols; int len = (int)strlen(l); if (len > w) len = w;
+            write(STDOUT_FILENO, l, (size_t)len);
+            // clear rest
+            char clr[32]; int cn = snprintf(clr, sizeof(clr), "\x1b[%d;%dH\x1b[K", ln, len + 1);
+            if (cn>0) write(STDOUT_FILENO, clr, (size_t)cn);
+            if (i == E.output_sel) write(STDOUT_FILENO, "\x1b[m", 3);
+        }
+        // footer with instructions
+        int fn = snprintf(buf, sizeof(buf), "\x1b[%d;1H\x1b[1;91m(q/ESC)\x1b[0m \x1b[1;96mclose\x1b[0m | \x1b[1;92mEnter\x1b[0m \x1b[1;96m: jump to file/line\x1b[0m | \x1b[1;94mTab\x1b[0m \x1b[1;96m: cycle errors\x1b[0m | \x1b[1;93mPgUp/PgDn\x1b[0m \x1b[1;96m: scroll\x1b[m", E.screenrows);
+        if (fn>0) write(STDOUT_FILENO, buf, (size_t)fn);
+        return;
+    }
+
     // Render suggestions overlay (if any) on top of the editor
     if (SuggestionsVisible) {
         render_suggestions_overlay();
         return; // overlay drawn, skip further drawing to avoid artifacts
+    }
+
+    // If prompt overlay visible, draw it full-page
+    if (E.prompt_visible) {
+        write(STDOUT_FILENO, "\x1b[2J", 4); // clear screen
+        write(STDOUT_FILENO, "\x1b[H", 3);  // move to top-left
+        // draw message
+        int msg_vis = visible_len(E.prompt_message);
+        int msg_row = E.screenrows / 2 - 2;
+        char buf[512]; int pn = snprintf(buf, sizeof(buf), "\x1b[%d;%dH\x1b[37m%s\x1b[0m", msg_row, (E.screencols - msg_vis) / 2, E.prompt_message);
+        if (pn > 0) write(STDOUT_FILENO, buf, (size_t)pn);
+        // draw options
+        int opt_vis = visible_len(E.prompt_options);
+        int opt_row = msg_row + 2;
+        pn = snprintf(buf, sizeof(buf), "\x1b[%d;%dH\x1b[37m%s\x1b[0m", opt_row, (E.screencols - opt_vis) / 2, E.prompt_options);
+        if (pn > 0) write(STDOUT_FILENO, buf, (size_t)pn);
+        // position cursor out of way
+        pn = snprintf(buf, sizeof(buf), "\x1b[%d;%dH", E.screenrows, E.screencols);
+        if (pn > 0) write(STDOUT_FILENO, buf, (size_t)pn);
+        return;
     }
 
     // (welcome page handled earlier as full-page; skip drawing here)
@@ -3740,6 +5055,37 @@ static void editorRefreshScreen(void) {
 }
 
 static void editorProcessKeypress(void) {
+    // If prompt visible, handle it
+    if (E.prompt_visible) {
+        int c = readKey();
+        if (c == 'o' || c == 'O') {
+            // open in current tab
+            open_file_and_seek(E.pending_path, E.pending_lineno);
+            E.prompt_visible = 0;
+        } else if (c == 't' || c == 'T') {
+            // open in new tab
+            // find available tab index
+            int new_idx = -1;
+            for (int i = 0; i < NumTabs; i++) {
+                if (!Tabs[i].name || !*Tabs[i].name) { new_idx = i; break; }
+            }
+            if (new_idx == -1 && NumTabs < MAX_TABS) { new_idx = NumTabs++; }
+            if (new_idx != -1) {
+                // save current to home if needed
+                if (CurTab == -1) save_current_to_home();
+                // switch to new tab
+                CurTab = new_idx;
+                // open file
+                open_file_and_seek(E.pending_path, E.pending_lineno);
+            }
+            E.prompt_visible = 0;
+        } else if (c == 'c' || c == 'C' || c == 27) { // ESC or c
+            E.prompt_visible = 0;
+        }
+        editorRefreshScreen();
+        return;
+    }
+
     // If terminal resized (SIGWINCH), refresh size and redraw immediately
     if (winch_received) { getWindowSize(); editorRefreshScreen(); winch_received = 0; return; }
 
@@ -3820,6 +5166,8 @@ static void editorProcessKeypress(void) {
 
     // Handle lone Escape: toggle help or mode. We already parse escape sequences
     // in readKey(), so c==27 here is a lone ESC key.
+    // Special case: if output pane is visible, ESC closes it
+    if (E.output_visible && c == 27) { E.output_visible = 0; return; }
     if (c == 27) {
         if (SuggestionsVisible) { clear_active_suggestions(); return; }
         if (E.help_visible) {
@@ -3844,11 +5192,86 @@ static void editorProcessKeypress(void) {
 
     // If suggestions visible and in view mode, let ARROW/Enter/Tab/Esc control them
     if (SuggestionsVisible && E.mode == MODE_VIEW) {
-        if (c == ARROW_DOWN) { ActiveMatchSel = (ActiveMatchSel + 1) % ActiveMatchesN; return; }
-        if (c == ARROW_UP) { ActiveMatchSel = (ActiveMatchSel - 1 + ActiveMatchesN) % ActiveMatchesN; return; }
+        /* compute current page size (full-page search uses more rows) */
+        int pageSize = (ActiveFilenameStart < 0) ? (E.screenrows - 4) : ((E.screenrows - 4 > 3) ? (E.screenrows - 4) : SuggestionPageSize);
+        if (pageSize < 3) pageSize = 3;
+        if (c == ARROW_DOWN) { ActiveMatchSel = (ActiveMatchSel + 1) % ActiveMatchesN; ActiveMatchesPage = ActiveMatchSel / pageSize; return; }
+        if (c == ARROW_UP) { ActiveMatchSel = (ActiveMatchSel - 1 + ActiveMatchesN) % ActiveMatchesN; ActiveMatchesPage = ActiveMatchSel / pageSize; return; }
+        if (c == PAGE_DOWN) { int pages = (ActiveMatchesN + pageSize - 1) / pageSize; ActiveMatchesPage = (ActiveMatchesPage + 1 < pages) ? ActiveMatchesPage + 1 : pages - 1; ActiveMatchSel = ActiveMatchesPage * pageSize; return; }
+        if (c == PAGE_UP) { ActiveMatchesPage = (ActiveMatchesPage > 0) ? ActiveMatchesPage - 1 : 0; ActiveMatchSel = ActiveMatchesPage * pageSize; return; }
         if (c == '\r' || c == '\n' || c == '\t') { accept_active_suggestion(); return; }
         if (c == 27) { clear_active_suggestions(); return; }
     }
+
+    // If output pane is visible, handle its keys
+    if (E.output_visible) {
+        int pageSize = E.screenrows - 4; if (pageSize < 1) pageSize = 1;
+        if (c == 'q' || c == 27) { E.output_visible = 0; return; }
+        if (c == ARROW_DOWN) { if (E.output_sel + 1 < E.output_n) { E.output_sel++; if (E.output_sel >= E.output_scroll + pageSize) E.output_scroll++; } return; }
+        if (c == ARROW_UP) { if (E.output_sel > 0) { E.output_sel--; if (E.output_sel < E.output_scroll) E.output_scroll--; } return; }
+        if (c == PAGE_DOWN) { E.output_scroll += pageSize; if (E.output_scroll > (E.output_n - pageSize)) E.output_scroll = (E.output_n > pageSize) ? (E.output_n - pageSize) : 0; if (E.output_sel < E.output_scroll) E.output_sel = E.output_scroll; return; }
+        if (c == PAGE_UP) { E.output_scroll -= pageSize; if (E.output_scroll < 0) E.output_scroll = 0; if (E.output_sel > E.output_scroll + pageSize - 1) E.output_sel = E.output_scroll + pageSize - 1; return; }
+        if (c == '\t') { // Tab: cycle to next error
+            int start = E.output_sel + 1;
+            if (start >= E.output_n) start = 0; // wrap around
+            int found = 0;
+            for (int i = 0; i < E.output_n; i++) {
+                int idx = (start + i) % E.output_n;
+                char path[512]; int lineno = 0, colno = 0;
+                if (parse_error_location(E.output_raw_lines[idx], path, sizeof(path), &lineno, &colno)) {
+                    E.output_sel = idx;
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found) {
+                // No errors found, select first line
+                if (E.output_n > 0) E.output_sel = 0;
+            }
+            if (E.output_sel < E.output_scroll) E.output_scroll = E.output_sel;
+            else if (E.output_sel >= E.output_scroll + pageSize) E.output_scroll = E.output_sel - pageSize + 1;
+            return;
+        }
+        if (c == '\r' || c == '\n') {
+            if (E.output_sel < 0 || E.output_sel >= E.output_n) { snprintf(E.msg, sizeof(E.msg), "No line selected"); E.msg_time = time(NULL); return; }
+            char *line = E.output_raw_lines[E.output_sel]; char path[512]; int lineno = 0; int colno = 0;
+            if (parse_error_location(line, path, sizeof(path), &lineno, &colno)) {
+                // Map temp build file back to original filename
+                if (E.filename && strncmp(path, "/tmp/editor_build_temp_", 23) == 0) {
+                    strncpy(path, E.filename, sizeof(path)-1);
+                    path[sizeof(path)-1] = '\0';
+                }
+                // If the file is the currently open buffer, just seek there
+                if (E.filename && E.filename[0] && strcmp(E.filename, path) == 0) {
+                    editorSeekLine(lineno); E.output_visible = 0; return;
+                }
+                // If the file is already open in another tab, switch to that tab
+                int found_tab = -1;
+                for (int t = 0; t < NumTabs; t++) {
+                    if (!Tabs[t].name) continue;
+                    if (strcmp(Tabs[t].name, path) == 0) { found_tab = t; break; }
+                    char *bn = strrchr(Tabs[t].name, '/'); const char *bname = bn ? bn + 1 : Tabs[t].name;
+                    if (strcmp(bname, path) == 0) { found_tab = t; break; }
+                }
+                if (found_tab >= 0) {
+                    switch_to_tab(found_tab);
+                    if (lineno > 0) editorSeekLine(lineno);
+                    E.output_visible = 0; return;
+                }
+                // Not open: open in a new tab and seek
+                open_file_in_new_tab(path);
+                if (lineno > 0) editorSeekLine(lineno);
+                E.output_visible = 0; return;
+            } else {
+                snprintf(E.msg, sizeof(E.msg), "No file:line found on this line"); E.msg_time = time(NULL); return;
+            }
+        }
+        // any other keys ignored while output pane is open
+        return;
+    }
+
+    /* Build/Run hotkeys removed: Build/Run now only execute when you type the command
+       into the command buffer and press Enter (e.g., type "B" or "BR" then Enter). */
 
     // Navigation keys - work in both modes
     if (c == ARROW_UP) {
@@ -3882,6 +5305,7 @@ static void editorProcessKeypress(void) {
         editorScroll();
         return;
     }
+    // continue handling navigation keys
     if (c == ARROW_RIGHT) {
         int rowlen = (E.cy < E.numrows) ? (int)strlen(E.rows[E.cy]) : 0;
         if (E.cx < rowlen) {
@@ -4257,3 +5681,4 @@ int main(int argc, char **argv) {
     editorFreeRows();
     return 0;
 }
+

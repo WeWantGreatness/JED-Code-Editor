@@ -1,0 +1,5 @@
+{
+  "files": ["test_build.c"],
+  "flags": "-std=c99 -Wall -O2",
+  "output": "test_build"
+}

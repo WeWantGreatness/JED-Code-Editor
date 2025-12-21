@@ -126,3 +126,15 @@ Tab commands
 - `tabcN` or `tabc N` closes tab N (1-based). The space between `tabc` and the number is optional.
 - `tabc all` closes all tabs, prompting to save unsaved changes for each tab with options to save, discard, or cancel.
 
+Code Improvement Plans
+----------------------
+1. **Color Coding Consistency**: Update all color coding across the codebase for consistency. This includes word coloring, background coloring, and ensuring uniform styling throughout the editor (e.g., help overlays, status messages, syntax highlighting). The goal is to create a cohesive visual theme that enhances readability and user experience.
+
+2. **Modularization**: Break out pieces of code into separate files to reduce clutter in the main file. Focus on extracting variables, utility functions, and related logic into dedicated modules. This will improve maintainability and make the codebase easier to navigate and extend.
+
+3. **Code Cleanup**: Perform a thorough cleanup of the codebase, including:
+   - Identifying and removing unnecessary or unused code.
+   - Eliminating duplicates and redundant functions.
+   - Optimizing performance where possible.
+   - Ensuring consistent coding style and documentation.
+
