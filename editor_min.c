@@ -4484,6 +4484,11 @@ static void show_file_browser(void) {
     char cwd[512]; getcwd(cwd, sizeof(cwd));
     // ensure other overlays (help) are hidden while browser is active
     E.help_visible = 0;
+    /* snapshot and clear the "opened from welcome" flag so stale state doesn't affect
+     * subsequent invocations. Use the local snapshot at the end to decide whether to
+     * return to the welcome page if the browser was cancelled without opening a file. */
+    int was_browser_from_welcome = E.browser_from_welcome;
+    E.browser_from_welcome = 0;
     int file_opened = 0;
 
     /* directory history stack: dir_history[0] is the initial directory, top is dir_history[dh_count-1]
@@ -4890,9 +4895,9 @@ static void show_file_browser(void) {
         for (int i = 0; i < dh_count; i++) { free(dir_history[i]); }
         free(dir_history); dir_history = NULL; dh_count = 0;
     }
-    if (E.browser_from_welcome && !file_opened) {
+    if (was_browser_from_welcome && !file_opened) {
         E.welcome_visible = 1;
-        E.browser_from_welcome = 0;
+        /* E.browser_from_welcome was cleared at entry; no need to reset here. */
     }
     // redraw editor
     editorRefreshScreen();
