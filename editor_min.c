@@ -2802,9 +2802,11 @@ static void draw_welcome_overlay(void) {
     write(STDOUT_FILENO, buf, strlen(buf));
     if (E.command_len > 0) write(STDOUT_FILENO, E.command_buf, E.command_len);
     write(STDOUT_FILENO, "\x1b[0m", 4); // reset
-    // Position cursor
+    // Position cursor and show it (welcome command prompt expects typed input)
     snprintf(buf, sizeof(buf), "\x1b[%d;%dH", cmd_row, 2 + E.command_len);
     write(STDOUT_FILENO, buf, strlen(buf));
+    write(STDOUT_FILENO, "\x1b[?25h", 6); // show cursor
+
 }
 
 // Open the help text as its own tab (so it appears as a full page). Closes when user uses 'tabc' on the help tab.
@@ -3369,20 +3371,30 @@ static void render_suggestions_overlay(void) {
     int foot_col = full_page ? 1 : (sx + 2);
     char foot[128]; int fp = snprintf(foot, sizeof(foot), "\x1b[%d;%dHPage %d/%d (%d results)", foot_ln, foot_col, ActiveMatchesPage + 1, pages ? pages : 1, n);
     if (fp > 0) write(STDOUT_FILENO, foot, (size_t)fp);
-    // position cursor and show it
-    write(STDOUT_FILENO, "\x1b[?25h", 6); // show cursor
-    if (E.mode == MODE_VIEW && ActiveFilenameStart < 0) {
-        // position cursor at end of visible title (account for ANSI codes)
+    /* Cursor behavior for suggestions:
+     * - For full-page search results on the welcome page (interactive selection), show and place the cursor on the overlay title.
+     * - For command/filename completion suggestions (non-full overlay), DO NOT move the cursor to the overlay; keep it on the command prompt
+     *   so the user's typing focus isn't lost. We hide the terminal cursor for the overlay in that case to avoid a visible jump.
+     */
+    if (full_page && E.mode == MODE_VIEW && ActiveFilenameStart < 0) {
+        /* show cursor when overlay is a full-page interactive search */
+        write(STDOUT_FILENO, "\x1b[?25h", 6); // show cursor
         int cursor_col = col + visible_len(title);
         if (cursor_col < 1) cursor_col = 1;
         if (cursor_col > E.screencols) cursor_col = E.screencols;
         char cur[64]; int m = snprintf(cur, sizeof(cur), "\x1b[%d;%dH", ln, cursor_col);
         if (m > 0) write(STDOUT_FILENO, cur, (size_t)m);
     } else {
-        // position cursor out of way
-        int out_ln = full_page ? E.screenrows : (sy + boxh);
-        int out_col = full_page ? E.screencols : (sx + 1);
-        char cur[64]; int m = snprintf(cur, sizeof(cur), "\x1b[%d;%dH", out_ln, out_col);
+        /* For command/filename completion overlays we must NOT hide the cursor or
+         * move it away — keep it visible at the command prompt so the user always
+         * sees where they're typing. */
+        // Keep the cursor visible and positioned on the command prompt to avoid a
+        // visual jump and to preserve typing focus when suggestions are shown.
+        write(STDOUT_FILENO, "\x1b[?25h", 6); // ensure cursor visible
+        int cmd_row = E.screenrows;
+        int cmd_col = 2 + E.command_len;
+        if (cmd_col < 1) cmd_col = 1; if (cmd_col > E.screencols) cmd_col = E.screencols;
+        char cur[64]; int m = snprintf(cur, sizeof(cur), "\x1b[%d;%dH", cmd_row, cmd_col);
         if (m > 0) write(STDOUT_FILENO, cur, (size_t)m);
     }
 }
@@ -4664,6 +4676,8 @@ static void show_file_browser(void) {
         if (curcol > sx + boxw - 2) curcol = sx + boxw - 2;
         int m = snprintf(cur, sizeof(cur), "\x1b[%d;%dH", crow, curcol);
         if (m>0) write(STDOUT_FILENO, cur, (size_t)m);
+        /* Make sure the cursor is visible in the browser input area */
+        write(STDOUT_FILENO, "\x1b[?25h", 6);
 
         // read keys
         int k = readKey(); if (k == -1) { continue; }
@@ -4895,6 +4909,9 @@ static void show_file_browser(void) {
         for (int i = 0; i < dh_count; i++) { free(dir_history[i]); }
         free(dir_history); dir_history = NULL; dh_count = 0;
     }
+    // If the browser was opened from the welcome page and the user cancelled
+    // without opening anything, restore the welcome page. Otherwise remain
+    // in the editor (do not switch to welcome on cancel).
     if (was_browser_from_welcome && !file_opened) {
         E.welcome_visible = 1;
         /* E.browser_from_welcome was cleared at entry; no need to reset here. */
@@ -5281,9 +5298,10 @@ static void editorRefreshScreen(void) {
         int opt_row = E.screenrows - 1; if (opt_row < 1) opt_row = 1;
         pn = snprintf(buf, sizeof(buf), "\x1b[%d;%dH\x1b[37m%s\x1b[0m", opt_row, (E.screencols - opt_vis) / 2, E.prompt_options);
         if (pn > 0) write(STDOUT_FILENO, buf, (size_t)pn);
-        // position cursor out of way (bottom-right)
+        // position cursor out of way (bottom-right) and hide it (prompt uses single-key responses)
         pn = snprintf(buf, sizeof(buf), "\x1b[%d;%dH", E.screenrows, E.screencols);
         if (pn > 0) write(STDOUT_FILENO, buf, (size_t)pn);
+        write(STDOUT_FILENO, "\x1b[?25l", 6); // hide cursor
         return;
     }
 
