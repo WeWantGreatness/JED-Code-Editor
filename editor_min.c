@@ -68,7 +68,7 @@ struct Editor {
     int welcome_visible; // welcome/title screen visible flag
 
     int prompt_visible; // prompt overlay visible flag
-    char prompt_message[256];
+    char prompt_message[1024];
     char prompt_options[256];
     char pending_path[512];
     int pending_lineno;
@@ -104,7 +104,7 @@ struct Editor {
 
 
     // transient message
-    char msg[128];
+    char msg[1024];
     time_t msg_time;
 
     // build/run flow helpers
@@ -176,6 +176,41 @@ static int push_current_to_tab_list(void) {
     struct Tab t = make_tab_from_editor();
     return append_tab(t);
 }
+
+// Insert a tab at position `pos` shifting existing tabs to the right.
+// Returns the inserted index or -1 on failure.
+static int insert_tab_at(int pos, struct Tab t) {
+    if (pos < 0) pos = 0;
+    if (pos > NumTabs) pos = NumTabs;
+    struct Tab *newtabs = realloc(Tabs, sizeof(struct Tab) * (NumTabs + 1));
+    if (!newtabs) { free_tab(&t); return -1; }
+    Tabs = newtabs;
+    // shift right
+    for (int i = NumTabs; i > pos; i--) Tabs[i] = Tabs[i-1];
+    Tabs[pos] = t;
+    NumTabs++;
+    if (CurTab >= pos) CurTab++; // adjust current tab index if it shifted
+    return pos;
+}
+
+// Push the "home" snapshot (the current home buffer) to the front of the tabs list.
+// If we are currently on a stored tab, copy HomeTab; otherwise snapshot current editor.
+static int push_home_to_front(void) {
+    struct Tab t = {0};
+    if (CurTab == -1) {
+        t = make_tab_from_editor();
+    } else {
+        if (HaveHomeTab) {
+            t.name = HomeTab.name ? strdup(HomeTab.name) : strdup("");
+            t.snapshot = HomeTab.snapshot ? strdup(HomeTab.snapshot) : NULL;
+            t.saved_snapshot = HomeTab.saved_snapshot ? strdup(HomeTab.saved_snapshot) : NULL;
+            t.cx = HomeTab.cx; t.cy = HomeTab.cy; t.row_offset = HomeTab.row_offset; t.col_offset = HomeTab.col_offset;
+        } else {
+            t = make_tab_from_editor();
+        }
+    }
+    return insert_tab_at(0, t);
+} 
 
 // Load tab at index into the editor (saving current into its slot first)
 static int switch_to_tab(int idx) {
@@ -310,7 +345,6 @@ static void open_file_in_new_tab(const char *fname);
 static void open_help_tab(void);
 static void disableRawMode(void);
 static void enableRawMode(void);
-static int run_cmd_and_wait(const char *cmd);
 static int switch_to_home(void);
 
 // Forward declarations for functions referenced by tab code
@@ -1312,18 +1346,9 @@ static void save_to_file(const char *fname) {
 }
 
 static int execute_command(const char *cmd) {
-    // allow interactive run: run_interactive <shell cmd> runs without capturing output, allowing user interaction
-    if (strncmp(cmd, "run_interactive ", 15) == 0) {
-        char *shell_cmd = cmd + 15;
-        disableRawMode();
-        int st = system(shell_cmd);
-        enableRawMode();
-        editorRefreshScreen();
-        int exitcode = WEXITSTATUS(st);
-        snprintf(E.msg, sizeof(E.msg), "Interactive command finished (exit %d)", exitcode); E.msg_time = time(NULL);
-        return exitcode;
-    }
     int i = 0; int L = strlen(cmd);
+    // Defensive: if NumTabs > 0 but Tabs pointer is NULL, reset NumTabs to avoid dereferencing a null pointer in later loops
+    if (NumTabs > 0 && !Tabs) NumTabs = 0;
     // allow quick build/run shim: "__run_shell__:<shell cmd>" will exec the shell cmd
     if (strncmp(cmd, "__run_shell__:", 14) == 0) {
         char shell_cmd[2048];
@@ -1672,8 +1697,9 @@ static int execute_command(const char *cmd) {
             char fname[512]; int sl = (tlen < (int)sizeof(fname)-1) ? tlen : (int)sizeof(fname)-1; memcpy(fname, &cmd[start], sl); fname[sl] = '\0';
             // debug: show parsed filename and existence
             snprintf(E.msg, sizeof(E.msg), "open -> '%s' (exists=%d)", fname, access(fname, F_OK) == 0); E.msg_time = time(NULL);
-            // push current file to new tab
-            push_current_to_tab_list();
+            // push current HOME snapshot to front, switch to home, and open requested file into home
+            push_home_to_front();
+            switch_to_home();
             // then open requested file into current editor
             if (access(fname, F_OK) == 0) {
                 // file exists: prompt open / create duplicate / cancel
@@ -1879,9 +1905,11 @@ static int execute_command(const char *cmd) {
             // home tab
             const char *hname = (CurTab == -1) ? (E.filename ? E.filename : "(No Name)") : (HaveHomeTab && HomeTab.name ? HomeTab.name : "(No Name)");
             int n = snprintf(buf + p, sizeof(buf) - p, "1:%s ", hname); if (n > 0) p += n;
-            for (int t = 0; t < NumTabs; t++) {
-                int n2 = snprintf(buf + p, sizeof(buf) - p, "%d:%s ", t+2, Tabs[t].name ? Tabs[t].name : "");
-                if (n2 <= 0) break; p += n2; if (p >= (int)sizeof(buf)-20) break;
+            if (Tabs) {
+                for (int t = 0; t < NumTabs; t++) {
+                    int n2 = snprintf(buf + p, sizeof(buf) - p, "%d:%s ", t+2, Tabs[t].name ? Tabs[t].name : "");
+                    if (n2 <= 0) break; p += n2; if (p >= (int)sizeof(buf)-20) break;
+                }
             }
             if (p == 0) { snprintf(E.msg, sizeof(E.msg), "No tabs"); }
             else { snprintf(E.msg, sizeof(E.msg), "%s", buf); }
@@ -1945,9 +1973,11 @@ static int execute_command(const char *cmd) {
                     }
                     free(cur);
                     if (needs_save) {
-                        char __tmpbuf[128]; int __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
+                        char __tmpbuf[512]; int __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
                         if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
                         const char *tabname = E.filename ? E.filename : "(No Name)";
+                        // truncate tabname if too long to fit in buffer
+                        char tabname_buf[256]; if (strlen(tabname) > sizeof(tabname_buf)-3) { memcpy(tabname_buf, tabname, sizeof(tabname_buf)-4); tabname_buf[sizeof(tabname_buf)-4] = '.'; tabname_buf[sizeof(tabname_buf)-3] = '.'; tabname_buf[sizeof(tabname_buf)-2] = '.'; tabname_buf[sizeof(tabname_buf)-1] = '\0'; tabname = tabname_buf; }
                         int pn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[1;97mTab\x1b[0m \x1b[96m'%s'\x1b[0m \x1b[1;97mhas unsaved changes\x1b[0m. \x1b[92m(s) Save\x1b[0m / \x1b[94m(d) Discard\x1b[0m / \x1b[93m(c) Cancel\x1b[0m: ", tabname);
                         if (pn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)pn);
                         int resp = 0;
@@ -1971,9 +2001,11 @@ static int execute_command(const char *cmd) {
                             if (strcmp(HomeTab.snapshot ? HomeTab.snapshot : "", HomeTab.saved_snapshot ? HomeTab.saved_snapshot : "") == 0) needs_save = 0;
                         }
                         if (needs_save) {
-                            char __tmpbuf[128]; int __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
+                            char __tmpbuf[512]; int __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
                             if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
                             const char *tabname = HomeTab.name && HomeTab.name[0] ? HomeTab.name : "(No Name)";
+                            // truncate tabname if too long to fit in buffer
+                            char tabname_buf[256]; if (strlen(tabname) > sizeof(tabname_buf)-3) { memcpy(tabname_buf, tabname, sizeof(tabname_buf)-4); tabname_buf[sizeof(tabname_buf)-4] = '.'; tabname_buf[sizeof(tabname_buf)-3] = '.'; tabname_buf[sizeof(tabname_buf)-2] = '.'; tabname_buf[sizeof(tabname_buf)-1] = '\0'; tabname = tabname_buf; }
                             int pn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[1;97mTab\x1b[0m \x1b[96m'%s'\x1b[0m \x1b[1;97mhas unsaved changes\x1b[0m. \x1b[92m(s) Save\x1b[0m / \x1b[94m(d) Discard\x1b[0m / \x1b[93m(c) Cancel\x1b[0m: ", tabname);
                             if (pn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)pn);
                             int resp = 0;
@@ -2004,9 +2036,11 @@ static int execute_command(const char *cmd) {
                         if (strcmp(Tabs[t].snapshot ? Tabs[t].snapshot : "", Tabs[t].saved_snapshot ? Tabs[t].saved_snapshot : "") == 0) needs_save = 0;
                     }
                     if (needs_save) {
-                        char __tmpbuf[128]; int __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
+                        char __tmpbuf[512]; int __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
                         if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
                         const char *tabname = Tabs[t].name && Tabs[t].name[0] ? Tabs[t].name : "(No Name)";
+                        // truncate tabname if too long to fit in buffer
+                        char tabname_buf[256]; if (strlen(tabname) > sizeof(tabname_buf)-3) { memcpy(tabname_buf, tabname, sizeof(tabname_buf)-4); tabname_buf[sizeof(tabname_buf)-4] = '.'; tabname_buf[sizeof(tabname_buf)-3] = '.'; tabname_buf[sizeof(tabname_buf)-2] = '.'; tabname_buf[sizeof(tabname_buf)-1] = '\0'; tabname = tabname_buf; }
                         int pn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[1;97mTab\x1b[0m \x1b[96m'%s'\x1b[0m \x1b[1;97mhas unsaved changes\x1b[0m. \x1b[92m(s) Save\x1b[0m / \x1b[94m(d) Discard\x1b[0m / \x1b[93m(c) Cancel\x1b[0m: ", tabname);
                         if (pn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)pn);
                         int resp = 0;
@@ -2035,8 +2069,11 @@ static int execute_command(const char *cmd) {
                     continue;
                 }
                 // Now close all tabs: free all stored tabs, clear home, switch to empty buffer
-                for (int t = 0; t < NumTabs; t++) free_tab(&Tabs[t]);
-                free(Tabs); Tabs = NULL; NumTabs = 0; CurTab = -1;
+                if (Tabs) {
+                    for (int t = 0; t < NumTabs; t++) free_tab(&Tabs[t]);
+                    free(Tabs); Tabs = NULL;
+                }
+                NumTabs = 0; CurTab = -1;
                 free_tab(&HomeTab); HaveHomeTab = 0;
                 free(E.filename); E.filename = NULL;
                 editorFreeRows(); editorAppendRow(""); save_snapshot(); free(E.saved_snapshot); E.saved_snapshot = serialize_buffer();
@@ -2243,9 +2280,11 @@ static int execute_command(const char *cmd) {
                 }
                 free(cur);
                 if (needs_save) {
-                    char __tmpbuf[128]; int __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
+                    char __tmpbuf[512]; int __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
                     if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
                     const char *tabname = E.filename ? E.filename : "(No Name)";
+                    // truncate tabname if too long to fit in buffer
+                    char tabname_buf[256]; if (strlen(tabname) > sizeof(tabname_buf)-3) { memcpy(tabname_buf, tabname, sizeof(tabname_buf)-4); tabname_buf[sizeof(tabname_buf)-4] = '.'; tabname_buf[sizeof(tabname_buf)-3] = '.'; tabname_buf[sizeof(tabname_buf)-2] = '.'; tabname_buf[sizeof(tabname_buf)-1] = '\0'; tabname = tabname_buf; }
                     int pn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[1;97mTab\x1b[0m \x1b[96m'%s'\x1b[0m \x1b[1;97mhas unsaved changes\x1b[0m. \x1b[92m(s) Save\x1b[0m / \x1b[94m(d) Discard\x1b[0m / \x1b[93m(c) Cancel\x1b[0m: ", tabname);
                     if (pn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)pn);
                     int resp = 0;
@@ -2269,9 +2308,11 @@ static int execute_command(const char *cmd) {
                         if (strcmp(HomeTab.snapshot ? HomeTab.snapshot : "", HomeTab.saved_snapshot ? HomeTab.saved_snapshot : "") == 0) needs_save = 0;
                     }
                     if (needs_save) {
-                        char __tmpbuf[128]; int __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
+                        char __tmpbuf[512]; int __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
                         if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
                         const char *tabname = HomeTab.name && HomeTab.name[0] ? HomeTab.name : "(No Name)";
+                        // truncate tabname if too long to fit in buffer
+                        char tabname_buf[256]; if (strlen(tabname) > sizeof(tabname_buf)-3) { memcpy(tabname_buf, tabname, sizeof(tabname_buf)-4); tabname_buf[sizeof(tabname_buf)-4] = '.'; tabname_buf[sizeof(tabname_buf)-3] = '.'; tabname_buf[sizeof(tabname_buf)-2] = '.'; tabname_buf[sizeof(tabname_buf)-1] = '\0'; tabname = tabname_buf; }
                         int pn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[1;97mTab\x1b[0m \x1b[96m'%s'\x1b[0m \x1b[1;97mhas unsaved changes\x1b[0m. \x1b[92m(s) Save\x1b[0m / \x1b[94m(d) Discard\x1b[0m / \x1b[93m(c) Cancel\x1b[0m: ", tabname);
                         if (pn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)pn);
                         int resp = 0;
@@ -2296,7 +2337,7 @@ static int execute_command(const char *cmd) {
                 }
             }
             // Now check each stored tab
-            for (int t = 0; t < NumTabs && !cancelled; t++) {
+            if (Tabs) for (int t = 0; t < NumTabs && !cancelled; t++) {
                 int needs_save = 1;
                 if (t == CurTab) {
                     char *cur = serialize_buffer();
@@ -2310,9 +2351,11 @@ static int execute_command(const char *cmd) {
                     }
                 }
                 if (needs_save) {
-                    char __tmpbuf[128]; int __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
+                    char __tmpbuf[512]; int __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
                     if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
                     const char *tabname = Tabs[t].name && Tabs[t].name[0] ? Tabs[t].name : "(No Name)";
+                    // truncate tabname if too long to fit in buffer
+                    char tabname_buf[256]; if (strlen(tabname) > sizeof(tabname_buf)-3) { memcpy(tabname_buf, tabname, sizeof(tabname_buf)-4); tabname_buf[sizeof(tabname_buf)-4] = '.'; tabname_buf[sizeof(tabname_buf)-3] = '.'; tabname_buf[sizeof(tabname_buf)-2] = '.'; tabname_buf[sizeof(tabname_buf)-1] = '\0'; tabname = tabname_buf; }
                     int pn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[1;97mTab\x1b[0m \x1b[96m'%s'\x1b[0m \x1b[1;97mhas unsaved changes\x1b[0m. \x1b[92m(s) Save\x1b[0m / \x1b[94m(d) Discard\x1b[0m / \x1b[93m(c) Cancel\x1b[0m: ", tabname);
                     if (pn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)pn);
                     int resp = 0;
@@ -2355,7 +2398,7 @@ static int execute_command(const char *cmd) {
                 unlink(swapbuf);
             }
             // remove swap for stored tabs
-            for (int t = 0; t < NumTabs; t++) {
+            if (Tabs) for (int t = 0; t < NumTabs; t++) {
                 if (Tabs[t].name) {
                     char *base = strrchr(Tabs[t].name, '/');
                     const char *b = base ? base + 1 : Tabs[t].name;
@@ -2399,18 +2442,20 @@ static int execute_command(const char *cmd) {
                 }
             }
             // Now save each stored tab if needed
-            for (int t = 0; t < NumTabs; t++) {
-                int needs_save = 1;
-                if (Tabs[t].saved_snapshot) {
-                    if (strcmp(Tabs[t].snapshot ? Tabs[t].snapshot : "", Tabs[t].saved_snapshot ? Tabs[t].saved_snapshot : "") == 0) needs_save = 0;
-                }
-                if (needs_save) {
-                    // save this tab: temporarily switch to it, save, switch back
-                    int orig_cur = CurTab;
-                    switch_to_tab(t);
-                    save_to_file(NULL);
-                    if (orig_cur >= 0 && orig_cur != t) switch_to_tab(orig_cur);
-                    else if (orig_cur == -1) switch_to_home();
+            if (Tabs) {
+                for (int t = 0; t < NumTabs; t++) {
+                    int needs_save = 1;
+                    if (Tabs[t].saved_snapshot) {
+                        if (strcmp(Tabs[t].snapshot ? Tabs[t].snapshot : "", Tabs[t].saved_snapshot ? Tabs[t].saved_snapshot : "") == 0) needs_save = 0;
+                    }
+                    if (needs_save) {
+                        // save this tab: temporarily switch to it, save, switch back
+                        int orig_cur = CurTab;
+                        switch_to_tab(t);
+                        save_to_file(NULL);
+                        if (orig_cur >= 0 && orig_cur != t) switch_to_tab(orig_cur);
+                        else if (orig_cur == -1) switch_to_home();
+                    }
                 }
             }
             // Now quit: remove swap files for all tabs
@@ -2424,7 +2469,7 @@ static int execute_command(const char *cmd) {
                 unlink(swapbuf);
             }
             // remove swap for stored tabs
-            for (int t = 0; t < NumTabs; t++) {
+            if (Tabs) for (int t = 0; t < NumTabs; t++) {
                 if (Tabs[t].name) {
                     char *base = strrchr(Tabs[t].name, '/');
                     const char *b = base ? base + 1 : Tabs[t].name;
@@ -2802,11 +2847,9 @@ static void draw_welcome_overlay(void) {
     write(STDOUT_FILENO, buf, strlen(buf));
     if (E.command_len > 0) write(STDOUT_FILENO, E.command_buf, E.command_len);
     write(STDOUT_FILENO, "\x1b[0m", 4); // reset
-    // Position cursor and show it (welcome command prompt expects typed input)
+    // Position cursor
     snprintf(buf, sizeof(buf), "\x1b[%d;%dH", cmd_row, 2 + E.command_len);
     write(STDOUT_FILENO, buf, strlen(buf));
-    write(STDOUT_FILENO, "\x1b[?25h", 6); // show cursor
-
 }
 
 // Open the help text as its own tab (so it appears as a full page). Closes when user uses 'tabc' on the help tab.
@@ -2893,35 +2936,71 @@ static int alphasort_entries(const void *a, const void *b) {
 // --- Filesystem fuzzy matching helpers -------------------------------------------------
 // Return array of directory entries (names with trailing '/' for directories).
 // Caller must free returned array and strings.
-static char **dir_entries(const char *dir, int *out_n, int executable_only) {
+static char **dir_entries(const char *dir, int *out_n) {
     char **entries = NULL; int nentries = 0;
     DIR *d = opendir(dir ? dir : ".");
     if (!d) { if (out_n) *out_n = 0; return NULL; }
     struct dirent *de;
     while ((de = readdir(d)) != NULL) {
         if (strcmp(de->d_name, ".") == 0) continue; // skip self
-        char fullpath[1024];
-        snprintf(fullpath, sizeof(fullpath), "%s/%s", dir ? dir : ".", de->d_name);
+        char *name = NULL;
         struct stat st;
-        if (stat(fullpath, &st) == 0) {
-            int is_dir = S_ISDIR(st.st_mode);
-            int is_reg = S_ISREG(st.st_mode);
-            int is_exec = access(fullpath, X_OK) == 0;
-            if ((is_dir && !executable_only) || (is_reg && (!executable_only || is_exec))) {
-                char *name = NULL;
-                if (is_dir) {
-                    int l = (int)strlen(de->d_name) + 2; name = malloc(l); if (!name) continue; snprintf(name, l, "%s/", de->d_name);
-                } else if (is_reg) {
-                    name = strdup(de->d_name);
-                }
-                if (name) {
-                    char **n = realloc(entries, sizeof(char*) * (nentries + 1)); if (!n) { free(name); continue; }
-                    entries = n; entries[nentries++] = name;
-                }
-            }
+        if (stat(de->d_name, &st) == 0 && S_ISDIR(st.st_mode)) {
+            int l = (int)strlen(de->d_name) + 2; name = malloc(l); if (!name) continue; snprintf(name, l, "%s/", de->d_name);
+        } else {
+            name = strdup(de->d_name);
         }
+        if (!name) continue;
+        char **n = realloc(entries, sizeof(char*) * (nentries + 1)); if (!n) { free(name); continue; }
+        entries = n; entries[nentries++] = name;
     }
     closedir(d);
+    if (nentries == 0) { if (out_n) *out_n = 0; return entries; }
+    qsort(entries, nentries, sizeof(char*), alphasort_entries);
+    if (out_n) *out_n = nentries; return entries;
+}
+
+// Recursively collect directory entries (relative paths with trailing '/' for directories)
+// Caller must free returned array and strings.
+static char **recursive_dir_entries(const char *dir, int *out_n) {
+    char **entries = NULL; int nentries = 0;
+    const char *base = dir ? dir : ".";
+    // recursive collector
+    void collect(const char *curpath) {
+        DIR *d = opendir(curpath);
+        if (!d) return;
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL) {
+            if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
+            int plen = (int)strlen(curpath);
+            int namelen = (int)strlen(de->d_name);
+            int total = plen + 1 + namelen + 2; // include '/' and possible trailing '/' and NUL
+            char *name = malloc(total);
+            if (!name) continue;
+            if (strcmp(curpath, ".") == 0) snprintf(name, total, "%s", de->d_name);
+            else snprintf(name, total, "%s/%s", curpath, de->d_name);
+            struct stat st;
+            if (stat(name, &st) == 0 && S_ISDIR(st.st_mode)) {
+                // append trailing '/'
+                int l = (int)strlen(name);
+                char *nname = realloc(name, l + 2);
+                if (!nname) { free(name); continue; }
+                name = nname; name[l] = '/'; name[l+1] = '\0';
+                char **n = realloc(entries, sizeof(char*) * (nentries + 1)); if (!n) { free(name); continue; }
+                entries = n; entries[nentries++] = name;
+                // recurse
+                char *subpath = NULL;
+                if (strcmp(curpath, ".") == 0) subpath = strdup(de->d_name);
+                else { subpath = malloc(plen + 1 + namelen + 1); if (subpath) snprintf(subpath, plen + 1 + namelen + 1, "%s/%s", curpath, de->d_name); }
+                if (subpath) { collect(subpath); free(subpath); }
+            } else {
+                char **n = realloc(entries, sizeof(char*) * (nentries + 1)); if (!n) { free(name); continue; }
+                entries = n; entries[nentries++] = name;
+            }
+        }
+        closedir(d);
+    }
+    collect(base);
     if (nentries == 0) { if (out_n) *out_n = 0; return entries; }
     qsort(entries, nentries, sizeof(char*), alphasort_entries);
     if (out_n) *out_n = nentries; return entries;
@@ -2972,69 +3051,19 @@ static int match_cmp(const void *a, const void *b) {
     return strcasecmp(A->name, B->name);
 }
 
-static char **recursive_dir_entries(const char *dir, int max_depth, int *out_n, int executable_only) {
-    char **entries = NULL; int nentries = 0;
-    void add_entries(const char *d, const char *prefix, int depth, int executable_only) {
-        DIR *dd = opendir(d ? d : ".");
-        if (!dd) return;
-        struct dirent *de;
-        while ((de = readdir(dd)) != NULL) {
-            if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
-            char fullpath[1024];
-            if (d && strcmp(d, "/") != 0) {
-                snprintf(fullpath, sizeof(fullpath), "%s/%s", d, de->d_name);
-            } else {
-                snprintf(fullpath, sizeof(fullpath), "%s%s", d ? d : ".", de->d_name);
-            }
-            struct stat st;
-            if (stat(fullpath, &st) == 0) {
-                int is_dir = S_ISDIR(st.st_mode);
-                int is_reg = S_ISREG(st.st_mode);
-                int is_exec = access(fullpath, X_OK) == 0;
-                if ((is_dir && !executable_only) || (is_reg && (!executable_only || is_exec))) {
-                    char *rel_name;
-                    if (prefix) {
-                        int l = strlen(prefix) + strlen(de->d_name) + 2;
-                        rel_name = malloc(l);
-                        snprintf(rel_name, l, "%s/%s", prefix, de->d_name);
-                    } else {
-                        rel_name = strdup(de->d_name);
-                    }
-                    if (is_dir) {
-                        int l = strlen(rel_name) + 2;
-                        char *name = malloc(l);
-                        snprintf(name, l, "%s/", rel_name);
-                        char **n = realloc(entries, sizeof(char*) * (nentries + 1));
-                        if (!n) { free(name); free(rel_name); continue; }
-                        entries = n;
-                        entries[nentries++] = name;
-                        if (depth < max_depth) {
-                            add_entries(fullpath, rel_name, depth + 1, executable_only);
-                        }
-                    } else {
-                        char **n = realloc(entries, sizeof(char*) * (nentries + 1));
-                        if (!n) { free(rel_name); continue; }
-                        entries = n;
-                        entries[nentries++] = rel_name;
-                    }
-                }
-            }
-        }
-        closedir(dd);
-    }
-    add_entries(dir, NULL, 0, executable_only);
-    qsort(entries, nentries, sizeof(char*), alphasort_entries);
-    if (out_n) *out_n = nentries;
-    return entries;
-}
-
 // Return up to max matches (allocated array of strdup'd names); out_n is number returned. Caller must free.
-static char **get_fuzzy_matches(const char *dir, const char *pat, int max, int *out_n, int recursive, int max_depth, int executable_only) {
-    int n = 0; char **entries = recursive ? recursive_dir_entries(dir, max_depth, &n, executable_only) : dir_entries(dir, &n, executable_only);
+static char **get_fuzzy_matches(const char *dir, const char *pat, int max, int *out_n, int recursive, int executable_only) {
+    int n = 0; char **entries = recursive ? recursive_dir_entries(dir, &n) : dir_entries(dir, &n);
     if (!entries || n == 0) { if (out_n) *out_n = 0; if (entries) free(entries); return NULL; }
     struct match_item *matches = malloc(sizeof(struct match_item) * n);
     int mc = 0;
     for (int i = 0; i < n; i++) {
+        if (executable_only) {
+            // check if executable
+            char fullpath[1024];
+            if (snprintf(fullpath, sizeof(fullpath), "%s/%s", dir, entries[i]) >= (int)sizeof(fullpath)) continue;
+            if (access(fullpath, X_OK) != 0) continue; // not executable
+        }
         int sc = fuzzy_score(entries[i], pat);
         if (sc >= 0) {
             matches[mc].name = entries[i]; matches[mc].score = sc; mc++; // take ownership of the string pointer
@@ -3154,7 +3183,7 @@ static char **run_search(const char *query, int max, int *out_n) {
                     pos, snippet,
                     (int)strlen(qcopy), snippet + pos,
                     (int)(strlen(snippet) - pos - strlen(qcopy)), snippet + pos + strlen(qcopy));
-                char full[1024]; snprintf(full, sizeof(full), "%s:%d: %s", path, lineno, out);
+                char full[2048]; snprintf(full, sizeof(full), "%s:%d: %s", path, lineno, out);
                 results[n++] = strdup(full);
                 continue;
             }
@@ -3196,12 +3225,11 @@ static int ActiveFilenameStart = -1; // offset in E.command_buf where filename b
 static int SuggestionsVisible = 0;
 static int SuggestionMax = 8; // default suggestion limit (within 5-10 per design)
 static int SuggestionPageSize = 8; // default page size for suggestion overlay
-static char *CurrentSearchDir = NULL;
+static const char *CurrentSearchDir = NULL; // directory used for the most recent suggestion search (e.g. ".")
 
 static void clear_active_suggestions(void) {
     free_matches(ActiveMatches, ActiveMatchesN);
     ActiveMatches = NULL; ActiveMatchesN = 0; ActiveMatchSel = 0; ActiveFilenameStart = -1; SuggestionsVisible = 0;
-    free(CurrentSearchDir); CurrentSearchDir = NULL;
 }
 
 // Update suggestions based on current E.command_buf. Shows suggestions if command is 'open' or 'opent'.
@@ -3217,57 +3245,12 @@ static void update_suggestions_from_command(void) {
                 // pattern is remainder (may be empty)
                 char pat[512] = {0}; int plen = 0;
                 if (pos < E.command_len) { plen = E.command_len - pos; if (plen > (int)sizeof(pat)-1) plen = (int)sizeof(pat)-1; memcpy(pat, &E.command_buf[pos], plen); pat[plen] = '\0'; }
-                // parse pat for directory: find last / to split dir and search pattern
-                char dir[512] = "."; char search_pat[512] = {0};
-                char pat_copy[512]; strcpy(pat_copy, pat);
-                char *last_slash = strrchr(pat_copy, '/');
-                if (last_slash) {
-                    *last_slash = '\0';
-                    strcpy(dir, pat_copy[0] ? pat_copy : "/");
-                    strcpy(search_pat, last_slash + 1);
-                } else {
-                    strcpy(search_pat, pat);
-                }
-                CurrentSearchDir = strdup(dir);
                 int n = 0;
-                char **matches = get_fuzzy_matches(dir, search_pat, SuggestionMax, &n, 1, 3, 0);
+                char **matches = get_fuzzy_matches(".", pat, SuggestionMax, &n, 0, 0);
                 if (n > 0) {
                     ActiveMatches = matches; ActiveMatchesN = n; ActiveMatchSel = 0; ActiveFilenameStart = pos; SuggestionsVisible = 1; return;
                 } else {
                     // no matches: keep suggestions hidden
-                    clear_active_suggestions(); return;
-                }
-            }
-        }
-    }
-
-    // support `run` and single-letter `r` commands: suggest executables only
-    const char *run_cmds[] = {"run", "r"};
-    for (int ci = 0; ci < (int)(sizeof(run_cmds)/sizeof(run_cmds[0])); ci++) {
-        const char *kw = run_cmds[ci]; size_t kwlen = strlen(kw);
-        if (E.command_len >= (int)kwlen && strncmp(E.command_buf, kw, kwlen) == 0) {
-            if (E.command_len == (int)kwlen || E.command_buf[kwlen] == ' ') {
-                int pos = (int)kwlen; while (pos < E.command_len && E.command_buf[pos] == ' ') pos++;
-                // pattern is remainder (may be empty)
-                char pat[512] = {0}; int plen = 0;
-                if (pos < E.command_len) { plen = E.command_len - pos; if (plen > (int)sizeof(pat)-1) plen = (int)sizeof(pat)-1; memcpy(pat, &E.command_buf[pos], plen); pat[plen] = '\0'; }
-                // parse pat for directory: find last / to split dir and search pattern
-                char dir[512] = "."; char search_pat[512] = {0};
-                char pat_copy[512]; strcpy(pat_copy, pat);
-                char *last_slash = strrchr(pat_copy, '/');
-                if (last_slash) {
-                    *last_slash = '\0';
-                    strcpy(dir, pat_copy[0] ? pat_copy : "/");
-                    strcpy(search_pat, last_slash + 1);
-                } else {
-                    strcpy(search_pat, pat);
-                }
-                CurrentSearchDir = strdup(dir);
-                int n = 0;
-                char **matches = get_fuzzy_matches(dir, search_pat, SuggestionMax, &n, 1, 3, 1); // executable-only
-                if (n > 0) {
-                    ActiveMatches = matches; ActiveMatchesN = n; ActiveMatchSel = 0; ActiveFilenameStart = pos; SuggestionsVisible = 1; return;
-                } else {
                     clear_active_suggestions(); return;
                 }
             }
@@ -3289,7 +3272,42 @@ static void update_suggestions_from_command(void) {
         }
     }
 
-    // not an open/opent/find command: ensure hidden
+    // support `run` command: show executable matches
+    const char *rkw = "run"; size_t rkwlen = strlen(rkw);
+    if (E.command_len >= (int)rkwlen && strncmp(E.command_buf, rkw, rkwlen) == 0) {
+        if (E.command_len == (int)rkwlen || E.command_buf[rkwlen] == ' ') {
+            int pos = (int)rkwlen; while (pos < E.command_len && E.command_buf[pos] == ' ') pos++;
+            char pat[512] = {0}; int plen = 0;
+            if (pos < E.command_len) { plen = E.command_len - pos; if (plen > (int)sizeof(pat)-1) plen = (int)sizeof(pat)-1; memcpy(pat, &E.command_buf[pos], plen); pat[plen] = '\0'; }
+            CurrentSearchDir = ".";
+            int n = 0;
+            char **matches = get_fuzzy_matches(".", pat, SuggestionMax, &n, 0, 1);
+            if (n > 0) {
+                ActiveMatches = matches; ActiveMatchesN = n; ActiveMatchSel = 0; ActiveFilenameStart = pos; SuggestionsVisible = 1; return;
+            } else {
+                clear_active_suggestions(); return;
+            }
+        }
+    }
+    // support `R` command: same as run (single-letter uppercase alias)
+    const char *rrkw = "R"; size_t rrkwlen = strlen(rrkw);
+    if (E.command_len >= (int)rrkwlen && strncmp(E.command_buf, rrkw, rrkwlen) == 0) {
+        if (E.command_len == (int)rrkwlen || E.command_buf[rrkwlen] == ' ') {
+            int pos = (int)rrkwlen; while (pos < E.command_len && E.command_buf[pos] == ' ') pos++;
+            char pat[512] = {0}; int plen = 0;
+            if (pos < E.command_len) { plen = E.command_len - pos; if (plen > (int)sizeof(pat)-1) plen = (int)sizeof(pat)-1; memcpy(pat, &E.command_buf[pos], plen); pat[plen] = '\0'; }
+            CurrentSearchDir = ".";
+            int n = 0;
+            char **matches = get_fuzzy_matches(".", pat, SuggestionMax, &n, 0, 1);
+            if (n > 0) {
+                ActiveMatches = matches; ActiveMatchesN = n; ActiveMatchSel = 0; ActiveFilenameStart = pos; SuggestionsVisible = 1; return;
+            } else {
+                clear_active_suggestions(); return;
+            }
+        }
+    }
+
+    // not an open/opent/find/run command: ensure hidden
     clear_active_suggestions();
 }
 
@@ -3324,7 +3342,7 @@ static void render_suggestions_overlay(void) {
         }
     }
     // title
-    char title[256];
+    char title[2048];
     if (ActiveFilenameStart < 0 && E.command_len > 0) {
         // search: include command in white
         snprintf(title, sizeof(title), "Suggestions (%d) : \x1b[37m%s\x1b[0m", n, E.command_buf);
@@ -3371,30 +3389,20 @@ static void render_suggestions_overlay(void) {
     int foot_col = full_page ? 1 : (sx + 2);
     char foot[128]; int fp = snprintf(foot, sizeof(foot), "\x1b[%d;%dHPage %d/%d (%d results)", foot_ln, foot_col, ActiveMatchesPage + 1, pages ? pages : 1, n);
     if (fp > 0) write(STDOUT_FILENO, foot, (size_t)fp);
-    /* Cursor behavior for suggestions:
-     * - For full-page search results on the welcome page (interactive selection), show and place the cursor on the overlay title.
-     * - For command/filename completion suggestions (non-full overlay), DO NOT move the cursor to the overlay; keep it on the command prompt
-     *   so the user's typing focus isn't lost. We hide the terminal cursor for the overlay in that case to avoid a visible jump.
-     */
-    if (full_page && E.mode == MODE_VIEW && ActiveFilenameStart < 0) {
-        /* show cursor when overlay is a full-page interactive search */
-        write(STDOUT_FILENO, "\x1b[?25h", 6); // show cursor
+    // position cursor and show it
+    write(STDOUT_FILENO, "\x1b[?25h", 6); // show cursor
+    if (E.mode == MODE_VIEW && ActiveFilenameStart < 0) {
+        // position cursor at end of visible title (account for ANSI codes)
         int cursor_col = col + visible_len(title);
         if (cursor_col < 1) cursor_col = 1;
         if (cursor_col > E.screencols) cursor_col = E.screencols;
         char cur[64]; int m = snprintf(cur, sizeof(cur), "\x1b[%d;%dH", ln, cursor_col);
         if (m > 0) write(STDOUT_FILENO, cur, (size_t)m);
     } else {
-        /* For command/filename completion overlays we must NOT hide the cursor or
-         * move it away — keep it visible at the command prompt so the user always
-         * sees where they're typing. */
-        // Keep the cursor visible and positioned on the command prompt to avoid a
-        // visual jump and to preserve typing focus when suggestions are shown.
-        write(STDOUT_FILENO, "\x1b[?25h", 6); // ensure cursor visible
-        int cmd_row = E.screenrows;
-        int cmd_col = 2 + E.command_len;
-        if (cmd_col < 1) cmd_col = 1; if (cmd_col > E.screencols) cmd_col = E.screencols;
-        char cur[64]; int m = snprintf(cur, sizeof(cur), "\x1b[%d;%dH", cmd_row, cmd_col);
+        // position cursor out of way
+        int out_ln = full_page ? E.screenrows : (sy + boxh);
+        int out_col = full_page ? E.screencols : (sx + 1);
+        char cur[64]; int m = snprintf(cur, sizeof(cur), "\x1b[%d;%dH", out_ln, out_col);
         if (m > 0) write(STDOUT_FILENO, cur, (size_t)m);
     }
 }
@@ -3404,81 +3412,8 @@ static void accept_active_suggestion(void) {
     if (!SuggestionsVisible || ActiveMatchesN <= 0) return;
     int sel = ActiveMatchSel; if (sel < 0 || sel >= ActiveMatchesN) sel = 0;
     if (ActiveFilenameStart >= 0) {
-        /* If we're on the welcome page, selecting a filename should prompt to open it
-           immediately (o/t/c) instead of inserting it into the command buffer. Also,
-           if the command buffer already contains an "open" or "opent" command,
-           treat acceptance the same way (prompt immediately) so the user doesn't
-           have to hit Enter twice. */
+        /* filename completion into command buffer */
         int addlen = (int)strlen(ActiveMatches[sel]);
-        char pathbuf[512]; int sl = (addlen < (int)sizeof(pathbuf)-1) ? addlen : (int)sizeof(pathbuf)-1;
-        memcpy(pathbuf, ActiveMatches[sel], sl); pathbuf[sl] = '\0';
-        // build full path if searching in a different directory
-        if (CurrentSearchDir && strcmp(CurrentSearchDir, ".") != 0) {
-            char full[512];
-            if (strcmp(CurrentSearchDir, "/") == 0) {
-                snprintf(full, sizeof(full), "/%s", pathbuf);
-            } else {
-                snprintf(full, sizeof(full), "%s/%s", CurrentSearchDir, pathbuf);
-            }
-            strcpy(pathbuf, full);
-        }
-
-        int cmd_is_open = 0;
-        if (E.command_len >= 4 && (strncmp(E.command_buf, "open", 4) == 0)) {
-            char next = (E.command_len > 4) ? E.command_buf[4] : '\0';
-            if (next == '\0' || next == ' ') cmd_is_open = 1;
-        }
-        if (E.command_len >= 5 && (strncmp(E.command_buf, "opent", 5) == 0)) {
-            char next = (E.command_len > 5) ? E.command_buf[5] : '\0';
-            if (next == '\0' || next == ' ') cmd_is_open = 1;
-        }
-        int cmd_is_run = 0;
-        if (E.command_len >= 3 && (strncmp(E.command_buf, "run", 3) == 0)) {
-            char next = (E.command_len > 3) ? E.command_buf[3] : '\0';
-            if (next == '\0' || next == ' ') cmd_is_run = 1;
-        }
-        if (E.command_len >= 1 && (E.command_buf[0] == 'r' || E.command_buf[0] == 'R')) {
-            char next = (E.command_len > 1) ? E.command_buf[1] : '\0';
-            if (next == '\0' || next == ' ') cmd_is_run = 1;
-        }
-
-        if (cmd_is_run) {
-            clear_active_suggestions();
-            // build run command (prefer ./ for relative paths)
-            char runcmd[1024];
-            if (pathbuf[0] == '/') {
-                snprintf(runcmd, sizeof(runcmd), "%s", pathbuf);
-            } else if (strncmp(pathbuf, "./", 2) == 0 || strncmp(pathbuf, "../", 3) == 0) {
-                snprintf(runcmd, sizeof(runcmd), "%s", pathbuf);
-            } else {
-                snprintf(runcmd, sizeof(runcmd), "./%s", pathbuf);
-            }
-            E.command_len = 0; E.command_buf[0] = '\0';
-            disableRawMode(); int st = run_cmd_and_wait(runcmd); enableRawMode(); editorRefreshScreen();
-            int exitcode = WEXITSTATUS(st);
-            snprintf(E.msg, sizeof(E.msg), "Ran %s (exit %d)", runcmd, exitcode); E.msg_time = time(NULL);
-            return;
-        }
-
-        if (E.welcome_visible || cmd_is_open) {
-            clear_active_suggestions();
-            E.prompt_visible = 1;
-            int is_dir = (pathbuf[0] && pathbuf[strlen(pathbuf)-1] == '/');
-            if (is_dir) {
-                snprintf(E.prompt_message, sizeof(E.prompt_message), "Directory '%s' selected.", pathbuf);
-                snprintf(E.prompt_options, sizeof(E.prompt_options), "\x1b[1;92mg\x1b[0m: \x1b[92mcd into dir\x1b[0m, \x1b[1;94mb\x1b[0m: \x1b[94mbrowse dir\x1b[0m, \x1b[1;93mc\x1b[0m: \x1b[93mcancel\x1b[0m");
-            } else {
-                snprintf(E.prompt_message, sizeof(E.prompt_message), "File '%s' is not open. Open it?", pathbuf);
-                snprintf(E.prompt_options, sizeof(E.prompt_options), "\x1b[1;92mo\x1b[0m: \x1b[92mcurrent tab\x1b[0m, \x1b[1;94mt\x1b[0m: \x1b[94mnew tab\x1b[0m, \x1b[1;93mc\x1b[0m: \x1b[93mcancel\x1b[0m");
-            }
-            strncpy(E.pending_path, pathbuf, sizeof(E.pending_path)-1); E.pending_path[sizeof(E.pending_path)-1] = '\0';
-            E.pending_lineno = 1;
-            // clear any typed command when we prompt here (user will choose)
-            E.command_len = 0; E.command_buf[0] = '\0';
-            return;
-        }
-
-        /* Otherwise, perform filename completion into command buffer (default behavior). */
         int pre = ActiveFilenameStart;
         int newlen = pre + addlen;
         if (newlen + 1 < (int)sizeof(E.command_buf)) {
@@ -3672,11 +3607,11 @@ static int pick_multi_from_matches_with_desc(char **labels, char **descs, int n,
 
 // -------------------------------------------------------------------------------------
 
-// helper: open a file into the current editor window (push current buffer to a new tab)
+// helper: open a file into the current editor window (push current HOME snapshot to front)
 static void open_file_in_current_window(const char *fname) {
     E.welcome_visible = 0;
-    // push current file to new tab
-    push_current_to_tab_list();
+    // push current HOME snapshot to front
+    push_home_to_front();
     // then open requested file into current editor (create if missing)
     FILE *f = fopen(fname, "r");
     if (!f) {
@@ -4073,12 +4008,14 @@ static int parse_error_location(const char *line, char *path, int pathlen, int *
             closedir(dirp);
         }
         // also try matching against open tabs (full path or basename)
-        for (int t = 0; t < NumTabs; t++) {
-            if (!Tabs[t].name) continue;
-            const char *tn = Tabs[t].name;
-            if (strcmp(tn, cand) == 0) { strncpy(path, tn, pathlen-1); path[pathlen-1] = '\0'; *lineno = ln; if (colno) *colno = col; return 1; }
-            char *bn = strrchr(tn, '/'); const char *bname = bn ? bn + 1 : tn;
-            if (strcmp(bname, cand) == 0) { strncpy(path, tn, pathlen-1); path[pathlen-1] = '\0'; *lineno = ln; if (colno) *colno = col; return 1; }
+        if (Tabs) {
+            for (int t = 0; t < NumTabs; t++) {
+                if (!Tabs[t].name) continue;
+                const char *tn = Tabs[t].name;
+                if (strcmp(tn, cand) == 0) { strncpy(path, tn, pathlen-1); path[pathlen-1] = '\0'; *lineno = ln; if (colno) *colno = col; return 1; }
+                char *bn = strrchr(tn, '/'); const char *bname = bn ? bn + 1 : tn;
+                if (strcmp(bname, cand) == 0) { strncpy(path, tn, pathlen-1); path[pathlen-1] = '\0'; *lineno = ln; if (colno) *colno = col; return 1; }
+            }
         }
         p = c + 1;
     }
@@ -4239,36 +4176,34 @@ static int interactive_setup(BuildConfig *outcfg) {
 }
 
 // choose a target/command then run or set for post-save
-static char *shell_quote(const char *s) {
-    if (!s) return strdup("''");
-    size_t len = strlen(s);
-    size_t cap = len * 4 + 16;
-    char *q = malloc(cap);
-    if (!q) return NULL;
-    char *p = q;
-    *p++ = '\'';
-    for (size_t i = 0; i < len; i++) {
-        if (s[i] == '\'') {
-            /* close, escape, reopen: '\'' */
-            memcpy(p, "'\\''", 4); p += 4;
-        } else {
-            *p++ = s[i];
-        }
-    }
-    *p++ = '\''; *p = '\0';
-    return q;
-}
+static void handle_build_run(int do_run_after);
 
-static int run_cmd_and_wait(const char *cmd) {
-    if (!cmd) return -1;
-    char *q = shell_quote(cmd);
-    if (!q) return -1;
-    char wrap[4096];
-    /* Use sh -lc with positional parameter to avoid complex escaping of cmd */
-    snprintf(wrap, sizeof(wrap), "sh -lc 'clear; eval \"$1\"; echo; printf \"\\nPress ENTER to return...\"; read -r _' sh %s", q);
-    free(q);
-    int st = system(wrap);
-    return st;
+// run an executable directly (for 'run' command, skips build detection)
+static void run_interactive(const char *fname) {
+    char cmd[1024];
+    const char *ext = strrchr(fname, '.');
+    if (ext) {
+        if (strcmp(ext, ".py") == 0) {
+            snprintf(cmd, sizeof(cmd), "python3 '%s'", fname);
+        } else if (strcmp(ext, ".sh") == 0) {
+            snprintf(cmd, sizeof(cmd), "bash '%s'", fname);
+        } else if (strcmp(ext, ".pl") == 0) {
+            snprintf(cmd, sizeof(cmd), "perl '%s'", fname);
+        } else if (strcmp(ext, ".rb") == 0) {
+            snprintf(cmd, sizeof(cmd), "ruby '%s'", fname);
+        } else if (strcmp(ext, ".js") == 0) {
+            snprintf(cmd, sizeof(cmd), "node '%s'", fname);
+        } else {
+            // assume executable
+            snprintf(cmd, sizeof(cmd), "'%s'", fname);
+        }
+    } else {
+        // no extension, assume executable
+        snprintf(cmd, sizeof(cmd), "'%s'", fname);
+    }
+    char runcmd[1024];
+    snprintf(runcmd, sizeof(runcmd), "__run_shell__:%s", cmd);
+    execute_command(runcmd);
 }
 
 static void handle_build_run(int do_run_after) {
@@ -4328,13 +4263,14 @@ static void handle_build_run(int do_run_after) {
             }
             if (!cmd) { char *in = prompt_input("Enter custom command (empty to cancel): "); if (in) { cmd = in; } }
             if (cmd) {
-                disableRawMode(); write(STDOUT_FILENO, "\x1b[2J\x1b[H", 7); int st = system(cmd); enableRawMode(); editorRefreshScreen();
+                char runcmd[768]; snprintf(runcmd, sizeof(runcmd), "__run_shell__:%s", cmd);
+                int st = execute_command(runcmd);
                 if (do_run_after) {
                     // If the selected command already contains 'run' we assume it executed the run step.
                     if (!strstr(cmd, "run")) {
                         // Otherwise, attempt to use saved project run command if present and only run on successful build
                         BuildConfig cfg2 = {0}; if (load_build_config(&cfg2) && cfg2.run_cmd[0] && st == 0) {
-                            disableRawMode(); int st = run_cmd_and_wait(cfg2.run_cmd); enableRawMode(); editorRefreshScreen(); (void)st;
+                            char rc[1024]; snprintf(rc, sizeof(rc), "__run_shell__:%s", cfg2.run_cmd); execute_command(rc);
                         }
                     }
                 }
@@ -4352,7 +4288,7 @@ static void handle_build_run(int do_run_after) {
                     int st = execute_command(runcmd);
                     if (do_run_after && cfg.run_cmd[0]) {
                         if (st == 0) {
-                            disableRawMode(); write(STDOUT_FILENO, "\x1b[2J\x1b[H", 7); system(cfg.run_cmd); enableRawMode(); editorRefreshScreen();
+                            char rc[1024]; snprintf(rc, sizeof(rc), "__run_shell__:%s", cfg.run_cmd); execute_command(rc);
                         } else {
                             char emsg[256]; snprintf(emsg, sizeof(emsg), "Run skipped: build failed (exit %d)", st);
                             output_append_colored_line(emsg);
@@ -4373,7 +4309,7 @@ static void handle_build_run(int do_run_after) {
                 if (nc.build_cmd[0]) { char bcmd[1024]; snprintf(bcmd, sizeof(bcmd), "__run_shell__:%s", nc.build_cmd); st = execute_command(bcmd); }
                 if (do_run_after && nc.run_cmd[0]) {
                     if (st == 0) {
-                        disableRawMode(); int st2 = run_cmd_and_wait(nc.run_cmd); enableRawMode(); editorRefreshScreen(); (void)st2;
+                        char rc[1024]; snprintf(rc, sizeof(rc), "__run_shell__:%s", nc.run_cmd); execute_command(rc);
                     } else {
                         char emsg[256]; snprintf(emsg, sizeof(emsg), "Run skipped: build failed (exit %d)", st);
                         output_append_colored_line(emsg);
@@ -4406,13 +4342,13 @@ static void handle_run_only(int allow_interactive) {
             cmd = strdup("ctest --output-on-failure");
         }
         if (!cmd) { char *in = prompt_input("Enter command to run: "); if (in) { cmd = in; } }
-        if (cmd) { disableRawMode(); int st = run_cmd_and_wait(cmd); enableRawMode(); editorRefreshScreen(); free(cmd); (void)st; return; }
+        if (cmd) { char runcmd[768]; snprintf(runcmd, sizeof(runcmd), "__run_shell__:%s", cmd); execute_command(runcmd); free(cmd); return; }
     } else {
         // no build system found: check config
         BuildConfig cfg = {0};
         if (load_build_config(&cfg)) {
             if (prompt_yesno("Saved build config found. Run it?")) {
-                if (cfg.run_cmd[0]) { disableRawMode(); int st = run_cmd_and_wait(cfg.run_cmd); enableRawMode(); editorRefreshScreen(); (void)st; }
+                if (cfg.run_cmd[0]) { char rc[1024]; snprintf(rc, sizeof(rc), "__run_shell__:%s", cfg.run_cmd); execute_command(rc); }
                 else if (cfg.build_cmd[0]) { char bc[1024]; snprintf(bc, sizeof(bc), "__run_shell__:%s", cfg.build_cmd); execute_command(bc); }
             }
             // In all cases when a saved config is present, we won't fall through to interactive setup for run-only
@@ -4422,7 +4358,7 @@ static void handle_run_only(int allow_interactive) {
         if (allow_interactive && prompt_yesno("No build system found. Run interactive setup?")) {
             BuildConfig nc = {0};
             if (interactive_setup(&nc)) {
-                if (nc.run_cmd[0]) { disableRawMode(); write(STDOUT_FILENO, "\x1b[2J\x1b[H", 7); system(nc.run_cmd); enableRawMode(); editorRefreshScreen(); }
+                if (nc.run_cmd[0]) { char rc[1024]; snprintf(rc, sizeof(rc), "__run_shell__:%s", nc.run_cmd); execute_command(rc); }
                 else if (nc.build_cmd[0]) { char bc[1024]; snprintf(bc, sizeof(bc), "__run_shell__:%s", nc.build_cmd); execute_command(bc); }
                 return;
             } else {
@@ -4496,11 +4432,6 @@ static void show_file_browser(void) {
     char cwd[512]; getcwd(cwd, sizeof(cwd));
     // ensure other overlays (help) are hidden while browser is active
     E.help_visible = 0;
-    /* snapshot and clear the "opened from welcome" flag so stale state doesn't affect
-     * subsequent invocations. Use the local snapshot at the end to decide whether to
-     * return to the welcome page if the browser was cancelled without opening a file. */
-    int was_browser_from_welcome = E.browser_from_welcome;
-    E.browser_from_welcome = 0;
     int file_opened = 0;
 
     /* directory history stack: dir_history[0] is the initial directory, top is dir_history[dh_count-1]
@@ -4676,8 +4607,6 @@ static void show_file_browser(void) {
         if (curcol > sx + boxw - 2) curcol = sx + boxw - 2;
         int m = snprintf(cur, sizeof(cur), "\x1b[%d;%dH", crow, curcol);
         if (m>0) write(STDOUT_FILENO, cur, (size_t)m);
-        /* Make sure the cursor is visible in the browser input area */
-        write(STDOUT_FILENO, "\x1b[?25h", 6);
 
         // read keys
         int k = readKey(); if (k == -1) { continue; }
@@ -4909,12 +4838,9 @@ static void show_file_browser(void) {
         for (int i = 0; i < dh_count; i++) { free(dir_history[i]); }
         free(dir_history); dir_history = NULL; dh_count = 0;
     }
-    // If the browser was opened from the welcome page and the user cancelled
-    // without opening anything, restore the welcome page. Otherwise remain
-    // in the editor (do not switch to welcome on cancel).
-    if (was_browser_from_welcome && !file_opened) {
+    if (E.browser_from_welcome && !file_opened) {
         E.welcome_visible = 1;
-        /* E.browser_from_welcome was cleared at entry; no need to reset here. */
+        E.browser_from_welcome = 0;
     }
     // redraw editor
     editorRefreshScreen();
@@ -4931,24 +4857,7 @@ static void editorRefreshScreen(void) {
         write(STDOUT_FILENO, "\x1b[2J", 4); // clear screen
         write(STDOUT_FILENO, "\x1b[H", 3);  // move to top-left
         draw_welcome_overlay();
-        // If a prompt is active (e.g., "Open it? o/t/c"), draw it on top of the welcome page
-        if (E.prompt_visible) {
-            // draw message (place near bottom so it doesn't overlap welcome content)
-            int msg_vis = visible_len(E.prompt_message);
-            int msg_row = E.screenrows - 4; if (msg_row < 1) msg_row = 1;
-            char buf[512]; int pn = snprintf(buf, sizeof(buf), "\x1b[%d;%dH\x1b[37m%s\x1b[0m", msg_row, (E.screencols - msg_vis) / 2, E.prompt_message);
-            if (pn > 0) write(STDOUT_FILENO, buf, (size_t)pn);
-            // draw options slightly below the message but above the bottom line
-            int opt_vis = visible_len(E.prompt_options);
-            int opt_row = msg_row + 1; if (opt_row > E.screenrows - 1) opt_row = E.screenrows - 1; if (opt_row < 1) opt_row = 1;
-            pn = snprintf(buf, sizeof(buf), "\x1b[%d;%dH\x1b[37m%s\x1b[0m", opt_row, (E.screencols - opt_vis) / 2, E.prompt_options);
-            if (pn > 0) write(STDOUT_FILENO, buf, (size_t)pn);
-            // position cursor out of way
-            pn = snprintf(buf, sizeof(buf), "\x1b[%d;%dH", E.screenrows, E.screencols);
-            if (pn > 0) write(STDOUT_FILENO, buf, (size_t)pn);
-            return;
-        }
-        // Otherwise, if suggestions are active, render them on top of the welcome page
+        // If suggestions are visible while on the welcome page, render them on top
         if (SuggestionsVisible) { render_suggestions_overlay(); return; }
         return;
     }
@@ -5104,7 +5013,7 @@ static void editorRefreshScreen(void) {
     }
     // build mode text and optionally command buffer (displayed next to mode in view)
     const char *mode_base = (E.mode == MODE_VIEW) ? "VIEW MODE" : "EDIT MODE";
-    char mode_text[256];
+    char mode_text[2048];
     int mode_len = 0;
     if (E.mode == MODE_VIEW && E.command_len > 0) {
         // display command next to mode, prefixed with ':'
@@ -5283,25 +5192,23 @@ static void editorRefreshScreen(void) {
         return; // overlay drawn, skip further drawing to avoid artifacts
     }
 
-    // If prompt overlay visible, draw it as a compact bottom overlay (don't clear screen)
+    // If prompt overlay visible, draw it full-page
     if (E.prompt_visible) {
-        // draw/clear the two bottom lines we'll use for the prompt
-        char tmp[128]; int cn = snprintf(tmp, sizeof(tmp), "\x1b[%d;1H\x1b[K\x1b[%d;1H\x1b[K", E.screenrows - 2, E.screenrows - 1);
-        if (cn > 0) write(STDOUT_FILENO, tmp, (size_t)cn);
-        // draw message (one line above the last line)
+        write(STDOUT_FILENO, "\x1b[2J", 4); // clear screen
+        write(STDOUT_FILENO, "\x1b[H", 3);  // move to top-left
+        // draw message
         int msg_vis = visible_len(E.prompt_message);
-        int msg_row = E.screenrows - 2; if (msg_row < 1) msg_row = 1;
+        int msg_row = E.screenrows / 2 - 2;
         char buf[512]; int pn = snprintf(buf, sizeof(buf), "\x1b[%d;%dH\x1b[37m%s\x1b[0m", msg_row, (E.screencols - msg_vis) / 2, E.prompt_message);
         if (pn > 0) write(STDOUT_FILENO, buf, (size_t)pn);
-        // draw options on the last line
+        // draw options
         int opt_vis = visible_len(E.prompt_options);
-        int opt_row = E.screenrows - 1; if (opt_row < 1) opt_row = 1;
+        int opt_row = msg_row + 2;
         pn = snprintf(buf, sizeof(buf), "\x1b[%d;%dH\x1b[37m%s\x1b[0m", opt_row, (E.screencols - opt_vis) / 2, E.prompt_options);
         if (pn > 0) write(STDOUT_FILENO, buf, (size_t)pn);
-        // position cursor out of way (bottom-right) and hide it (prompt uses single-key responses)
+        // position cursor out of way
         pn = snprintf(buf, sizeof(buf), "\x1b[%d;%dH", E.screenrows, E.screencols);
         if (pn > 0) write(STDOUT_FILENO, buf, (size_t)pn);
-        write(STDOUT_FILENO, "\x1b[?25l", 6); // hide cursor
         return;
     }
 
@@ -5330,32 +5237,6 @@ static void editorProcessKeypress(void) {
     // If prompt visible, handle it
     if (E.prompt_visible) {
         int c = readKey();
-        // detect if the pending path is a directory (ends with '/')
-        int pending_is_dir = (E.pending_path[0] && E.pending_path[strlen(E.pending_path)-1] == '/');
-        if (pending_is_dir) {
-            if (c == 'g' || c == 'G' || c == 'o' || c == 'O') {
-                // change directory into the pending path
-                if (chdir(E.pending_path) == 0) {
-                    char cwd[512]; getcwd(cwd, sizeof(cwd)); snprintf(E.msg, sizeof(E.msg), "Changed directory to %s", cwd); E.msg_time = time(NULL);
-                } else {
-                    snprintf(E.msg, sizeof(E.msg), "cd failed: %s", strerror(errno)); E.msg_time = time(NULL);
-                }
-                E.prompt_visible = 0;
-            } else if (c == 'b' || c == 'B' || c == 't' || c == 'T') {
-                // browse into the directory (t also accepted for convenience)
-                if (chdir(E.pending_path) == 0) {
-                    E.browser_from_welcome = 0; show_file_browser();
-                } else {
-                    snprintf(E.msg, sizeof(E.msg), "cd failed: %s", strerror(errno)); E.msg_time = time(NULL);
-                }
-                E.prompt_visible = 0;
-            } else if (c == 'c' || c == 'C' || c == 27) { // ESC or c
-                E.prompt_visible = 0;
-            }
-            editorRefreshScreen();
-            return;
-        }
-
         if (c == 'o' || c == 'O') {
             // open in current tab
             open_file_and_seek(E.pending_path, E.pending_lineno);
@@ -5411,29 +5292,53 @@ static void editorProcessKeypress(void) {
 
     // Handle welcome page input
     if (E.welcome_visible) {
-        // If suggestions are visible, let arrows, page keys, Enter/Tab and ESC control them
-        if (SuggestionsVisible) {
-            int pageSize = (ActiveFilenameStart < 0) ? (E.screenrows - 4) : ((E.screenrows - 4 > 3) ? (E.screenrows - 4) : SuggestionPageSize);
-            if (pageSize < 3) pageSize = 3;
-            if (c == ARROW_DOWN) { ActiveMatchSel = (ActiveMatchSel + 1) % ActiveMatchesN; ActiveMatchesPage = ActiveMatchSel / pageSize; editorRefreshScreen(); return; }
-            if (c == ARROW_UP) { ActiveMatchSel = (ActiveMatchSel - 1 + ActiveMatchesN) % ActiveMatchesN; ActiveMatchesPage = ActiveMatchSel / pageSize; editorRefreshScreen(); return; }
-            if (c == PAGE_DOWN) { int pages = (ActiveMatchesN + pageSize - 1) / pageSize; ActiveMatchesPage = (ActiveMatchesPage + 1 < pages) ? ActiveMatchesPage + 1 : pages - 1; ActiveMatchSel = ActiveMatchesPage * pageSize; editorRefreshScreen(); return; }
-            if (c == PAGE_UP) { ActiveMatchesPage = (ActiveMatchesPage > 0) ? ActiveMatchesPage - 1 : 0; ActiveMatchSel = ActiveMatchesPage * pageSize; editorRefreshScreen(); return; }
-            if (c == '\r' || c == '\n' || c == '\t') { accept_active_suggestion(); editorRefreshScreen(); return; }
-            if (c == 27) { clear_active_suggestions(); editorRefreshScreen(); return; }
-        }
-
         if (c == 27) { // ESC
             E.welcome_visible = 0;
             E.command_buf[0] = '\0';
             E.command_len = 0;
             free(E.filename); E.filename = NULL; editorFreeRows(); editorAppendRow(""); save_snapshot(); free(E.saved_snapshot); E.saved_snapshot = serialize_buffer();
             E.cx = 0; E.cy = 0; E.row_offset = 0; E.col_offset = 0;
-            clear_active_suggestions();
             return;
         } else if (c == '\r' || c == '\n') {
-            // If suggestions visible, accept instead of executing the command
-            if (SuggestionsVisible) { accept_active_suggestion(); editorRefreshScreen(); return; }
+            // If suggestions are visible, accept the active suggestion first
+            if (SuggestionsVisible) {
+                int was_filename = (ActiveFilenameStart >= 0);
+                accept_active_suggestion();
+                if (was_filename && E.command_len > 0) {
+                    // execute command as if user pressed Enter (duplicate of below)
+                    if (E.command_len == 1 && E.command_buf[0] == 'b') {
+                        E.welcome_visible = 0;
+                        E.browser_from_welcome = 1;
+                        show_file_browser();
+                    } else if (E.command_len == 1 && E.command_buf[0] == 'q') {
+                        write(STDOUT_FILENO, "\x1b[2J", 4);
+                        write(STDOUT_FILENO, "\x1b[H", 3);
+                        disableRawMode();
+                        exit(0);
+                    } else if (strncmp(E.command_buf, "help", 4) == 0) {
+                        E.welcome_visible = 0;
+                        E.help_visible = 1;
+                        E.help_scroll = 0;
+                        E.help_from_welcome = 1;
+                    } else if (strncmp(E.command_buf, "open ", 5) == 0) {
+                        E.welcome_visible = 0;
+                        push_current_to_tab_list();
+                        open_file_in_current_window_no_push(&E.command_buf[5]);
+                    } else if (strncmp(E.command_buf, "opent ", 6) == 0) {
+                        E.welcome_visible = 0;
+                        open_file_in_new_tab(&E.command_buf[6]);
+                    } else if (strncmp(E.command_buf, "run ", 4) == 0) {
+                        E.welcome_visible = 0;
+                        run_interactive(&E.command_buf[4]);
+                    } else if (E.command_len >= 2 && strncmp(E.command_buf, "R ", 2) == 0) {
+                        E.welcome_visible = 0;
+                        run_interactive(&E.command_buf[2]);
+                    }
+                    E.command_buf[0] = '\0';
+                    E.command_len = 0;
+                }
+                return;
+            }
             // execute command
             if (E.command_len > 0) {
                 if (E.command_len == 1 && E.command_buf[0] == 'b') {
@@ -5452,32 +5357,54 @@ static void editorProcessKeypress(void) {
                     E.help_from_welcome = 1;
                 } else if (strncmp(E.command_buf, "open ", 5) == 0) {
                     E.welcome_visible = 0;
+                    push_home_to_front();
+                    switch_to_home();
                     open_file_in_current_window_no_push(&E.command_buf[5]);
+                } else if (strncmp(E.command_buf, "opent ", 6) == 0) {
+                    E.welcome_visible = 0;
+                    open_file_in_new_tab(&E.command_buf[6]);
+                } else if (strncmp(E.command_buf, "run ", 4) == 0) {
+                    E.welcome_visible = 0;
+                    run_interactive(&E.command_buf[4]);
+                } else if (E.command_len >= 2 && strncmp(E.command_buf, "R ", 2) == 0) {
+                    E.welcome_visible = 0;
+                    run_interactive(&E.command_buf[2]);
                 } else {
                     // ignore unknown commands
                 }
             }
             E.command_buf[0] = '\0';
             E.command_len = 0;
-            clear_active_suggestions();
             return;
         } else if (c == 127 || c == 8) { // backspace
             if (E.command_len > 0) {
                 E.command_len--;
                 E.command_buf[E.command_len] = '\0';
+                // Update suggestions while user edits command on welcome page
+                update_suggestions_from_command();
             }
-            update_suggestions_from_command();
-            editorRefreshScreen();
             return;
         } else if (c >= 32 && c <= 126) { // printable
             if (E.command_len < (int)sizeof(E.command_buf) - 1) {
                 E.command_buf[E.command_len++] = c;
                 E.command_buf[E.command_len] = '\0';
+                // Update suggestions while user types on the welcome page
+                update_suggestions_from_command();
             }
-            update_suggestions_from_command();
-            editorRefreshScreen();
             return;
         } else {
+            // If suggestions are visible, allow navigation/acceptance with arrow keys, page keys, tab, enter, or esc
+            if (SuggestionsVisible) {
+                if (ActiveMatchesN <= 0) { clear_active_suggestions(); return; }
+                int pageSize = (ActiveFilenameStart < 0) ? (E.screenrows - 4) : ((E.screenrows - 4 > 3) ? (E.screenrows - 4) : SuggestionPageSize);
+                if (pageSize < 3) pageSize = 3;
+                if (c == ARROW_DOWN) { ActiveMatchSel = (ActiveMatchSel + 1) % ActiveMatchesN; ActiveMatchesPage = ActiveMatchSel / pageSize; return; }
+                if (c == ARROW_UP) { ActiveMatchSel = (ActiveMatchSel - 1 + ActiveMatchesN) % ActiveMatchesN; ActiveMatchesPage = ActiveMatchSel / pageSize; return; }
+                if (c == PAGE_DOWN) { int pages = (ActiveMatchesN + pageSize - 1) / pageSize; ActiveMatchesPage = (ActiveMatchesPage + 1 < pages) ? ActiveMatchesPage + 1 : pages - 1; ActiveMatchSel = ActiveMatchesPage * pageSize; return; }
+                if (c == PAGE_UP) { ActiveMatchesPage = (ActiveMatchesPage > 0) ? ActiveMatchesPage - 1 : 0; ActiveMatchSel = ActiveMatchesPage * pageSize; return; }
+                if (c == '\t') { accept_active_suggestion(); return; }
+                if (c == 27) { clear_active_suggestions(); return; }
+            }
             return; // ignore other keys
         }
     }
@@ -5510,14 +5437,29 @@ static void editorProcessKeypress(void) {
 
     // If suggestions visible and in view mode, let ARROW/Enter/Tab/Esc control them
     if (SuggestionsVisible && E.mode == MODE_VIEW) {
+        if (ActiveMatchesN <= 0) { clear_active_suggestions(); }
         /* compute current page size (full-page search uses more rows) */
         int pageSize = (ActiveFilenameStart < 0) ? (E.screenrows - 4) : ((E.screenrows - 4 > 3) ? (E.screenrows - 4) : SuggestionPageSize);
         if (pageSize < 3) pageSize = 3;
-        if (c == ARROW_DOWN) { ActiveMatchSel = (ActiveMatchSel + 1) % ActiveMatchesN; ActiveMatchesPage = ActiveMatchSel / pageSize; return; }
-        if (c == ARROW_UP) { ActiveMatchSel = (ActiveMatchSel - 1 + ActiveMatchesN) % ActiveMatchesN; ActiveMatchesPage = ActiveMatchSel / pageSize; return; }
-        if (c == PAGE_DOWN) { int pages = (ActiveMatchesN + pageSize - 1) / pageSize; ActiveMatchesPage = (ActiveMatchesPage + 1 < pages) ? ActiveMatchesPage + 1 : pages - 1; ActiveMatchSel = ActiveMatchesPage * pageSize; return; }
-        if (c == PAGE_UP) { ActiveMatchesPage = (ActiveMatchesPage > 0) ? ActiveMatchesPage - 1 : 0; ActiveMatchSel = ActiveMatchesPage * pageSize; return; }
-        if (c == '\r' || c == '\n' || c == '\t') { accept_active_suggestion(); return; }
+        if (ActiveMatchesN > 0) {
+            if (c == ARROW_DOWN) { ActiveMatchSel = (ActiveMatchSel + 1) % ActiveMatchesN; ActiveMatchesPage = ActiveMatchSel / pageSize; return; }
+            if (c == ARROW_UP) { ActiveMatchSel = (ActiveMatchSel - 1 + ActiveMatchesN) % ActiveMatchesN; ActiveMatchesPage = ActiveMatchSel / pageSize; return; }
+            if (c == PAGE_DOWN) { int pages = (ActiveMatchesN + pageSize - 1) / pageSize; ActiveMatchesPage = (ActiveMatchesPage + 1 < pages) ? ActiveMatchesPage + 1 : pages - 1; ActiveMatchSel = ActiveMatchesPage * pageSize; return; }
+            if (c == PAGE_UP) { ActiveMatchesPage = (ActiveMatchesPage > 0) ? ActiveMatchesPage - 1 : 0; ActiveMatchSel = ActiveMatchesPage * pageSize; return; }
+            if (c == '\r' || c == '\n' || c == '\t') {
+                int was_filename = (ActiveFilenameStart >= 0);
+                accept_active_suggestion();
+                if (was_filename && E.command_len > 0) {
+                    // execute command in buffer
+                    clear_active_suggestions();
+                    E.command_buf[E.command_len] = '\0';
+                    execute_command(E.command_buf);
+                    E.command_len = 0;
+                    E.command_buf[0] = '\0';
+                }
+                return;
+            }
+        }
         if (c == 27) { clear_active_suggestions(); return; }
     }
 
@@ -5565,11 +5507,13 @@ static void editorProcessKeypress(void) {
                 }
                 // If the file is already open in another tab, switch to that tab
                 int found_tab = -1;
-                for (int t = 0; t < NumTabs; t++) {
-                    if (!Tabs[t].name) continue;
-                    if (strcmp(Tabs[t].name, path) == 0) { found_tab = t; break; }
-                    char *bn = strrchr(Tabs[t].name, '/'); const char *bname = bn ? bn + 1 : Tabs[t].name;
-                    if (strcmp(bname, path) == 0) { found_tab = t; break; }
+                if (Tabs) {
+                    for (int t = 0; t < NumTabs; t++) {
+                        if (!Tabs[t].name) continue;
+                        if (strcmp(Tabs[t].name, path) == 0) { found_tab = t; break; }
+                        char *bn = strrchr(Tabs[t].name, '/'); const char *bname = bn ? bn + 1 : Tabs[t].name;
+                        if (strcmp(bname, path) == 0) { found_tab = t; break; }
+                    }
                 }
                 if (found_tab >= 0) {
                     switch_to_tab(found_tab);
@@ -5777,7 +5721,7 @@ static void editorProcessKeypress(void) {
             return;
         }
 
-        // handle view-mode input: command buffer
+
         if (c == '\r' || c == '\n') {
             // execute command in buffer
             if (E.command_len > 0) {
@@ -5805,8 +5749,9 @@ static void editorProcessKeypress(void) {
             return;
         }
         if (c == '\t') {
-            // Autocomplete for filename/executable in commands like "open", "opent", and "run".
-            const char *cmds[] = {"open", "opent", "run", "r"};
+            // Autocomplete for filename in commands like "open" and "opent".
+            // If buffer starts with open/opent, find filename part and show suggestions.
+            const char *cmds[] = {"open", "opent"};
             for (int ci = 0; ci < (int)(sizeof(cmds)/sizeof(cmds[0])); ci++) {
                 const char *kw = cmds[ci]; size_t kwlen = strlen(kw);
                 if (E.command_len >= (int)kwlen && strncmp(E.command_buf, kw, kwlen) == 0) {
@@ -5817,29 +5762,17 @@ static void editorProcessKeypress(void) {
                         // build pattern from pos to end
                         char pat[512] = {0}; int plen = 0;
                         if (pos < E.command_len) { plen = E.command_len - pos; if (plen > (int)sizeof(pat)-1) plen = (int)sizeof(pat)-1; memcpy(pat, &E.command_buf[pos], plen); pat[plen] = '\0'; }
-                        int n = 0; int max_sugg = 8; int executable_only = (strcmp(kw, "run") == 0 || strcmp(kw, "r") == 0) ? 1 : 0;
-                        char **matches = get_fuzzy_matches(".", pat, max_sugg, &n, 1, 3, executable_only);
+                        int n = 0; int max_sugg = 8; char **matches = get_fuzzy_matches(".", pat, max_sugg, &n, 0, 0);
                         if (n > 0) {
                             int picked = pick_from_matches(matches, n);
                             if (picked >= 0 && picked < n) {
-                                if (executable_only) {
-                                    // run the selected executable immediately
-                                    char runcmd[1024]; if (matches[picked][0] == '/') snprintf(runcmd, sizeof(runcmd), "%s", matches[picked]); else snprintf(runcmd, sizeof(runcmd), "./%s", matches[picked]);
-                                    free_matches(matches, n);
-                                    disableRawMode(); int st = run_cmd_and_wait(runcmd); enableRawMode(); editorRefreshScreen();
-                                    snprintf(E.msg, sizeof(E.msg), "Ran %s (exit %d)", runcmd, WEXITSTATUS(st)); E.msg_time = time(NULL);
-                                    // clear any typed command
-                                    E.command_len = 0; E.command_buf[0] = '\0';
-                                    return;
-                                } else {
-                                    // replace buffer content from pos to end with chosen match
-                                    int newlen = pos + (int)strlen(matches[picked]);
-                                    if (newlen + 1 < (int)sizeof(E.command_buf)) {
-                                        // shift/replace
-                                        memcpy(&E.command_buf[pos], matches[picked], strlen(matches[picked]));
-                                        E.command_len = pos + (int)strlen(matches[picked]);
-                                        E.command_buf[E.command_len] = '\0';
-                                    }
+                                // replace buffer content from pos to end with chosen match
+                                int newlen = pos + (int)strlen(matches[picked]);
+                                if (newlen + 1 < (int)sizeof(E.command_buf)) {
+                                    // shift/replace
+                                    memcpy(&E.command_buf[pos], matches[picked], strlen(matches[picked]));
+                                    E.command_len = pos + (int)strlen(matches[picked]);
+                                    E.command_buf[E.command_len] = '\0';
                                 }
                             }
                             free_matches(matches, n);
