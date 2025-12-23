@@ -1682,6 +1682,21 @@ static int execute_command(const char *cmd) {
             } else {
                 // doesn't exist: will create
             }
+            // check if it's a directory
+            struct stat st;
+            if (stat(fname, &st) == 0 && S_ISDIR(st.st_mode)) {
+                // open directory in browser
+                char orig_cwd[512];
+                if (getcwd(orig_cwd, sizeof(orig_cwd)) == NULL) {
+                    snprintf(E.msg, sizeof(E.msg), "getcwd failed"); E.msg_time = time(NULL); continue;
+                }
+                if (chdir(fname) != 0) {
+                    snprintf(E.msg, sizeof(E.msg), "Cannot access directory %s: %s", fname, strerror(errno)); E.msg_time = time(NULL); continue;
+                }
+                show_file_browser();
+                chdir(orig_cwd);
+                continue;
+            }
             // Create a new tab with the file without modifying the current buffer
             open_file_in_new_tab(fname);
             snprintf(E.msg, sizeof(E.msg), "opent: opened %s", fname); E.msg_time = time(NULL);
@@ -1697,6 +1712,21 @@ static int execute_command(const char *cmd) {
             char fname[512]; int sl = (tlen < (int)sizeof(fname)-1) ? tlen : (int)sizeof(fname)-1; memcpy(fname, &cmd[start], sl); fname[sl] = '\0';
             // debug: show parsed filename and existence
             snprintf(E.msg, sizeof(E.msg), "open -> '%s' (exists=%d)", fname, access(fname, F_OK) == 0); E.msg_time = time(NULL);
+            // check if it's a directory
+            struct stat st;
+            if (stat(fname, &st) == 0 && S_ISDIR(st.st_mode)) {
+                // open directory in browser
+                char orig_cwd[512];
+                if (getcwd(orig_cwd, sizeof(orig_cwd)) == NULL) {
+                    snprintf(E.msg, sizeof(E.msg), "getcwd failed"); E.msg_time = time(NULL); continue;
+                }
+                if (chdir(fname) != 0) {
+                    snprintf(E.msg, sizeof(E.msg), "Cannot access directory %s: %s", fname, strerror(errno)); E.msg_time = time(NULL); continue;
+                }
+                show_file_browser();
+                chdir(orig_cwd);
+                continue;
+            }
             // push current HOME snapshot to front, switch to home, and open requested file into home
             push_home_to_front();
             switch_to_home();
@@ -3052,35 +3082,127 @@ static int match_cmp(const void *a, const void *b) {
 }
 
 // Return up to max matches (allocated array of strdup'd names); out_n is number returned. Caller must free.
-static char **get_fuzzy_matches(const char *dir, const char *pat, int max, int *out_n, int recursive, int executable_only) {
-    int n = 0; char **entries = recursive ? recursive_dir_entries(dir, &n) : dir_entries(dir, &n);
-    if (!entries || n == 0) { if (out_n) *out_n = 0; if (entries) free(entries); return NULL; }
-    struct match_item *matches = malloc(sizeof(struct match_item) * n);
-    int mc = 0;
-    for (int i = 0; i < n; i++) {
-        if (executable_only) {
-            // check if executable
-            char fullpath[1024];
-            if (snprintf(fullpath, sizeof(fullpath), "%s/%s", dir, entries[i]) >= (int)sizeof(fullpath)) continue;
-            if (access(fullpath, X_OK) != 0) continue; // not executable
-        }
-        int sc = fuzzy_score(entries[i], pat);
-        if (sc >= 0) {
-            matches[mc].name = entries[i]; matches[mc].score = sc; mc++; // take ownership of the string pointer
-            entries[i] = NULL; // mark taken
-        }
+static char **collect_dir_paths(const char *base, int max_depth, int *out_n) {
+    char **list = NULL; int count = 0;
+    const int MAX_DIR_COLLECT = 10000; // safety cap to avoid excessive memory/use
+
+    void add_dir(const char *path) {
+        if (count >= MAX_DIR_COLLECT) return;
+        char **n = realloc(list, sizeof(char*) * (count + 1));
+        if (!n) return;
+        list = n;
+        list[count] = strdup(path);
+        if (list[count]) count++;
     }
-    // free leftover entries we didn't take
-    for (int i = 0; i < n; i++) if (entries[i]) free(entries[i]); free(entries);
-    if (mc == 0) { free(matches); if (out_n) *out_n = 0; return NULL; }
-    qsort(matches, mc, sizeof(struct match_item), match_cmp);
-    int ret_n = (mc < max) ? mc : max;
-    char **ret = malloc(sizeof(char*) * ret_n);
-    for (int i = 0; i < ret_n; i++) ret[i] = strdup(matches[i].name);
-    // free matches array (but not names; ret holds copies)
-    for (int i = 0; i < mc; i++) free(matches[i].name);
-    free(matches);
-    if (out_n) *out_n = ret_n; return ret;
+
+    void recurse(const char *current, int depth) {
+        if (depth >= max_depth) return;
+        if (count >= MAX_DIR_COLLECT) return;
+        DIR *d = opendir(current);
+        if (!d) return;
+        struct dirent *de;
+        while ((de = readdir(d)) != NULL) {
+            if (count >= MAX_DIR_COLLECT) break;
+            if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) continue;
+            char full[1024];
+            if (snprintf(full, sizeof(full), "%s/%s", current, de->d_name) >= (int)sizeof(full)) continue;
+            struct stat st;
+            if (stat(full, &st) == 0 && S_ISDIR(st.st_mode)) {
+                add_dir(full);
+                recurse(full, depth + 1);
+            }
+        }
+        closedir(d);
+    }
+
+    recurse(base, 0);
+    *out_n = count;
+    return list;
+}
+
+static char **get_fuzzy_matches(const char *dir, const char *pat, int max, int *out_n, int recursive, int executable_only, int search_directories) {
+    if (search_directories) {
+        // Try with max depth 6 first
+        int ndirs = 0; char **dirs = collect_dir_paths(dir, 6, &ndirs);
+        struct match_item *matches = malloc(sizeof(struct match_item) * ndirs);
+        int mc = 0;
+        for (int i = 0; i < ndirs; i++) {
+            int sc = -1;
+            if (!pat || !*pat) {
+                sc = 0; /* empty pattern matches everything */
+            } else {
+                const char *cmp;
+                if (strchr(pat, '/')) cmp = dirs[i];
+                else { const char *p = strrchr(dirs[i], '/'); cmp = p ? p+1 : dirs[i]; }
+                if (strncasecmp(cmp, pat, strlen(pat)) == 0) {
+                    sc = 10000 - (int)strlen(dirs[i]);
+                }
+            }
+            if (sc >= 0) {
+                matches[mc].name = dirs[i]; matches[mc].score = sc; mc++;
+                dirs[i] = NULL;
+            }
+        }
+        for (int i = 0; i < ndirs; i++) if (dirs[i]) free(dirs[i]); free(dirs);
+        if (mc == 0) {
+            // No matches at depth 6, try depth 10
+            ndirs = 0; dirs = collect_dir_paths(dir, 10, &ndirs);
+            matches = realloc(matches, sizeof(struct match_item) * ndirs);
+            mc = 0;
+            for (int i = 0; i < ndirs; i++) {
+                int sc = -1;
+                if (!pat || !*pat) {
+                    sc = 0;
+                } else {
+                    const char *cmp;
+                    if (strchr(pat, '/')) cmp = dirs[i];
+                    else { const char *p = strrchr(dirs[i], '/'); cmp = p ? p+1 : dirs[i]; }
+                    if (strncasecmp(cmp, pat, strlen(pat)) == 0) {
+                        sc = 10000 - (int)strlen(dirs[i]);
+                    }
+                }
+                if (sc >= 0) {
+                    matches[mc].name = dirs[i]; matches[mc].score = sc; mc++;
+                    dirs[i] = NULL;
+                }
+            }
+            for (int i = 0; i < ndirs; i++) if (dirs[i]) free(dirs[i]); free(dirs);
+        }
+        if (mc == 0) { free(matches); if (out_n) *out_n = 0; return NULL; }
+        qsort(matches, mc, sizeof(struct match_item), match_cmp);
+        int ret_n = (mc < max) ? mc : max;
+        char **ret = malloc(sizeof(char*) * ret_n);
+        for (int i = 0; i < ret_n; i++) ret[i] = strdup(matches[i].name);
+        for (int i = 0; i < mc; i++) free(matches[i].name);
+        free(matches);
+        if (out_n) *out_n = ret_n; return ret;
+    } else {
+        int n = 0; char **entries = recursive ? recursive_dir_entries(dir, &n) : dir_entries(dir, &n);
+        if (!entries || n == 0) { if (out_n) *out_n = 0; if (entries) free(entries); return NULL; }
+        struct match_item *matches = malloc(sizeof(struct match_item) * n);
+        int mc = 0;
+        for (int i = 0; i < n; i++) {
+            if (executable_only) {
+                char fullpath[1024];
+                if (snprintf(fullpath, sizeof(fullpath), "%s/%s", dir, entries[i]) >= (int)sizeof(fullpath)) continue;
+                if (access(fullpath, X_OK) != 0) continue;
+            }
+            int sc = fuzzy_score(entries[i], pat);
+            if (sc >= 0) {
+                matches[mc].name = entries[i]; matches[mc].score = sc; mc++;
+                entries[i] = NULL;
+            }
+        }
+        for (int i = 0; i < n; i++) if (entries[i]) free(entries[i]); free(entries);
+        if (mc == 0) { free(matches); if (out_n) *out_n = 0; return NULL; }
+        qsort(matches, mc, sizeof(struct match_item), match_cmp);
+        int ret_n = (mc < max) ? mc : max;
+        char **ret = malloc(sizeof(char*) * ret_n);
+        for (int i = 0; i < ret_n; i++) ret[i] = strdup(matches[i].name);
+        for (int i = 0; i < mc; i++) free(matches[i].name);
+        free(matches);
+        if (out_n) *out_n = ret_n; return ret;
+    }
 }
 
 static void free_matches(char **m, int n) { if (!m) return; for (int i = 0; i < n; i++) free(m[i]); free(m); }
@@ -3246,7 +3368,14 @@ static void update_suggestions_from_command(void) {
                 char pat[512] = {0}; int plen = 0;
                 if (pos < E.command_len) { plen = E.command_len - pos; if (plen > (int)sizeof(pat)-1) plen = (int)sizeof(pat)-1; memcpy(pat, &E.command_buf[pos], plen); pat[plen] = '\0'; }
                 int n = 0;
-                char **matches = get_fuzzy_matches(".", pat, SuggestionMax, &n, 0, 0);
+                char **matches;
+                if (pat[0] == '/') {
+                    // directory search from root
+                    char *new_pat = pat + 1;
+                    matches = get_fuzzy_matches("/", new_pat, SuggestionMax, &n, 1, 0, 1);
+                } else {
+                    matches = get_fuzzy_matches(".", pat, SuggestionMax, &n, 0, 0, 0);
+                }
                 if (n > 0) {
                     ActiveMatches = matches; ActiveMatchesN = n; ActiveMatchSel = 0; ActiveFilenameStart = pos; SuggestionsVisible = 1; return;
                 } else {
@@ -3281,7 +3410,7 @@ static void update_suggestions_from_command(void) {
             if (pos < E.command_len) { plen = E.command_len - pos; if (plen > (int)sizeof(pat)-1) plen = (int)sizeof(pat)-1; memcpy(pat, &E.command_buf[pos], plen); pat[plen] = '\0'; }
             CurrentSearchDir = ".";
             int n = 0;
-            char **matches = get_fuzzy_matches(".", pat, SuggestionMax, &n, 0, 1);
+            char **matches = get_fuzzy_matches(".", pat, SuggestionMax, &n, 0, 1, 0);
             if (n > 0) {
                 ActiveMatches = matches; ActiveMatchesN = n; ActiveMatchSel = 0; ActiveFilenameStart = pos; SuggestionsVisible = 1; return;
             } else {
@@ -3298,7 +3427,7 @@ static void update_suggestions_from_command(void) {
             if (pos < E.command_len) { plen = E.command_len - pos; if (plen > (int)sizeof(pat)-1) plen = (int)sizeof(pat)-1; memcpy(pat, &E.command_buf[pos], plen); pat[plen] = '\0'; }
             CurrentSearchDir = ".";
             int n = 0;
-            char **matches = get_fuzzy_matches(".", pat, SuggestionMax, &n, 0, 1);
+            char **matches = get_fuzzy_matches(".", pat, SuggestionMax, &n, 0, 1, 0);
             if (n > 0) {
                 ActiveMatches = matches; ActiveMatchesN = n; ActiveMatchSel = 0; ActiveFilenameStart = pos; SuggestionsVisible = 1; return;
             } else {
@@ -3416,6 +3545,71 @@ static void accept_active_suggestion(void) {
         int addlen = (int)strlen(ActiveMatches[sel]);
         int pre = ActiveFilenameStart;
         int newlen = pre + addlen;
+        /* detect if this match is a directory; build full path if necessary */
+        char selpath[1024]; selpath[0] = '\0';
+        const char *mname = ActiveMatches[sel];
+        if (!mname) { clear_active_suggestions(); return; }
+        if (mname[0] == '/') {
+            strncpy(selpath, mname, sizeof(selpath)-1);
+        } else {
+            /* use CurrentSearchDir if set, otherwise treat as relative */
+            const char *base = CurrentSearchDir && *CurrentSearchDir ? CurrentSearchDir : ".";
+            if (snprintf(selpath, sizeof(selpath), "%s/%s", base, mname) >= (int)sizeof(selpath)) selpath[0] = '\0';
+        }
+        struct stat st; int is_dir = 0;
+        if (selpath[0] && stat(selpath, &st) == 0 && S_ISDIR(st.st_mode)) is_dir = 1;
+        if (is_dir) {
+            /* show same directory prompt as file browser */
+            char tmpn[512]; strncpy(tmpn, selpath, sizeof(tmpn)-1); tmpn[sizeof(tmpn)-1] = '\0';
+            /* strip trailing slash for display if present */
+            size_t tlen = strlen(tmpn); if (tlen > 0 && tmpn[tlen-1] == '/') tmpn[tlen-1] = '\0';
+            char __tmpbuf[256]; int __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
+            if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
+            int pn = snprintf(__tmpbuf, sizeof(__tmpbuf), "Directory '%s': \x1b[92m(o) Open\x1b[0m / \x1b[91m(d) Delete\x1b[0m / \x1b[94m(g) Change Directory\x1b[0m / \x1b[93m(c) Cancel\x1b[0m: ", tmpn);
+            if (pn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)pn);
+            int dresp = 0;
+            while (1) {
+                int kk = readKey(); if (kk == -1) continue;
+                if (kk == 'o' || kk == 'O' || kk == '\r' || kk == '\n') { dresp = 'o'; break; }
+                if (kk == 'd' || kk == 'D') { dresp = 'd'; break; }
+                if (kk == 'g' || kk == 'G') { dresp = 'g'; break; }
+                if (kk == 'c' || kk == 'C' || kk == 27) { dresp = 'c'; break; }
+            }
+            __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
+            if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
+            clear_active_suggestions();
+            /* apply choice rules */
+            if (dresp == 'c') { snprintf(E.msg, sizeof(E.msg), "Cancelled"); E.msg_time = time(NULL); E.command_len = 0; E.command_buf[0] = '\0'; return; }
+            if (dresp == 'o') {
+                if (chdir(selpath) == 0) {
+                    show_file_browser();
+                } else {
+                    snprintf(E.msg, sizeof(E.msg), "Chdir failed: %s", strerror(errno)); E.msg_time = time(NULL);
+                }
+                E.command_len = 0; E.command_buf[0] = '\0'; return;
+            }
+            if (dresp == 'g') {
+                if (chdir(selpath) == 0) {
+                    char newcwd[512]; getcwd(newcwd, sizeof(newcwd)); snprintf(E.msg, sizeof(E.msg), "Changed directory to %s", newcwd); E.msg_time = time(NULL);
+                } else {
+                    snprintf(E.msg, sizeof(E.msg), "Chdir failed: %s", strerror(errno)); E.msg_time = time(NULL);
+                }
+                E.command_len = 0; E.command_buf[0] = '\0'; return;
+            }
+            if (dresp == 'd') {
+                /* confirm delete */
+                char __tmp2[256]; int __n2 = snprintf(__tmp2, sizeof(__tmp2), "\x1b[%d;1H\x1b[K", E.screenrows);
+                if (__n2 > 0) write(STDOUT_FILENO, __tmp2, (size_t)__n2);
+                int pn2 = snprintf(__tmp2, sizeof(__tmp2), "\x1b[93mDelete directory '%s'?\x1b[0m \x1b[92m(y)\x1b[0m\x1b[91m(N)\x1b[0m: ", tmpn);
+                if (pn2 > 0) write(STDOUT_FILENO, __tmp2, (size_t)pn2);
+                int y = 0; while (1) { int k2 = readKey(); if (k2 == -1) continue; if (k2=='y'||k2=='Y') { y = 1; break; } if (k2=='n'||k2=='N'||k2==27) { y = 0; break; } }
+                __n2 = snprintf(__tmp2, sizeof(__tmp2), "\x1b[%d;1H\x1b[K", E.screenrows); if (__n2>0) write(STDOUT_FILENO, __tmp2, (size_t)__n2);
+                if (!y) { snprintf(E.msg, sizeof(E.msg), "Delete cancelled"); E.msg_time = time(NULL); E.command_len = 0; E.command_buf[0] = '\0'; return; }
+                if (rmdir(selpath) == 0) snprintf(E.msg, sizeof(E.msg), "Deleted directory %s", tmpn); else snprintf(E.msg, sizeof(E.msg), "rmdir failed: %s", strerror(errno));
+                E.msg_time = time(NULL); E.command_len = 0; E.command_buf[0] = '\0'; return;
+            }
+        }
+        /* not a directory: insert into command buffer as before */
         if (newlen + 1 < (int)sizeof(E.command_buf)) {
             memcpy(&E.command_buf[pre], ActiveMatches[sel], addlen);
             E.command_len = newlen; E.command_buf[E.command_len] = '\0';
@@ -5762,7 +5956,7 @@ static void editorProcessKeypress(void) {
                         // build pattern from pos to end
                         char pat[512] = {0}; int plen = 0;
                         if (pos < E.command_len) { plen = E.command_len - pos; if (plen > (int)sizeof(pat)-1) plen = (int)sizeof(pat)-1; memcpy(pat, &E.command_buf[pos], plen); pat[plen] = '\0'; }
-                        int n = 0; int max_sugg = 8; char **matches = get_fuzzy_matches(".", pat, max_sugg, &n, 0, 0);
+                        int n = 0; int max_sugg = 8; char **matches = get_fuzzy_matches(".", pat, max_sugg, &n, 0, 0, 0);
                         if (n > 0) {
                             int picked = pick_from_matches(matches, n);
                             if (picked >= 0 && picked < n) {
