@@ -494,6 +494,110 @@ static void run_embedded_terminal(void) {
     snprintf(E.msg, sizeof(E.msg), "Returned from embedded terminal"); E.msg_time = time(NULL);
 }
 
+// Run a command in a PTY, capturing output to logfile and pane, allowing interactive input
+static int run_command_in_pty(const char *shell_cmd, FILE *out) {
+    // temporarily disable raw mode to allow normal terminal behavior
+    disableRawMode();
+
+    // clear the screen before running the command to avoid leftover text
+    write(STDOUT_FILENO, "\x1b[2J\x1b[H", 7);
+
+    int masterfd;
+    pid_t pid = forkpty(&masterfd, NULL, NULL, NULL);
+    if (pid == -1) {
+        enableRawMode();
+        return -1;
+    }
+    if (pid == 0) {
+        // child: execute the command
+        execlp("/bin/sh", "sh", "-c", shell_cmd, (char *)NULL);
+        _exit(127);
+    }
+
+    // parent: mirror window size to pty
+    struct winsize ws;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) ioctl(masterfd, TIOCSWINSZ, &ws);
+
+    // set masterfd non-blocking
+    int flags_master = fcntl(masterfd, F_GETFL, 0);
+    fcntl(masterfd, F_SETFL, flags_master | O_NONBLOCK);
+    // set stdin blocking
+    int flags_stdin = fcntl(STDIN_FILENO, F_GETFL, 0);
+    fcntl(STDIN_FILENO, F_SETFL, flags_stdin & ~O_NONBLOCK);
+
+    char buf[1024];
+    char output_buf[4096];
+    int buf_pos = 0;
+    int child_exited = 0;
+    int exitcode = 0;
+
+    while (!child_exited) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(masterfd, &rfds);
+        FD_SET(STDIN_FILENO, &rfds);
+        int maxfd = (masterfd > STDIN_FILENO) ? masterfd : STDIN_FILENO;
+        int rv = select(maxfd + 1, &rfds, NULL, NULL, NULL);
+        if (rv < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (FD_ISSET(masterfd, &rfds)) {
+            ssize_t r = read(masterfd, buf, sizeof(buf));
+            if (r > 0) {
+                // write to terminal
+                write(STDOUT_FILENO, buf, (size_t)r);
+                // write to log
+                fwrite(buf, 1, (size_t)r, out);
+                fflush(out);
+                // buffer for pane
+                for (ssize_t i = 0; i < r; i++) {
+                    if (buf[i] == '\n' || buf_pos >= (int)sizeof(output_buf) - 1) {
+                        output_buf[buf_pos] = '\0';
+                        output_append_colored_line(output_buf);
+                        buf_pos = 0;
+                    } else {
+                        output_buf[buf_pos++] = buf[i];
+                    }
+                }
+            } else if (r == 0) {
+                child_exited = 1;
+            }
+        }
+        if (FD_ISSET(STDIN_FILENO, &rfds)) {
+            ssize_t r = read(STDIN_FILENO, buf, sizeof(buf));
+            if (r > 0) {
+                write(masterfd, buf, (size_t)r);
+            } else if (r == 0) {
+                close(masterfd);
+                child_exited = 1;
+            }
+        }
+        // check if child exited
+        int st;
+        pid_t w = waitpid(pid, &st, WNOHANG);
+        if (w == pid) {
+            exitcode = WEXITSTATUS(st);
+            child_exited = 1;
+        }
+    }
+
+    // flush any remaining output
+    if (buf_pos > 0) {
+        output_buf[buf_pos] = '\0';
+        output_append_colored_line(output_buf);
+    }
+
+    // ensure child is reaped
+    waitpid(pid, NULL, 0);
+
+    // restore editor raw mode and redraw
+    enableRawMode();
+    editorRefreshScreen();
+
+    return exitcode;
+}
+
 static int __raw_inited = 0;
 
 static void disableRawMode(void) {
@@ -1387,18 +1491,15 @@ static int execute_command(const char *cmd) {
         // remove any existing log file so we create a fresh file/inode for this run
         (void)unlink("config/last_build.log");
         // write output to config/last_build.log and open it
-        FILE *out = fopen("config/last_build.log", "w");
+        FILE *out = fopen("config/last_build.log", "a");
         if (out) {
             // clear any previous in-editor output so the pane only reflects this run
             output_clear();
             // add a timestamp header to the log and the pane so it's clear this run's output
             time_t _t = time(NULL); struct tm *_tm = localtime(&_t); char _th[128]; if (_tm) strftime(_th, sizeof(_th), "=== Run at %Y-%m-%d %H:%M:%S ===", _tm); else snprintf(_th, sizeof(_th), "=== Run started ==="); fputs(_th, out); fputs("\n", out); output_append_colored_line(_th);
-            // use popen to capture output
-            char pcmd[1024]; snprintf(pcmd, sizeof(pcmd), "%s 2>&1", shell);
-            FILE *p = popen(pcmd, "r");
-            if (p) {
-                char line[1024]; while (fgets(line, sizeof(line), p)) { fputs(line, out); fflush(out); output_append_colored_line(line); }
-                int st = pclose(p);
+            // use PTY to run command interactively
+            int exitcode = run_command_in_pty(shell, out);
+            if (exitcode != -1) {
                 if (out) { fflush(out); fsync(fileno(out)); }
                 if (out) fclose(out);
                 // force reload of on-disk log when rendering
@@ -1406,7 +1507,6 @@ static int execute_command(const char *cmd) {
                 // show output pane in-editor (and keep log file too)
                 E.output_visible = 1; if (E.output_n > 0) { E.output_scroll = 0; E.output_sel = 0; }
                 editorRefreshScreen();
-                int exitcode = WEXITSTATUS(st);
                 snprintf(E.msg, sizeof(E.msg), "Command finished (exit %d)", exitcode); E.msg_time = time(NULL);
                 return exitcode;
             } else {
@@ -4151,7 +4251,12 @@ static void output_load_last_log(void) {
     }
     fclose(f);
     E.output_last_mtime = st.st_mtime;
+    // auto-select the first error line (if any), otherwise default to top
     E.output_scroll = 0; E.output_sel = 0;
+    for (int idx = 0; idx < E.output_n; idx++) {
+        char pth[512]; int ln = 0, cn = 0;
+        if (parse_error_location(E.output_raw_lines[idx], pth, sizeof(pth), &ln, &cn)) { E.output_sel = idx; E.output_scroll = idx; break; }
+    }
 }
 
 // Append a raw (uncolored) line to the on-disk log, flush and fsync so it's durable
@@ -4167,6 +4272,35 @@ static void output_write_raw_to_log(const char *line) {
 
 // crude parser: find first substring of the form PATH:LINE[:COL]
 // returns 1 and fills path/lineno/col if found
+/* Strip ANSI escape sequences and other control characters from a string into a buffer.
+   Returns the number of characters written (not including terminating NUL). */
+static int strip_ansi(const char *in, char *out, int outlen) {
+    if (!in || !out || outlen <= 0) return 0;
+    int oi = 0; const unsigned char *p = (const unsigned char*)in;
+    while (*p && oi < outlen - 1) {
+        if (*p == 0x1b) {
+            // skip ANSI CSI sequences: ESC '[' ... alpha
+            p++;
+            if (*p == '[') {
+                p++;
+                while (*p && oi < outlen - 1) {
+                    if ((*p >= '@' && *p <= '~')) { p++; break; }
+                    p++;
+                }
+                continue;
+            }
+            // skip other ESC sequences roughly
+            while (*p && *p != 'm' && *p != '[' && oi < outlen - 1) p++;
+            if (*p) p++;
+            continue;
+        }
+        // drop control characters (except tab and space)
+        if (*p < 32 && *p != '\t' && *p != '\n') { p++; continue; }
+        out[oi++] = (char)*p++;
+    }
+    out[oi] = '\0'; return oi;
+}
+
 static int parse_error_location(const char *line, char *path, int pathlen, int *lineno, int *colno) {
     if (!line || !path || !lineno) return 0;
     const char *p = line;
@@ -4181,12 +4315,25 @@ static int parse_error_location(const char *line, char *path, int pathlen, int *
         if (plen <= 0 || plen >= pathlen) { p = c + 1; continue; }
         // copy path candidate
         char cand[512]; int cp = plen < (int)sizeof(cand)-1 ? plen : (int)sizeof(cand)-1; memcpy(cand, s, cp); cand[cp] = '\0';
+        // sanitize candidate: strip ANSI/control chars and trim whitespace
+        char tmpcand[512]; strip_ansi(cand, tmpcand, sizeof(tmpcand));
+        char *tc = tmpcand; while (*tc && (unsigned char)*tc <= 32) tc++;
+        size_t tl = strlen(tc); while (tl > 0 && (unsigned char)tc[tl-1] <= 32) tc[--tl] = '\0';
+        // move cleaned string back into cand for existing checks
+        if (tc != tmpcand) memmove(cand, tc, tl + 1); else strncpy(cand, tmpcand, sizeof(cand)-1), cand[sizeof(cand)-1] = '\0';
         // parse number after ':'
         int ln = 0; int col = 0; int consumed = 0;
         if (sscanf(c + 1, "%d%n", &ln, &consumed) != 1) { p = c + 1; continue; }
         const char *after = c + 1 + consumed;
         if (*after == ':') {
             int cc = 0; int cons2 = 0; if (sscanf(after + 1, "%d%n", &cc, &cons2) == 1) { col = cc; after = after + 1 + cons2; }
+        }
+        // If current buffer was the one built/selected, prefer it when basenames match
+        if (E.filename && E.filename[0]) {
+            char *bn = strrchr(E.filename, '/'); const char *efn = bn ? bn + 1 : E.filename;
+            if (strcmp(efn, cand) == 0 || strcmp(E.filename, cand) == 0) {
+                strncpy(path, E.filename, pathlen-1); path[pathlen-1] = '\0'; *lineno = ln; if (colno) *colno = col; return 1;
+            }
         }
         // verify the path exists (attempt) — try as-is and also try relative path (same dir)
         if (access(cand, R_OK) == 0) { strncpy(path, cand, pathlen-1); path[pathlen-1] = '\0'; *lineno = ln; if (colno) *colno = col; return 1; }
@@ -4401,6 +4548,9 @@ static void run_interactive(const char *fname) {
 }
 
 static void handle_build_run(int do_run_after) {
+    // ensure a fresh log file for build/run operations
+    (void)unlink("config/last_build.log");
+
     char path[256] = {0}; BuildSystem bs = detect_build_system(path, sizeof(path));
     if (bs != BS_NONE) {
         // prompt to edit build file
