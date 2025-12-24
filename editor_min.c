@@ -205,6 +205,8 @@ struct Editor {
     int output_scroll;        // top line index shown
     int output_sel;           // selected line index
     time_t output_last_mtime; // mtime of last loaded config/last_build.log
+    int output_mode;          // 0=generic, 1=man page
+    char output_man_topic[256]; // topic name when viewing a man page
 
 
     // history snapshots
@@ -1606,10 +1608,12 @@ static int execute_command(const char *cmd) {
         const char *shell = shell_cmd;
         // ensure config directory exists (best-effort)
         mkdir("config", 0755);
+        // determine log file: use separate file for man pages to avoid mixing with build logs
+        const char *log_path = (strncmp(shell_cmd, "man ", 4) == 0) ? "config/last_man.log" : "config/last_build.log";
         // remove any existing log file so we create a fresh file/inode for this run
-        (void)unlink("config/last_build.log");
-        // write output to config/last_build.log and open it
-        FILE *out = fopen("config/last_build.log", "a");
+        (void)unlink(log_path);
+        // write output to log file and open it
+        FILE *out = fopen(log_path, "a");
         if (out) {
             // clear any previous in-editor output so the pane only reflects this run
             output_clear();
@@ -1624,6 +1628,8 @@ static int execute_command(const char *cmd) {
                 E.output_last_mtime = 0;
                 // show output pane in-editor (and keep log file too)
                 E.output_visible = 1; if (E.output_n > 0) { E.output_scroll = 0; E.output_sel = 0; }
+                // set output mode: man if man command, else generic
+                if (strncmp(shell_cmd, "man ", 4) != 0) E.output_mode = 0;
                 editorRefreshScreen();
                 snprintf(E.msg, sizeof(E.msg), "Command finished (exit %d)", exitcode); E.msg_time = time(NULL);
                 return exitcode;
@@ -1927,6 +1933,22 @@ static int execute_command(const char *cmd) {
             // Create a new tab with the file without modifying the current buffer
             open_file_in_new_tab(fname);
             snprintf(E.msg, sizeof(E.msg), "opent: opened %s", fname); E.msg_time = time(NULL);
+            continue;
+        }
+
+        // man <topic> -> fetch man page and open it in a new tab
+        if (i + 2 < L && strncmp(&cmd[i], "man", 3) == 0) {
+            char next = (i + 3 < L) ? cmd[i+3] : '\0';
+            if (!(next == '\0' || next == ' ')) { i++; continue; }
+            i += 3; while (i < L && cmd[i] == ' ') i++;
+            int start = i; while (i < L && cmd[i] != ' ') i++; int tlen = i - start;
+            if (tlen <= 0) { snprintf(E.msg, sizeof(E.msg), "man: topic required"); E.msg_time = time(NULL); continue; }
+            char topic[256]; int sl = (tlen < (int)sizeof(topic)-1) ? tlen : (int)sizeof(topic)-1; memcpy(topic, &cmd[start], sl); topic[sl] = '\0';
+            // Run man through the PTY runner so output appears in the output pane
+            char runshim[512]; snprintf(runshim, sizeof(runshim), "__run_shell__:man %s | col -b", topic);
+            // mark output pane as a man page view so Tab/Enter behave accordingly
+            E.output_mode = 1; strncpy(E.output_man_topic, topic, sizeof(E.output_man_topic)-1); E.output_man_topic[sizeof(E.output_man_topic)-1] = '\0';
+            execute_command(runshim);
             continue;
         }
 
@@ -4046,6 +4068,54 @@ static void open_file_in_new_tab(const char *fname) {
     if (idx >= 0) switch_to_tab(idx);
 }
 
+// Fetch a man page for `topic` as plain text (runs `man topic | col -b`).
+// Returns an allocated string (caller must free) or NULL on error.
+static char *get_man_page_text(const char *topic) {
+    if (!topic || !*topic) return NULL;
+    char cmd[1024];
+    snprintf(cmd, sizeof(cmd), "man %s | col -b", topic);
+    FILE *fp = popen(cmd, "r");
+    if (!fp) return NULL;
+    size_t cap = 4096; size_t len = 0;
+    char *buf = malloc(cap);
+    if (!buf) { pclose(fp); return NULL; }
+    buf[0] = '\0';
+    char tmp[1024];
+    while (fgets(tmp, sizeof(tmp), fp)) {
+        size_t tlen = strlen(tmp);
+        if (len + tlen + 1 >= cap) {
+            size_t ncap = cap * 2;
+            while (len + tlen + 1 >= ncap) ncap *= 2;
+            char *n = realloc(buf, ncap);
+            if (!n) { free(buf); pclose(fp); return NULL; }
+            buf = n; cap = ncap;
+        }
+        memcpy(buf + len, tmp, tlen);
+        len += tlen; buf[len] = '\0';
+    }
+    pclose(fp);
+    return buf;
+}
+
+// Open a man page into a new tab (topic is the man name). If fetching fails,
+// show an error message instead.
+void open_man_in_new_tab(const char *topic) {
+    if (!topic || !*topic) { snprintf(E.msg, sizeof(E.msg), "man: topic required"); E.msg_time = time(NULL); return; }
+    char *text = get_man_page_text(topic);
+    if (!text) { snprintf(E.msg, sizeof(E.msg), "man: cannot fetch %s", topic); E.msg_time = time(NULL); return; }
+    struct Tab t = {0};
+    // name shown in tab bar
+    char nbuf[256]; snprintf(nbuf, sizeof(nbuf), "man:%s", topic);
+    t.name = strdup(nbuf);
+    t.snapshot = strdup(text);
+    t.saved_snapshot = NULL;
+    t.cx = 0; t.cy = 0; t.row_offset = 0; t.col_offset = 0;
+    free(text);
+    int idx = append_tab(t);
+    if (idx >= 0) switch_to_tab(idx);
+    else { free_tab(&t); snprintf(E.msg, sizeof(E.msg), "man: cannot allocate tab"); E.msg_time = time(NULL); }
+}
+
 // detect available build system in CWD
 typedef enum { BS_NONE=0, BS_MAKE=1, BS_CMAKE=2, BS_CARGO=3 } BuildSystem;
 static BuildSystem detect_build_system(char *outpath, int outpath_len) {
@@ -4256,7 +4326,7 @@ static void output_clear(void) {
 // simple colorization for display only (log file remains raw)
 static char *colorize_line_for_display(const char *line) {
     if (!line) return NULL;
-    const char *RED = "\x1b[31m"; const char *YEL = "\x1b[33m"; const char *MAG = "\x1b[35m"; const char *RESET = "\x1b[0m";
+    const char *RED = "\x1b[31m"; const char *YEL = "\x1b[33m"; const char *MAG = "\x1b[35m"; const char *CYAN = "\x1b[36m"; const char *RESET = "\x1b[0m";
     // prefer case-insensitive search if available
     if (strcasestr(line, "error:")) {
         size_t n = strlen(line) + 32; char *buf = malloc(n); if (!buf) return strdup(line); snprintf(buf, n, "%s%s%s", RED, line, RESET); return buf;
@@ -4264,6 +4334,19 @@ static char *colorize_line_for_display(const char *line) {
         size_t n = strlen(line) + 32; char *buf = malloc(n); if (!buf) return strdup(line); snprintf(buf, n, "%s%s%s", YEL, line, RESET); return buf;
     } else if (strstr(line, "Run skipped:")) {
         size_t n = strlen(line) + 32; char *buf = malloc(n); if (!buf) return strdup(line); snprintf(buf, n, "%s%s%s", MAG, line, RESET); return buf;
+    }
+    // for man pages, color section headers (short all-uppercase lines)
+    if (E.output_mode == 1) {
+        size_t len = strlen(line);
+        if (len > 0 && len < 20) {
+            int all_upper = 1;
+            for (size_t i = 0; i < len; i++) {
+                if (!isupper((unsigned char)line[i]) && !isspace((unsigned char)line[i])) { all_upper = 0; break; }
+            }
+            if (all_upper) {
+                size_t n = len + 32; char *buf = malloc(n); if (!buf) return strdup(line); snprintf(buf, n, "%s%s%s", CYAN, line, RESET); return buf;
+            }
+        }
     }
     return strdup(line);
 }
@@ -4295,9 +4378,9 @@ static void output_append_colored_line(const char *rawline) {
     }
 }
 
-// Load `config/last_build.log` into the in-memory output pane if it changed.
+// Load the appropriate log file into the in-memory output pane if it changed.
 static void output_load_last_log(void) {
-    const char *path = "config/last_build.log";
+    const char *path = (E.output_mode == 1) ? "config/last_man.log" : "config/last_build.log";
     struct stat st;
     if (stat(path, &st) != 0) return; // no file
     if (E.output_last_mtime != 0 && E.output_last_mtime == st.st_mtime && E.output_n > 0) return; // no change
@@ -4361,6 +4444,29 @@ static int strip_ansi(const char *in, char *out, int outlen) {
 
 static int parse_error_location(const char *line, char *path, int pathlen, int *lineno, int *colno) {
     if (!line || !path || !lineno) return 0;
+    // check for Python format: File "path", line lineno
+    if (strstr(line, "File \"") == line) {
+        const char *quote1 = strchr(line, '"');
+        if (quote1) {
+            const char *quote2 = strchr(quote1 + 1, '"');
+            if (quote2) {
+                int plen = (int)(quote2 - quote1 - 1);
+                if (plen > 0 && plen < pathlen) {
+                    memcpy(path, quote1 + 1, plen);
+                    path[plen] = '\0';
+                    const char *line_str = strstr(quote2, ", line ");
+                    if (line_str) {
+                        int ln;
+                        if (sscanf(line_str + 7, "%d", &ln) == 1) {
+                            *lineno = ln;
+                            if (colno) *colno = 0;
+                            return 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
     const char *p = line;
     while (*p) {
         // look for ':' then digits
@@ -4419,6 +4525,24 @@ static int parse_error_location(const char *line, char *path, int pathlen, int *
         p = c + 1;
     }
     return 0;
+}
+
+// Heuristic: detect man page section headers like "NAME", "SYNOPSIS", "DESCRIPTION", "SEE ALSO".
+static int is_man_header(const char *line) {
+    if (!line) return 0;
+    // trim
+    const char *s = line; while (*s && (unsigned char)*s <= 32) s++;
+    int len = (int)strlen(s);
+    while (len > 0 && (unsigned char)s[len-1] <= 32) len--;
+    if (len <= 0 || len > 80) return 0;
+    int has_alpha = 0; int bad = 0;
+    for (int i = 0; i < len; i++) {
+        unsigned char c = (unsigned char)s[i];
+        if (isalpha(c)) { if (!isupper(c)) { bad = 1; break; } has_alpha = 1; }
+        else if (c == ' ' || c == '-' || c == '/' || c == '(' || c == ')' || isdigit(c) || c == '.' || c == ',') continue;
+        else { bad = 1; break; }
+    }
+    return (!bad && has_alpha);
 }
 
 // interactive setup for projects without a detected build system
@@ -5927,9 +6051,14 @@ static void editorRefreshScreen(void) {
             if (cn>0) write(STDOUT_FILENO, clr, (size_t)cn);
             if (i == E.output_sel) write(STDOUT_FILENO, "\x1b[m", 3);
         }
-        // footer with instructions
-        int fn = snprintf(buf, sizeof(buf), "\x1b[%d;1H\x1b[1;91m(q/ESC)\x1b[0m \x1b[1;96mclose\x1b[0m | \x1b[1;92mEnter\x1b[0m \x1b[1;96m: jump to file/line\x1b[0m | \x1b[1;94mTab\x1b[0m \x1b[1;96m: cycle errors\x1b[0m | \x1b[1;93mPgUp/PgDn\x1b[0m \x1b[1;96m: scroll\x1b[m", E.screenrows);
-        if (fn>0) write(STDOUT_FILENO, buf, (size_t)fn);
+        // footer with instructions (context-sensitive for man pages)
+        if (E.output_mode == 1) {
+            int fn = snprintf(buf, sizeof(buf), "\x1b[%d;1H\x1b[1;91m(q/ESC)\x1b[0m \x1b[1;96mclose\x1b[0m | \x1b[1;92mEnter\x1b[0m \x1b[1;96m: open man reference\x1b[0m | \x1b[1;94mTab\x1b[0m \x1b[1;96m: cycle sections\x1b[0m | \x1b[1;93mPgUp/PgDn\x1b[0m \x1b[1;96m: scroll\x1b[m", E.screenrows);
+            if (fn>0) write(STDOUT_FILENO, buf, (size_t)fn);
+        } else {
+            int fn = snprintf(buf, sizeof(buf), "\x1b[%d;1H\x1b[1;91m(q/ESC)\x1b[0m \x1b[1;96mclose\x1b[0m | \x1b[1;92mEnter\x1b[0m \x1b[1;96m: jump to file/line\x1b[0m | \x1b[1;94mTab\x1b[0m \x1b[1;96m: cycle errors\x1b[0m | \x1b[1;93mPgUp/PgDn\x1b[0m \x1b[1;96m: scroll\x1b[m", E.screenrows);
+            if (fn>0) write(STDOUT_FILENO, buf, (size_t)fn);
+        }
         return;
     }
 
@@ -6216,31 +6345,64 @@ static void editorProcessKeypress(void) {
         if (c == ARROW_UP) { if (E.output_sel > 0) { E.output_sel--; if (E.output_sel < E.output_scroll) E.output_scroll--; } return; }
         if (c == PAGE_DOWN) { E.output_scroll += pageSize; if (E.output_scroll > (E.output_n - pageSize)) E.output_scroll = (E.output_n > pageSize) ? (E.output_n - pageSize) : 0; if (E.output_sel < E.output_scroll) E.output_sel = E.output_scroll; return; }
         if (c == PAGE_UP) { E.output_scroll -= pageSize; if (E.output_scroll < 0) E.output_scroll = 0; if (E.output_sel > E.output_scroll + pageSize - 1) E.output_sel = E.output_scroll + pageSize - 1; return; }
-        if (c == '\t') { // Tab: cycle to next error
-            int start = E.output_sel + 1;
-            if (start >= E.output_n) start = 0; // wrap around
-            int found = 0;
-            for (int i = 0; i < E.output_n; i++) {
-                int idx = (start + i) % E.output_n;
-                char path[512]; int lineno = 0, colno = 0;
-                if (parse_error_location(E.output_raw_lines[idx], path, sizeof(path), &lineno, &colno)) {
-                    E.output_sel = idx;
-                    found = 1;
-                    break;
+        if (c == '\t') {
+            if (E.output_mode == 1) {
+                // man page: cycle to next header/section
+                int start = E.output_sel + 1; if (start >= E.output_n) start = 0;
+                int found = 0;
+                for (int i = 0; i < E.output_n; i++) {
+                    int idx = (start + i) % E.output_n;
+                    if (is_man_header(E.output_raw_lines[idx])) { E.output_sel = idx; found = 1; break; }
                 }
+                if (!found && E.output_n > 0) E.output_sel = 0;
+                if (E.output_sel < E.output_scroll) E.output_scroll = E.output_sel;
+                else if (E.output_sel >= E.output_scroll + pageSize) E.output_scroll = E.output_sel - pageSize + 1;
+                return;
+            } else {
+                // Tab: cycle to next error
+                int start = E.output_sel + 1;
+                if (start >= E.output_n) start = 0; // wrap around
+                int found = 0;
+                for (int i = 0; i < E.output_n; i++) {
+                    int idx = (start + i) % E.output_n;
+                    char path[512]; int lineno = 0, colno = 0;
+                    if (parse_error_location(E.output_raw_lines[idx], path, sizeof(path), &lineno, &colno)) {
+                        E.output_sel = idx;
+                        found = 1;
+                        break;
+                    }
+                }
+                if (!found) {
+                    // No errors found, select first line
+                    if (E.output_n > 0) E.output_sel = 0;
+                }
+                if (E.output_sel < E.output_scroll) E.output_scroll = E.output_sel;
+                else if (E.output_sel >= E.output_scroll + pageSize) E.output_scroll = E.output_sel - pageSize + 1;
+                return;
             }
-            if (!found) {
-                // No errors found, select first line
-                if (E.output_n > 0) E.output_sel = 0;
-            }
-            if (E.output_sel < E.output_scroll) E.output_scroll = E.output_sel;
-            else if (E.output_sel >= E.output_scroll + pageSize) E.output_scroll = E.output_sel - pageSize + 1;
-            return;
         }
         if (c == '\r' || c == '\n') {
             if (E.output_sel < 0 || E.output_sel >= E.output_n) { snprintf(E.msg, sizeof(E.msg), "No line selected"); E.msg_time = time(NULL); return; }
-            char *line = E.output_raw_lines[E.output_sel]; char path[512]; int lineno = 0; int colno = 0;
-            if (parse_error_location(line, path, sizeof(path), &lineno, &colno)) {
+                char *line = E.output_raw_lines[E.output_sel]; char path[512]; int lineno = 0; int colno = 0;
+                if (E.output_mode == 1) {
+                    // If the selected line contains a man(SECTION) reference like printf(3), follow it
+                    const char *p = strchr(line, '(');
+                    if (p) {
+                        // ensure there's a digit after '('
+                        if (isdigit((unsigned char)p[1])) {
+                            // backtrack to find token start
+                            const char *q = p - 1; while (q > line && (isalnum((unsigned char)*q) || *q == '_' || *q == '+' || *q == '-')) q--; if (q > line) q++; int namelen = (int)(p - q);
+                            if (namelen > 0 && namelen < 200) {
+                                char topic[256]; int sl = namelen < (int)sizeof(topic)-1 ? namelen : (int)sizeof(topic)-1; memcpy(topic, q, sl); topic[sl] = '\0';
+                                char runshim[512]; snprintf(runshim, sizeof(runshim), "__run_shell__:man %s | col -b", topic);
+                                E.output_mode = 1; strncpy(E.output_man_topic, topic, sizeof(E.output_man_topic)-1); E.output_man_topic[sizeof(E.output_man_topic)-1] = '\0';
+                                execute_command(runshim);
+                                return;
+                            }
+                        }
+                    }
+                }
+                if (parse_error_location(line, path, sizeof(path), &lineno, &colno)) {
                 // Map temp build file back to original filename
                 if (E.filename && strncmp(path, "/tmp/editor_build_temp_", 23) == 0) {
                     strncpy(path, E.filename, sizeof(path)-1);
