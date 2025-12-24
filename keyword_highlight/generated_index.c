@@ -1,6 +1,4 @@
 /* Auto-generated index of keyword lists */
-#include "2html_keywords.h"
-#include "8th_keywords.h"
 #include "a2ps_keywords.h"
 #include "a65_keywords.h"
 #include "aap_keywords.h"
@@ -768,8 +766,6 @@
 #include <string.h>
 
 const struct KH kh_languages[] = {
-    { "2html", NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL },
-    { "8th", NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL },
     { "a2ps", a2ps_ctype, a2ps_cstorageclass, a2ps_cstatement, a2ps_cconditional, a2ps_crepeat, a2ps_coperator, a2ps_cconstant, a2ps_ctypedef, a2ps_cstructure },
     { "a65", a65_ctype, a65_cstorageclass, a65_cstatement, a65_cconditional, a65_crepeat, a65_coperator, a65_cconstant, a65_ctypedef, a65_cstructure },
     { "aap", aap_ctype, aap_cstorageclass, aap_cstatement, aap_cconditional, aap_crepeat, aap_coperator, aap_cconstant, aap_ctypedef, aap_cstructure },

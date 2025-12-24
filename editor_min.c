@@ -30,6 +30,130 @@
 #include "highlight.h"
 #include "include_classifier.h"
 
+// Language definitions for build/run
+typedef enum {
+    LANG_NONE = 0,
+    LANG_C,
+    LANG_CPP,
+    LANG_PYTHON,
+    LANG_JAVA,
+    LANG_CSHARP,
+    LANG_JAVASCRIPT,
+    LANG_GO,
+    LANG_RUST,
+    LANG_ZIG,
+    LANG_LUA,
+    LANG_BASH,
+    LANG_RUBY,
+    LANG_PERL,
+    LANG_PHP
+} Language;
+
+typedef struct {
+    const char *name;
+    const char **extensions;
+    int ext_count;
+    const char **build_tools;
+    int build_tool_count;
+    const char **run_tools;
+    int run_tool_count;
+    const char *build_template;
+    const char *run_template;
+    int has_flags;
+} LangDef;
+
+static const LangDef lang_defs[] = {
+    { "C", (const char*[]){"c"}, 1, (const char*[]){"gcc", "clang", "cc"}, 3, NULL, 0, "%s %s -o %s %s", "./%s", 1 },
+    { "C++", (const char*[]){"cpp", "cc", "cxx"}, 3, (const char*[]){"g++", "clang++", "c++"}, 3, NULL, 0, "%s %s -o %s %s", "./%s", 1 },
+    { "Python", (const char*[]){"py"}, 1, NULL, 0, (const char*[]){"python3", "python"}, 2, "", "python3 %s", 0 },
+    { "Java", (const char*[]){"java"}, 1, (const char*[]){"javac"}, 1, (const char*[]){"java"}, 1, "javac %s", "java %s", 1 },
+    { "C#", (const char*[]){"cs"}, 1, (const char*[]){"mcs"}, 1, (const char*[]){"mono"}, 1, "mcs %s -out:%s", "mono %s", 1 },
+    { "JavaScript", (const char*[]){"js"}, 1, NULL, 0, (const char*[]){"node"}, 1, "", "node %s", 0 },
+    { "Go", (const char*[]){"go"}, 1, (const char*[]){"go"}, 1, NULL, 0, "go build %s -o %s %s", "./%s", 1 },
+    // Note: Rust uses the template "rustc %s -o %s %s" (src, output, flags).
+    // Be careful: generating build commands from generic templates must preserve
+    // the expected argument order. A previous bug produced malformed commands
+    // like "rustc rustc -o main" due to incorrect template parameter ordering.
+    // If you add or change templates, add tests and ensure `interactive_setup`
+    // formats the arguments correctly.
+    { "Rust", (const char*[]){"rs"}, 1, (const char*[]){"rustc"}, 1, NULL, 0, "rustc %s -o %s %s", "./%s", 1 },
+    { "Zig", (const char*[]){"zig"}, 1, (const char*[]){"zig"}, 1, NULL, 0, "zig build-exe %s -femit-bin=%s", "./%s", 1 },
+    { "Lua", (const char*[]){"lua"}, 1, NULL, 0, (const char*[]){"lua"}, 1, "", "lua %s", 0 },
+    { "Bash", (const char*[]){"sh"}, 1, NULL, 0, (const char*[]){"bash"}, 1, "", "bash %s", 0 },
+    { "Ruby", (const char*[]){"rb"}, 1, NULL, 0, (const char*[]){"ruby"}, 1, "", "ruby %s", 0 },
+    { "Perl", (const char*[]){"pl"}, 1, NULL, 0, (const char*[]){"perl"}, 1, "", "perl %s", 0 },
+    { "PHP", (const char*[]){"php"}, 1, NULL, 0, (const char*[]){"php"}, 1, "", "php %s", 0 }
+};
+
+static Language detect_language(const char *filename) {
+    if (!filename) return LANG_NONE;
+    const char *ext = strrchr(filename, '.');
+    if (!ext) return LANG_NONE;
+    ext++; // skip '.'
+    for (int i = 0; i < sizeof(lang_defs)/sizeof(lang_defs[0]); i++) {
+        for (int j = 0; j < lang_defs[i].ext_count; j++) {
+            if (strcmp(ext, lang_defs[i].extensions[j]) == 0) return (Language)(i + 1);
+        }
+    }
+    return LANG_NONE;
+}
+
+static int detect_tool(const char **tools, int count, char *found_tool, int tool_len) {
+    for (int i = 0; i < count; i++) {
+        char cmd[512]; snprintf(cmd, sizeof(cmd), "which %s >/dev/null 2>&1", tools[i]);
+        if (system(cmd) == 0) {
+            strncpy(found_tool, tools[i], tool_len - 1);
+            found_tool[tool_len - 1] = '\0';
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int parse_flags_from_help(const char *tool, char ***flags_out, int *count_out) {
+    *flags_out = NULL;
+    *count_out = 0;
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "%s --help 2>&1 | head -50", tool);
+    FILE *fp = popen(cmd, "r");
+    if (!fp) return 0;
+    char line[1024];
+    while (fgets(line, sizeof(line), fp) && *count_out < 50) {
+        char *p = line;
+        while (*p) {
+            if (*p == '-' && (isalnum(p[1]) || p[1] == '-')) {
+                char flag[64] = {0};
+                int i = 0;
+                while (*p && !isspace(*p) && *p != ',' && *p != '|' && i < 63) {
+                    flag[i++] = *p++;
+                }
+                flag[i] = '\0';
+                if (strlen(flag) > 1) {
+                    int have = 0;
+                    for (int j = 0; j < *count_out; j++) {
+                        if (strcmp((*flags_out)[j], flag) == 0) {
+                            have = 1;
+                            break;
+                        }
+                    }
+                    if (!have) {
+                        char **n = realloc(*flags_out, sizeof(char*) * (*count_out + 1));
+                        if (n) {
+                            *flags_out = n;
+                            (*flags_out)[*count_out] = strdup(flag);
+                            (*count_out)++;
+                        }
+                    }
+                }
+            } else {
+                p++;
+            }
+        }
+    }
+    pclose(fp);
+    return *count_out > 0;
+}
+
 // Special keys
 #define ARROW_LEFT 1000
 #define ARROW_RIGHT 1001
@@ -104,7 +228,7 @@ struct Editor {
 
 
     // transient message
-    char msg[1024];
+    char msg[4096];
     time_t msg_time;
 
     // build/run flow helpers
@@ -143,7 +267,7 @@ static void output_clear(void);
 static int parse_error_location(const char *line, char *path, int pathlen, int *lineno, int *colno);
 /* Forward declarations for Build/Run handlers (used by command parsing before definition) */
 static void handle_build_run(int do_run_after);
-static void handle_run_only(int allow_interactive);
+static void handle_run_only(int allow_interactive, const char *arg);
 static volatile sig_atomic_t winch_received = 0;
 static volatile sig_atomic_t include_update_received = 0;
 
@@ -340,9 +464,7 @@ static void die(const char *s) {
 static void editorRefreshScreen(void);
 static void show_file_browser(void);
 static int alphasort_entries(const void *a, const void *b);
-static void open_file_in_current_window(const char *fname);
 static void open_file_in_new_tab(const char *fname);
-static void open_help_tab(void);
 static void disableRawMode(void);
 static void enableRawMode(void);
 static int switch_to_home(void);
@@ -498,6 +620,8 @@ static void run_embedded_terminal(void) {
 static int run_command_in_pty(const char *shell_cmd, FILE *out) {
     // temporarily disable raw mode to allow normal terminal behavior
     disableRawMode();
+
+
 
     // clear the screen before running the command to avoid leftover text
     write(STDOUT_FILENO, "\x1b[2J\x1b[H", 7);
@@ -978,12 +1102,6 @@ static void delete_line_at(int idx) {
     if (E.cy < 0) E.cy = 0;
 }
 
-static void copy_whole_line(void) {
-    if (E.cy < 0 || E.cy >= E.numrows) return;
-    free(E.clipboard);
-    E.clipboard = strdup(E.rows[E.cy]);
-    snprintf(E.msg, sizeof(E.msg), "Copied line %d", E.cy + 1); E.msg_time = time(NULL);
-}
 
 static void copy_line_n(int n) {
     if (n < 1 || n > E.numrows) {
@@ -1510,7 +1628,7 @@ static int execute_command(const char *cmd) {
                 snprintf(E.msg, sizeof(E.msg), "Command finished (exit %d)", exitcode); E.msg_time = time(NULL);
                 return exitcode;
             } else {
-                char emsg[512]; snprintf(emsg, sizeof(emsg), "Failed to run: %s", shell);
+                char emsg[4096]; snprintf(emsg, sizeof(emsg), "Failed to run: %s", shell);
                 if (out) { fputs(emsg, out); fputs("\n", out); fflush(out); fsync(fileno(out)); }
                 if (out) fclose(out);
                 // also surface the error in the in-editor output pane
@@ -1552,12 +1670,21 @@ static int execute_command(const char *cmd) {
         while (i < L && cmd[i] == ' ') i++;
         handle_build_run(do_run_after);
     }
-    else if (i < L && cmd[i] == 'R') {
-        // run-only command (uppercase only)
-        int start = i; i++;
-        while (i < L && isalpha((unsigned char)cmd[i])) i++;
+    else if (i < L && (cmd[i] == 'R' || strncasecmp(&cmd[i], "run", 3) == 0)) {
+        // run-only command: accept uppercase 'R' or the word 'run' (case-insensitive)
+        if (cmd[i] == 'R') { i++; }
+        else { i += 3; } // consumed 'run'
+        while (i < L && isalpha((unsigned char)cmd[i])) i++; // consume any trailing letters (safety)
         while (i < L && cmd[i] == ' ') i++;
-        handle_run_only(0);
+        const char *arg = NULL; char argbuf[1024] = {0};
+        if (i < L) {
+            // copy remainder as argument (trim leading/trailing spaces)
+            int j = 0; while (i < L && cmd[i] == ' ') i++;
+            while (i < L && j < (int)sizeof(argbuf)-1) { argbuf[j++] = cmd[i++]; }
+            argbuf[j] = '\0'; for (int k = j-1; k >= 0 && isspace((unsigned char)argbuf[k]); k--) argbuf[k] = '\0';
+            if (argbuf[0]) arg = argbuf;
+        }
+        handle_run_only(0, arg);
     }
 
     while (i < L) {
@@ -1765,7 +1892,7 @@ static int execute_command(const char *cmd) {
                     } else {
                         strcpy(base, fname);
                     }
-                    char newname[512];
+                    char newname[2048];
                     int num = 1;
                     while (1) {
                         if (ext[0]) snprintf(newname, sizeof(newname), "%s%d%s", base, num, ext);
@@ -1866,7 +1993,7 @@ static int execute_command(const char *cmd) {
                     } else {
                         strcpy(base, fname);
                     }
-                    char newname[512];
+                    char newname[2048];
                     int num = 1;
                     while (1) {
                         if (ext[0]) snprintf(newname, sizeof(newname), "%s%d%s", base, num, ext);
@@ -2982,72 +3109,6 @@ static void draw_welcome_overlay(void) {
     write(STDOUT_FILENO, buf, strlen(buf));
 }
 
-// Open the help text as its own tab (so it appears as a full page). Closes when user uses 'tabc' on the help tab.
-static void open_help_tab(void) {
-    const char *lines[] = {
-        "Command Cheat Sheet",
-        "",
-        "File & Tab Management",
-        "fn <file>        Name/rename current file",
-        "fn add <file>    Create file on disk",
-        "fn del <file>    Delete file",
-        "open <file>      Open in current window",
-        "opent <file>     Open in new tab",
-        "tabs             List tabs",
-        "tab<N>           Switch to tab N",
-        "tabc<N>          Close tab N",
-        "tabc all         Close all tabs (prompts to save)",
-        "md <dir>         Make directory",
-        "md -p <dir>      Make directory (recursive)",
-        "cd <path>        Change directory",
-        "",
-        "Editing",
-        "s                Save",
-        "q                Quit (prompts to save)",
-        "qs               Quit & Save",
-        "u                Undo",
-        "r                Redo",
-        "cl<N>            Copy Line(s) N or Range",
-        "p                Paste at cursor",
-        "pl<N>            Paste at Line N",
-        "plf<N>           Paste at Front of Line N",
-        "dall             Delete all lines",
-        "dl               Delete current line",
-        "dl<Range>        Clear text on range (remove empty lines)",
-        "dl<N>            Clear text on line N (remove if empty)",
-        "dl<N>w           Delete last N words",
-        "df<N>w           Delete first N words",
-        "",
-        "Navigation",
-        "jl<N>            Jump to Front of Line N",
-        "jml<N>           Jump to Middle of Line N",
-        "jel<N>           Jump to End of Line N",
-        "",
-        "File Browser",
-        "b                File browser",
-        "",
-        "Terminal",
-        "ot               Open Terminal",
-        "Type \"exit\" into the terminal to close",
-        "",
-        "Help",
-        "help             Toggle help overlay",
-        "?                Toggle help overlay",
-    };
-    int n = sizeof(lines)/sizeof(lines[0]);
-    // join lines into a single snapshot string
-    int tot = 0; for (int i = 0; i < n; i++) tot += (int)strlen(lines[i]) + 1; // +1 for newline
-    char *s = malloc(tot + 1); if (!s) return; s[0] = '\0';
-    for (int i = 0; i < n; i++) { strcat(s, lines[i]); strcat(s, "\n"); }
-    struct Tab t = {0};
-    t.name = strdup("[Help]");
-    t.snapshot = strdup(s);
-    t.saved_snapshot = t.snapshot ? strdup(t.snapshot) : NULL;
-    t.cx = 0; t.cy = 0; t.row_offset = 0; t.col_offset = 0;
-    int idx = append_tab(t);
-    if (idx >= 0) switch_to_tab(idx);
-    free(s);
-}
 
 // Helper: case-insensitive directory-first sort for entries
 static int alphasort_entries(const void *a, const void *b) {
@@ -3902,28 +3963,6 @@ static int pick_multi_from_matches_with_desc(char **labels, char **descs, int n,
 // -------------------------------------------------------------------------------------
 
 // helper: open a file into the current editor window (push current HOME snapshot to front)
-static void open_file_in_current_window(const char *fname) {
-    E.welcome_visible = 0;
-    // push current HOME snapshot to front
-    push_home_to_front();
-    // then open requested file into current editor (create if missing)
-    FILE *f = fopen(fname, "r");
-    if (!f) {
-        // prompt to create
-        char __tmpbuf[64]; int __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows);
-        if (__tmpn > 0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
-        const char *fn_prompt1 = "\x1b[93mFile not found. Create?\x1b[0m \x1b[92m(y)\x1b[0m \x1b[91m(n)\x1b[0m ";
-        write(STDOUT_FILENO, fn_prompt1, strlen(fn_prompt1));
-        int resp = 0; while (1) { int k = readKey(); if (k == -1) continue; if (k=='y'||k=='Y') { resp='y'; break; } if (k=='n'||k=='N'||k==27) { resp='n'; break; } }
-        __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows); if (__tmpn>0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
-        if (resp != 'y') { snprintf(E.msg, sizeof(E.msg), "Open cancelled"); E.msg_time = time(NULL); return; }
-        free(E.filename); E.filename = strdup(fname); free(E.saved_snapshot); E.saved_snapshot = NULL; editorFreeRows(); editorAppendRow(""); save_snapshot(); set_language_from_filename(fname); snprintf(E.msg, sizeof(E.msg), "New file %s", fname); E.msg_time = time(NULL);
-    } else {
-        fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
-        char *buf = malloc(sz + 1); if (buf) { fread(buf, 1, sz, f); buf[sz] = '\0'; load_buffer_from_string(buf); free(buf); free(E.filename); E.filename = strdup(fname); save_snapshot(); free(E.saved_snapshot); E.saved_snapshot = serialize_buffer(); set_language_from_filename(fname); snprintf(E.msg, sizeof(E.msg), "Opened %s", fname); E.msg_time = time(NULL); }
-        fclose(f);
-    }
-}
 
 // Non-destructive variant: open into current window without pushing current buffer to a new tab.
 static void open_file_in_current_window_no_push(const char *fname) {
@@ -4033,8 +4072,8 @@ static void free_string_array(char **a, int n) { if (!a) return; for (int i=0;i<
 // simple per-project build config
 typedef struct {
     char buildfile[256];
-    char build_cmd[512];
-    char run_cmd[512];
+    char build_cmd[2048];
+    char run_cmd[2048];
     time_t saved_at;
 } BuildConfig;
 
@@ -4161,25 +4200,6 @@ static char **detect_supported_standards(const char *compiler, int is_cxx, int *
     }
     *out_n = cnt; return res;
 }
-
-// Helper: parse comma-separated numbers into a boolean array (1-indexed options)
-// Returns number of options parsed; 'flags' must be sized at least max_opts and will be 1 for selected.
-static int parse_number_list(const char *in, int *flags, int max_opts) {
-    if (!in || !flags) return 0;
-    for (int i = 0; i < max_opts; i++) flags[i] = 0;
-    int count = 0;
-    const char *p = in;
-    while (*p) {
-        while (*p && isspace((unsigned char)*p)) p++;
-        int v = 0; int n = 0; if (sscanf(p, "%d%n", &v, &n) == 1) {
-            if (v >= 1 && v <= max_opts) { flags[v-1] = 1; count++; }
-            p += n;
-        } else { p++; }
-        while (*p && (*p == ' ' || *p == ',')) p++;
-    }
-    return count;
-}
-
 
 
 
@@ -4387,12 +4407,18 @@ static int interactive_setup(BuildConfig *outcfg) {
     char *src = strdup(cands[idx]); free_string_array(cands, nc);
     memset(outcfg, 0, sizeof(*outcfg)); strncpy(outcfg->buildfile, src, sizeof(outcfg->buildfile)-1);
     // heuristics based on extension
-    const char *ext = strrchr(src, '.');
+    int lang = detect_language(src);
     char exe_default[128]; snprintf(exe_default, sizeof(exe_default), "%s", src);
     char *dot = strrchr(exe_default, '.'); if (dot) *dot = '\0';
-    char exe_name[128]; exe_name[0] = '\0';
-    if (ext && (strcmp(ext, ".c") == 0 || strcmp(ext, ".cpp") == 0)) {
-        int is_cxx = (strcmp(ext, ".cpp") == 0);
+    char exe_name[256]; exe_name[0] = '\0';
+    if (lang == LANG_NONE) {
+        // fallback
+        char *b = prompt_input("Enter build command (empty to skip): "); if (b) { strncpy(outcfg->build_cmd, b, sizeof(outcfg->build_cmd)-1); free(b); }
+        char *r = prompt_input("Enter run command (empty to skip): "); if (r) { strncpy(outcfg->run_cmd, r, sizeof(outcfg->run_cmd)-1); free(r); }
+    } else {
+        const LangDef *ld = &lang_defs[lang - 1];
+        if (lang == LANG_C || lang == LANG_CPP) {
+        int is_cxx = (lang == LANG_CPP);
         char compiler_name[256] = {0}; detect_compiler(is_cxx, compiler_name, sizeof(compiler_name));
         // allow user to override detected compiler if desired
         char probe_msg[512]; snprintf(probe_msg, sizeof(probe_msg), "Use detected compiler %s?", compiler_name);
@@ -4481,30 +4507,120 @@ static int interactive_setup(BuildConfig *outcfg) {
         // cleanup
         for (int ii = 0; ii < std_n; ii++) { free(stds[ii]); }
         free(stds); stds = NULL;
-    } else if (ext && strcmp(ext, ".rs") == 0) {
-        // rust: use rustc direct compile for single file
-        char *en = prompt_input("Executable name (leave empty for default): "); if (en) { if (en[0]) strncpy(exe_name, en, sizeof(exe_name)-1); free(en); }
-        if (!exe_name[0]) strncpy(exe_name, exe_default, sizeof(exe_name)-1);
-        snprintf(outcfg->build_cmd, sizeof(outcfg->build_cmd), "rustc -o %s %s", exe_name, src);
-        snprintf(outcfg->run_cmd, sizeof(outcfg->run_cmd), "./%s", exe_name);
-    } else if (ext && strcmp(ext, ".go") == 0) {
-        char *en = prompt_input("Executable name (leave empty for default): "); if (en) { if (en[0]) strncpy(exe_name, en, sizeof(exe_name)-1); free(en); }
-        if (!exe_name[0]) strncpy(exe_name, exe_default, sizeof(exe_name)-1);
-        snprintf(outcfg->build_cmd, sizeof(outcfg->build_cmd), "go build -o %s %s", exe_name, src);
-        snprintf(outcfg->run_cmd, sizeof(outcfg->run_cmd), "./%s", exe_name);
-    } else if (ext && strcmp(ext, ".py") == 0) {
-        outcfg->build_cmd[0] = '\0';
-        snprintf(outcfg->run_cmd, sizeof(outcfg->run_cmd), "python3 %s", src);
-    } else if (ext && strcmp(ext, ".java") == 0) {
-        char *en = prompt_input("Main class name (leave empty to derive from file): "); if (en) { if (en[0]) strncpy(exe_name, en, sizeof(exe_name)-1); free(en); }
-        if (!exe_name[0]) strncpy(exe_name, exe_default, sizeof(exe_name)-1);
-        snprintf(outcfg->build_cmd, sizeof(outcfg->build_cmd), "javac %s", src);
-        snprintf(outcfg->run_cmd, sizeof(outcfg->run_cmd), "java %s", exe_name);
     } else {
-        // fallback: ask for explicit build and run commands
-        char *b = prompt_input("Enter build command (empty to skip): "); if (b) { strncpy(outcfg->build_cmd, b, sizeof(outcfg->build_cmd)-1); free(b); }
-        char *r = prompt_input("Enter run command (empty to skip): "); if (r) { strncpy(outcfg->run_cmd, r, sizeof(outcfg->run_cmd)-1); free(r); }
+        // general for other languages
+        char build_tool[256] = {0};
+        char run_tool[256] = {0};
+        if (ld->build_tools) {
+            detect_tool(ld->build_tools, ld->build_tool_count, build_tool, sizeof(build_tool));
+        }
+        if (ld->run_tools) {
+            detect_tool(ld->run_tools, ld->run_tool_count, run_tool, sizeof(run_tool));
+        }
+        if (!build_tool[0] && !run_tool[0]) {
+            char msg[2048];
+            const char **tools = ld->build_tools ? ld->build_tools : ld->run_tools;
+            int tcount = ld->build_tools ? ld->build_tool_count : ld->run_tool_count;
+            if (tcount > 0) {
+                snprintf(msg, sizeof(msg), "Tool not found. Install %s or enter manually?", tools[0]);
+            } else {
+                strcpy(msg, "No tool available for this language. Enter commands manually?");
+            }
+            if (!prompt_yesno(msg)) {
+                // manual
+                char *b = prompt_input("Enter build command (empty to skip): "); if (b) { strncpy(outcfg->build_cmd, b, sizeof(outcfg->build_cmd)-1); free(b); }
+                char *r = prompt_input("Enter run command (empty to skip): "); if (r) { strncpy(outcfg->run_cmd, r, sizeof(outcfg->run_cmd)-1); free(r); }
+            } else {
+                // hint
+                if (tcount > 0) {
+                    snprintf(E.msg, sizeof(E.msg), "Install %s first", tools[0]);
+                } else {
+                    snprintf(E.msg, sizeof(E.msg), "No tool for %s", ld->name);
+                }
+                E.msg_time = time(NULL);
+                free(src);
+                return 0;
+            }
+        } else {
+            // have tool
+            if (ld->build_template[0]) {
+                char *en = prompt_input("Executable name (leave empty for default): "); if (en) { if (en[0]) strncpy(exe_name, en, sizeof(exe_name)-1); free(en); }
+                if (!exe_name[0]) strncpy(exe_name, exe_default, sizeof(exe_name)-1);
+            }
+            // flags
+            char flagstr[1024] = {0};
+            if (ld->has_flags && build_tool[0]) {
+                char **flags = NULL;
+                int nflags = 0;
+                if (parse_flags_from_help(build_tool, &flags, &nflags)) {
+                    if (nflags > 0) {
+                        char **descs = calloc(nflags, sizeof(char*));
+                        for (int i = 0; i < nflags; i++) descs[i] = strdup("");
+                        int fflags[64] = {0};
+                        int sel = pick_multi_from_matches_with_desc(flags, descs, nflags, fflags);
+                        for (int i = 0; i < nflags; i++) free(descs[i]);
+                        free(descs);
+                        if (sel < 0) {
+                            free_string_array(flags, nflags);
+                            free(src);
+                            return 0;
+                        }
+                        for (int i = 0; i < nflags; i++) {
+                            if (fflags[i]) {
+                                if (flagstr[0]) strncat(flagstr, " ", sizeof(flagstr)-strlen(flagstr)-1);
+                                strncat(flagstr, flags[i], sizeof(flagstr)-strlen(flagstr)-1);
+                            }
+                        }
+                    }
+                }
+                free_string_array(flags, nflags);
+            }
+            // build cmd
+            if (ld->build_template[0]) {
+                char buildbuf[1024] = {0};
+                if (strcmp(ld->name, "Java") == 0) {
+                    snprintf(buildbuf, sizeof(buildbuf), ld->build_template, build_tool, src);
+                } else if (strcmp(ld->name, "Go") == 0) {
+                    snprintf(buildbuf, sizeof(buildbuf), ld->build_template, build_tool, flagstr, exe_name, src);
+                } else if (strcmp(ld->name, "Zig") == 0) {
+                    snprintf(buildbuf, sizeof(buildbuf), ld->build_template, build_tool, src, exe_name);
+                } else if (strcmp(ld->name, "C#") == 0) {
+                    snprintf(buildbuf, sizeof(buildbuf), ld->build_template, build_tool, src, exe_name);
+                } else if (strcmp(ld->name, "Rust") == 0) {
+                    // Rust expects (src, exe, flags)
+                    snprintf(buildbuf, sizeof(buildbuf), ld->build_template, src, exe_name, flagstr);
+                } else {
+                    // C, C++
+                    snprintf(buildbuf, sizeof(buildbuf), ld->build_template, build_tool, src, exe_name, flagstr);
+                }
+                strncpy(outcfg->build_cmd, buildbuf, sizeof(outcfg->build_cmd)-1);
+            }
+            // run cmd
+            if (ld->run_template[0]) {
+                char runbuf[256] = {0};
+                char *tool_for_run = run_tool[0] ? run_tool : build_tool;
+                if (strcmp(ld->name, "Java") == 0) {
+                    char class[128];
+                    char temp[256];
+                    strcpy(temp, src);
+                    char *dot = strrchr(temp, '.');
+                    if (dot) *dot = '\0';
+                    char *slash = strrchr(temp, '/');
+                    if (slash) strcpy(class, slash+1);
+                    else strcpy(class, temp);
+                    snprintf(runbuf, sizeof(runbuf), ld->run_template, tool_for_run, class);
+                } else if (strstr(ld->run_template, "%s %s")) {
+                    // interpreted
+                    snprintf(runbuf, sizeof(runbuf), ld->run_template, tool_for_run, src);
+                } else {
+                    // compiled
+                    snprintf(runbuf, sizeof(runbuf), ld->run_template, exe_name);
+                }
+                strncpy(outcfg->run_cmd, runbuf, sizeof(outcfg->run_cmd)-1);
+            }
+        }
     }
+}
 
     // ask to save
     if (prompt_yesno("Save this configuration for future builds?")) {
@@ -4518,11 +4634,27 @@ static int interactive_setup(BuildConfig *outcfg) {
 
 // choose a target/command then run or set for post-save
 static void handle_build_run(int do_run_after);
+static void handle_run_only(int allow_interactive, const char *arg);
+
+// check if a tool is available in PATH
+static int tool_available(const char *tool) {
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd), "command -v %s > /dev/null 2>&1", tool);
+    return system(cmd) == 0;
+}
 
 // run an executable directly (for 'run' command, skips build detection)
-static void run_interactive(const char *fname) {
-    char cmd[1024];
+static int run_interactive(const char *fname) {
+    char cmd[4096];
     const char *ext = strrchr(fname, '.');
+    char base[512];
+    strncpy(base, fname, sizeof(base)-1);
+    char *dot = strrchr(base, '.');
+    if (dot) *dot = '\0';
+    char *slash = strrchr(base, '/');
+    char *bname = slash ? slash + 1 : base;
+    char exe[2048];
+    snprintf(exe, sizeof(exe), "./%s", bname);
     if (ext) {
         if (strcmp(ext, ".py") == 0) {
             snprintf(cmd, sizeof(cmd), "python3 '%s'", fname);
@@ -4534,17 +4666,184 @@ static void run_interactive(const char *fname) {
             snprintf(cmd, sizeof(cmd), "ruby '%s'", fname);
         } else if (strcmp(ext, ".js") == 0) {
             snprintf(cmd, sizeof(cmd), "node '%s'", fname);
+        } else if (strcmp(ext, ".java") == 0) {
+            /* For Java, compile if needed */
+            char classfile[2048];
+            snprintf(classfile, sizeof(classfile), "%s.class", bname);
+            struct stat st_src, st_class;
+            int need_compile = 1;
+            if (stat(fname, &st_src) == 0 && stat(classfile, &st_class) == 0) {
+                if (st_class.st_mtime >= st_src.st_mtime) need_compile = 0;
+            }
+            if (need_compile) {
+                if (!tool_available("javac")) {
+                    char msg[2048];
+                    snprintf(msg, sizeof(msg), "Tool not found. Install javac or enter manually?");
+                    if (prompt_yesno(msg)) {
+                        snprintf(E.msg, sizeof(E.msg), "Install javac first");
+                        E.msg_time = time(NULL);
+                        return -1;
+                    } else {
+                        char *manual = prompt_input("Enter compile command (e.g., javac file.java): ");
+                        if (manual && manual[0]) {
+                            char runcmd[4096];
+                            snprintf(runcmd, sizeof(runcmd), "__run_shell__:%s", manual);
+                            int rc = execute_command(runcmd);
+                            free(manual);
+                            if (rc != 0) return rc;
+                        } else {
+                            if (manual) free(manual);
+                            return -1;
+                        }
+                    }
+                } else {
+                    char compile_cmd[1024];
+                    snprintf(compile_cmd, sizeof(compile_cmd), "PATH=\"$PATH\" javac '%s'", fname);
+                    char runcmd[4096];
+                    snprintf(runcmd, sizeof(runcmd), "__run_shell__:%s", compile_cmd);
+                    int compile_exit = execute_command(runcmd);
+                    if (compile_exit != 0) {
+                        return compile_exit;
+                    }
+                }
+            }
+            snprintf(cmd, sizeof(cmd), "java %s", bname);
+        } else if (strcmp(ext, ".rs") == 0) {
+            // Rust
+            struct stat st_src, st_exe;
+            int need_compile = 1;
+            if (stat(fname, &st_src) == 0 && stat(exe, &st_exe) == 0) {
+                if (st_exe.st_mtime >= st_src.st_mtime) need_compile = 0;
+            }
+            if (need_compile) {
+                if (!tool_available("rustc")) {
+                    char msg[2048];
+                    snprintf(msg, sizeof(msg), "Tool not found. Install rustc or enter manually?");
+                    if (prompt_yesno(msg)) {
+                        snprintf(E.msg, sizeof(E.msg), "Install rustc first");
+                        E.msg_time = time(NULL);
+                        return -1;
+                    } else {
+                        char *manual = prompt_input("Enter compile command (e.g., rustc file.rs -o exe): ");
+                        if (manual && manual[0]) {
+                            char runcmd[4096];
+                            snprintf(runcmd, sizeof(runcmd), "__run_shell__:%s", manual);
+                            int rc = execute_command(runcmd);
+                            free(manual);
+                            if (rc != 0) return rc;
+                        } else {
+                            if (manual) free(manual);
+                            return -1;
+                        }
+                    }
+                } else {
+                    char compile_cmd[1024];
+                    snprintf(compile_cmd, sizeof(compile_cmd), "PATH=\"$PATH\" rustc '%s' -o '%s'", fname, bname);
+                    char runcmd[4096];
+                    snprintf(runcmd, sizeof(runcmd), "__run_shell__:%s", compile_cmd);
+                    int compile_exit = execute_command(runcmd);
+                    if (compile_exit != 0) {
+                        return compile_exit;
+                    }
+                }
+            }
+            snprintf(cmd, sizeof(cmd), "'%s'", exe);
+        } else if (strcmp(ext, ".c") == 0) {
+            // C
+            struct stat st_src, st_exe;
+            int need_compile = 1;
+            if (stat(fname, &st_src) == 0 && stat(exe, &st_exe) == 0) {
+                if (st_exe.st_mtime >= st_src.st_mtime) need_compile = 0;
+            }
+            if (need_compile) {
+                if (!tool_available("gcc")) {
+                    char msg[2048];
+                    snprintf(msg, sizeof(msg), "Tool not found. Install gcc or enter manually?");
+                    if (prompt_yesno(msg)) {
+                        snprintf(E.msg, sizeof(E.msg), "Install gcc first");
+                        E.msg_time = time(NULL);
+                        return -1;
+                    } else {
+                        char *manual = prompt_input("Enter compile command (e.g., gcc file.c -o exe): ");
+                        if (manual && manual[0]) {
+                            char runcmd[4096];
+                            snprintf(runcmd, sizeof(runcmd), "__run_shell__:%s", manual);
+                            int rc = execute_command(runcmd);
+                            free(manual);
+                            if (rc != 0) return rc;
+                        } else {
+                            if (manual) free(manual);
+                            return -1;
+                        }
+                    }
+                } else {
+                    char compile_cmd[1024];
+                    snprintf(compile_cmd, sizeof(compile_cmd), "PATH=\"$PATH\" gcc '%s' -o '%s'", fname, bname);
+                    char runcmd[4096];
+                    snprintf(runcmd, sizeof(runcmd), "__run_shell__:%s", compile_cmd);
+                    int compile_exit = execute_command(runcmd);
+                    if (compile_exit != 0) {
+                        return compile_exit;
+                    }
+                }
+            }
+            snprintf(cmd, sizeof(cmd), "'%s'", exe);
+        } else if (strcmp(ext, ".cpp") == 0 || strcmp(ext, ".cc") == 0 || strcmp(ext, ".cxx") == 0) {
+            // C++
+            struct stat st_src, st_exe;
+            int need_compile = 1;
+            if (stat(fname, &st_src) == 0 && stat(exe, &st_exe) == 0) {
+                if (st_exe.st_mtime >= st_src.st_mtime) need_compile = 0;
+            }
+            if (need_compile) {
+                if (!tool_available("g++")) {
+                    char msg[2048];
+                    snprintf(msg, sizeof(msg), "Tool not found. Install g++ or enter manually?");
+                    if (prompt_yesno(msg)) {
+                        snprintf(E.msg, sizeof(E.msg), "Install g++ first");
+                        E.msg_time = time(NULL);
+                        return -1;
+                    } else {
+                        char *manual = prompt_input("Enter compile command (e.g., g++ file.cpp -o exe): ");
+                        if (manual && manual[0]) {
+                            char runcmd[4096];
+                            snprintf(runcmd, sizeof(runcmd), "__run_shell__:%s", manual);
+                            int rc = execute_command(runcmd);
+                            free(manual);
+                            if (rc != 0) return rc;
+                        } else {
+                            if (manual) free(manual);
+                            return -1;
+                        }
+                    }
+                } else {
+                    char compile_cmd[1024];
+                    snprintf(compile_cmd, sizeof(compile_cmd), "PATH=\"$PATH\" g++ '%s' -o '%s'", fname, bname);
+                    char runcmd[4096];
+                    snprintf(runcmd, sizeof(runcmd), "__run_shell__:%s", compile_cmd);
+                    int compile_exit = execute_command(runcmd);
+                    if (compile_exit != 0) {
+                        return compile_exit;
+                    }
+                }
+            }
+            snprintf(cmd, sizeof(cmd), "'%s'", exe);
         } else {
-            // assume executable
-            snprintf(cmd, sizeof(cmd), "'%s'", fname);
+            /* Other extensions: assume compiled, run ./basename */
+            snprintf(cmd, sizeof(cmd), "'%s'", exe);
         }
     } else {
-        // no extension, assume executable
-        snprintf(cmd, sizeof(cmd), "'%s'", fname);
+        /* No extension: if executable, run directly; otherwise try ./basename */
+        struct stat st;
+        if (stat(fname, &st) == 0 && (st.st_mode & S_IXUSR)) {
+            snprintf(cmd, sizeof(cmd), "'%s'", fname);
+        } else {
+            snprintf(cmd, sizeof(cmd), "'%s'", exe);
+        }
     }
-    char runcmd[1024];
+    char runcmd[8192];
     snprintf(runcmd, sizeof(runcmd), "__run_shell__:%s", cmd);
-    execute_command(runcmd);
+    return execute_command(runcmd);
 }
 
 static void handle_build_run(int do_run_after) {
@@ -4553,74 +4852,117 @@ static void handle_build_run(int do_run_after) {
 
     char path[256] = {0}; BuildSystem bs = detect_build_system(path, sizeof(path));
     if (bs != BS_NONE) {
-        // prompt to edit build file
-        char q[512]; int pn = snprintf(q, sizeof(q), "Build system found: %s. Edit it?", path);
-        if (prompt_yesno(q)) {
-            // let user pick which target to run after save
-            char *selcmd = NULL;
-            if (bs == BS_MAKE) {
-                int tn=0; char **t = get_make_targets(&tn);
-                if (tn>0) {
-                    int idx = pick_from_matches(t, tn);
-                    if (idx >= 0) { selcmd = malloc(256); snprintf(selcmd, 256, "make %s", t[idx]); }
-                    free_string_array(t, tn);
+        // offer options: use build system, setup for current file, run current file directly
+        const char *opts[] = {"Use build system", "Setup for current file", "Run current file directly"};
+        int optc = 3;
+        int idx = pick_from_matches((char**)opts, optc);
+        if (idx < 0) { snprintf(E.msg, sizeof(E.msg), "Cancelled"); E.msg_time = time(NULL); return; }
+        if (idx == 0) {
+            // use build system - original logic
+            char q[512]; int pn = snprintf(q, sizeof(q), "Edit %s?", path);
+            if (prompt_yesno(q)) {
+                // let user pick which target to run after save
+                char *selcmd = NULL;
+                if (bs == BS_MAKE) {
+                    int tn=0; char **t = get_make_targets(&tn);
+                    if (tn>0) {
+                        int idx2 = pick_from_matches(t, tn);
+                        if (idx2 >= 0) { selcmd = malloc(256); snprintf(selcmd, 256, "make %s", t[idx2]); }
+                        free_string_array(t, tn);
+                    }
+                } else if (bs == BS_CARGO) {
+                    const char *opts2[] = {"build","run","test","clean"}; int optc2 = 4;
+                    int idx2 = pick_from_matches((char**)opts2, optc2);
+                    if (idx2 >= 0) { selcmd = malloc(256); snprintf(selcmd, 256, "cargo %s", opts2[idx2]); }
+                } else if (bs == BS_CMAKE) {
+                    const char *opts2[] = {"build","clean","test"}; int optc2 = 3;
+                    int idx2 = pick_from_matches((char**)opts2, optc2);
+                    if (idx2 >= 0) { if (strcmp(opts2[idx2], "build") == 0) snprintf((selcmd=malloc(256)),256, "cmake --build ."); else snprintf((selcmd=malloc(256)),256, "cmake --build . --target %s", opts2[idx2]); }
                 }
-            } else if (bs == BS_CARGO) {
-                const char *opts[] = {"build","run","test","clean"}; int optc = 4;
-                int idx = pick_from_matches((char**)opts, optc);
-                if (idx >= 0) { selcmd = malloc(256); snprintf(selcmd, 256, "cargo %s", opts[idx]); }
-            } else if (bs == BS_CMAKE) {
-                const char *opts[] = {"build","clean","test"}; int optc = 3;
-                int idx = pick_from_matches((char**)opts, optc);
-                if (idx >= 0) { if (strcmp(opts[idx], "build") == 0) snprintf((selcmd=malloc(256)),256, "cmake --build ."); else snprintf((selcmd=malloc(256)),256, "cmake --build . --target %s", opts[idx]); }
-            }
-            if (!selcmd) { // allow custom
-                char *in = prompt_input("Enter custom command (empty to cancel): "); if (in) { selcmd = in; } 
-            }
-            if (selcmd) {
-                // set post-edit command and open file for editing
-                strncpy(E.post_edit_cmd, selcmd, sizeof(E.post_edit_cmd)-1); E.post_edit_cmd[sizeof(E.post_edit_cmd)-1] = '\0';
-                E.awaiting_buildfile_save = 1; free(selcmd);
-                open_file_in_current_window_no_push(path);
-                return;
+                if (!selcmd) { // allow custom
+                    char *in = prompt_input("Enter custom command (empty to cancel): "); if (in) { selcmd = in; } 
+                }
+                if (selcmd) {
+                    // set post-edit command and open file for editing
+                    strncpy(E.post_edit_cmd, selcmd, sizeof(E.post_edit_cmd)-1); E.post_edit_cmd[sizeof(E.post_edit_cmd)-1] = '\0';
+                    E.awaiting_buildfile_save = 1; free(selcmd);
+                    open_file_in_current_window_no_push(path);
+                    return;
+                } else {
+                    snprintf(E.msg, sizeof(E.msg), "No command selected"); E.msg_time = time(NULL); return;
+                }
             } else {
-                snprintf(E.msg, sizeof(E.msg), "No command selected"); E.msg_time = time(NULL); return;
-            }
-        } else {
-            // don't edit: pick target and run now
-            char *cmd = NULL;
-            if (bs == BS_MAKE) {
-                int tn=0; char **t = get_make_targets(&tn);
-                if (tn>0) {
-                    int idx = pick_from_matches(t, tn);
-                    if (idx >= 0) { cmd = malloc(256); snprintf(cmd, 256, "make %s", t[idx]); }
-                    free_string_array(t, tn);
+                // don't edit: pick target and run now
+                char *cmd = NULL;
+                if (bs == BS_MAKE) {
+                    int tn=0; char **t = get_make_targets(&tn);
+                    if (tn>0) {
+                        int idx2 = pick_from_matches(t, tn);
+                        if (idx2 >= 0) { cmd = malloc(256); snprintf(cmd, 256, "make %s", t[idx2]); }
+                        free_string_array(t, tn);
+                    }
+                } else if (bs == BS_CARGO) {
+                    const char *opts2[] = {"build","run","test","clean"}; int optc2 = 4;
+                    int idx2 = pick_from_matches((char**)opts2, optc2);
+                    if (idx2 >= 0) { cmd = malloc(256); snprintf(cmd, 256, "cargo %s", opts2[idx2]); }
+                } else if (bs == BS_CMAKE) {
+                    const char *opts2[] = {"build","clean","test"}; int optc2 = 3;
+                    int idx2 = pick_from_matches((char**)opts2, optc2);
+                    if (idx2 >= 0) { cmd = malloc(256); if (strcmp(opts2[idx2], "build") == 0) snprintf(cmd,256, "cmake --build ."); else snprintf(cmd,256, "cmake --build . --target %s", opts2[idx2]); }
                 }
-            } else if (bs == BS_CARGO) {
-                const char *opts[] = {"build","run","test","clean"}; int optc = 4;
-                int idx = pick_from_matches((char**)opts, optc);
-                if (idx >= 0) { cmd = malloc(256); snprintf(cmd, 256, "cargo %s", opts[idx]); }
-            } else if (bs == BS_CMAKE) {
-                const char *opts[] = {"build","clean","test"}; int optc = 3;
-                int idx = pick_from_matches((char**)opts, optc);
-                if (idx >= 0) { cmd = malloc(256); if (strcmp(opts[idx], "build") == 0) snprintf(cmd,256, "cmake --build ."); else snprintf(cmd,256, "cmake --build . --target %s", opts[idx]); }
-            }
-            if (!cmd) { char *in = prompt_input("Enter custom command (empty to cancel): "); if (in) { cmd = in; } }
-            if (cmd) {
-                char runcmd[768]; snprintf(runcmd, sizeof(runcmd), "__run_shell__:%s", cmd);
-                int st = execute_command(runcmd);
-                if (do_run_after) {
-                    // If the selected command already contains 'run' we assume it executed the run step.
-                    if (!strstr(cmd, "run")) {
-                        // Otherwise, attempt to use saved project run command if present and only run on successful build
-                        BuildConfig cfg2 = {0}; if (load_build_config(&cfg2) && cfg2.run_cmd[0] && st == 0) {
-                            char rc[1024]; snprintf(rc, sizeof(rc), "__run_shell__:%s", cfg2.run_cmd); execute_command(rc);
+                if (!cmd) { char *in = prompt_input("Enter custom command (empty to cancel): "); if (in) { cmd = in; } }
+                if (cmd) {
+                    char runcmd[768]; snprintf(runcmd, sizeof(runcmd), "__run_shell__:%s", cmd);
+                    int st = execute_command(runcmd);
+                    if (do_run_after) {
+                        // If the selected command already contains 'run' we assume it executed the run step.
+                        if (!strstr(cmd, "run")) {
+                            // Otherwise, attempt to use saved project run command if present and only run on successful build
+                            BuildConfig cfg2 = {0}; if (load_build_config(&cfg2) && cfg2.run_cmd[0] && st == 0) {
+                                char rc[4096]; snprintf(rc, sizeof(rc), "__run_shell__:%s", cfg2.run_cmd); execute_command(rc);
+                            }
                         }
                     }
+                    free(cmd);
+                    return;
+                } else { snprintf(E.msg, sizeof(E.msg), "Command cancelled"); E.msg_time = time(NULL); return; }
+            }
+        } else if (idx == 1) {
+            // setup for current file
+            if (E.filename && E.filename[0]) {
+                BuildConfig nc = {0};
+                // set buildfile to current file
+                strncpy(nc.buildfile, E.filename, sizeof(nc.buildfile)-1);
+                if (interactive_setup(&nc)) {
+                    // run the build (and run if requested)
+                    int st = 0;
+                    if (nc.build_cmd[0]) { char bcmd[4096]; snprintf(bcmd, sizeof(bcmd), "__run_shell__:%s", nc.build_cmd); st = execute_command(bcmd); }
+                    if (do_run_after && nc.run_cmd[0]) {
+                        if (st == 0) {
+                            char rc[4096]; snprintf(rc, sizeof(rc), "__run_shell__:%s", nc.run_cmd); execute_command(rc);
+                        } else {
+                            char emsg[256]; snprintf(emsg, sizeof(emsg), "Run skipped: build failed (exit %d)", st);
+                            output_append_colored_line(emsg);
+                            output_write_raw_to_log(emsg);
+                            E.output_visible = 1; E.output_scroll = 0; E.output_sel = 0; editorRefreshScreen();
+                        }
+                    }
+                    return;
+                } else {
+                    snprintf(E.msg, sizeof(E.msg), "Setup cancelled"); E.msg_time = time(NULL);
                 }
-                free(cmd);
-                return;
-            } else { snprintf(E.msg, sizeof(E.msg), "Command cancelled"); E.msg_time = time(NULL); return; }
+            } else {
+                snprintf(E.msg, sizeof(E.msg), "No current file"); E.msg_time = time(NULL);
+            }
+        } else if (idx == 2) {
+            // run current file directly (use unified run_interactive)
+            if (E.filename && E.filename[0]) {
+                int rc = run_interactive(E.filename);
+                if (rc == 0) return;
+                else if (rc != -1) { snprintf(E.msg, sizeof(E.msg), "Run finished (exit %d)", rc); E.msg_time = time(NULL); }
+            } else {
+                snprintf(E.msg, sizeof(E.msg), "No current file"); E.msg_time = time(NULL);
+            }
         }
     } else {
         // no build system: try saved config
@@ -4628,11 +4970,11 @@ static void handle_build_run(int do_run_after) {
         if (load_build_config(&cfg)) {
             if (prompt_yesno("Saved build config found. Use it?")) {
                 if (cfg.build_cmd[0]) {
-                    char runcmd[1024]; snprintf(runcmd, sizeof(runcmd), "__run_shell__:%s", cfg.build_cmd);
+                    char runcmd[4096]; snprintf(runcmd, sizeof(runcmd), "__run_shell__:%s", cfg.build_cmd);
                     int st = execute_command(runcmd);
                     if (do_run_after && cfg.run_cmd[0]) {
                         if (st == 0) {
-                            char rc[1024]; snprintf(rc, sizeof(rc), "__run_shell__:%s", cfg.run_cmd); execute_command(rc);
+                            char rc[4096]; snprintf(rc, sizeof(rc), "__run_shell__:%s", cfg.run_cmd); execute_command(rc);
                         } else {
                             char emsg[256]; snprintf(emsg, sizeof(emsg), "Run skipped: build failed (exit %d)", st);
                             output_append_colored_line(emsg);
@@ -4650,10 +4992,10 @@ static void handle_build_run(int do_run_after) {
             if (interactive_setup(&nc)) {
                 // after setup, run the build (and run if requested)
                 int st = 0;
-                if (nc.build_cmd[0]) { char bcmd[1024]; snprintf(bcmd, sizeof(bcmd), "__run_shell__:%s", nc.build_cmd); st = execute_command(bcmd); }
+                if (nc.build_cmd[0]) { char bcmd[4096]; snprintf(bcmd, sizeof(bcmd), "__run_shell__:%s", nc.build_cmd); st = execute_command(bcmd); }
                 if (do_run_after && nc.run_cmd[0]) {
                     if (st == 0) {
-                        char rc[1024]; snprintf(rc, sizeof(rc), "__run_shell__:%s", nc.run_cmd); execute_command(rc);
+                        char rc[4096]; snprintf(rc, sizeof(rc), "__run_shell__:%s", nc.run_cmd); execute_command(rc);
                     } else {
                         char emsg[256]; snprintf(emsg, sizeof(emsg), "Run skipped: build failed (exit %d)", st);
                         output_append_colored_line(emsg);
@@ -4669,7 +5011,15 @@ static void handle_build_run(int do_run_after) {
     }
 }
 
-static void handle_run_only(int allow_interactive) {
+static void handle_run_only(int allow_interactive, const char *arg) {
+    // If an explicit argument was provided (e.g., "R file.py"), run it directly and return
+    if (arg && arg[0]) {
+        int rc = run_interactive(arg);
+        if (rc == 0) return; // success
+        if (rc == -1) { snprintf(E.msg, sizeof(E.msg), "Failed to run %s", arg); E.msg_time = time(NULL); return; }
+        snprintf(E.msg, sizeof(E.msg), "Run finished (exit %d)", rc); E.msg_time = time(NULL); return;
+    }
+
     char path[256] = {0}; BuildSystem bs = detect_build_system(path, sizeof(path));
     if (bs != BS_NONE) {
         // list typical run targets
@@ -4692,8 +5042,8 @@ static void handle_run_only(int allow_interactive) {
         BuildConfig cfg = {0};
         if (load_build_config(&cfg)) {
             if (prompt_yesno("Saved build config found. Run it?")) {
-                if (cfg.run_cmd[0]) { char rc[1024]; snprintf(rc, sizeof(rc), "__run_shell__:%s", cfg.run_cmd); execute_command(rc); }
-                else if (cfg.build_cmd[0]) { char bc[1024]; snprintf(bc, sizeof(bc), "__run_shell__:%s", cfg.build_cmd); execute_command(bc); }
+                if (cfg.run_cmd[0]) { char rc[4096]; snprintf(rc, sizeof(rc), "__run_shell__:%s", cfg.run_cmd); execute_command(rc); }
+                else if (cfg.build_cmd[0]) { char bc[4096]; snprintf(bc, sizeof(bc), "__run_shell__:%s", cfg.build_cmd); execute_command(bc); }
             }
             // In all cases when a saved config is present, we won't fall through to interactive setup for run-only
             return;
@@ -4702,8 +5052,8 @@ static void handle_run_only(int allow_interactive) {
         if (allow_interactive && prompt_yesno("No build system found. Run interactive setup?")) {
             BuildConfig nc = {0};
             if (interactive_setup(&nc)) {
-                if (nc.run_cmd[0]) { char rc[1024]; snprintf(rc, sizeof(rc), "__run_shell__:%s", nc.run_cmd); execute_command(rc); }
-                else if (nc.build_cmd[0]) { char bc[1024]; snprintf(bc, sizeof(bc), "__run_shell__:%s", nc.build_cmd); execute_command(bc); }
+                if (nc.run_cmd[0]) { char rc[4096]; snprintf(rc, sizeof(rc), "__run_shell__:%s", nc.run_cmd); execute_command(rc); }
+                else if (nc.build_cmd[0]) { char bc[4096]; snprintf(bc, sizeof(bc), "__run_shell__:%s", nc.build_cmd); execute_command(bc); }
                 return;
             } else {
                 snprintf(E.msg, sizeof(E.msg), "Interactive setup cancelled"); E.msg_time = time(NULL);
@@ -4711,8 +5061,12 @@ static void handle_run_only(int allow_interactive) {
         }
         // If we didn't run saved config and interactive setup isn't allowed (typical for R), try to run executable based on current file
         if (!allow_interactive) {
-            // Try to run (or auto-build then run) executable based on current file
+            // First attempt: try unified runner (interpreters or ./basename)
             if (E.filename && E.filename[0]) {
+                int rc = run_interactive(E.filename);
+                if (rc == 0) return; // success
+                // If runner failed, fall back to attempting a quick single-file build+run for compiled languages
+
                 char exe[256];
                 const char *base = strrchr(E.filename, '/');
                 base = base ? base + 1 : E.filename;
@@ -4748,7 +5102,7 @@ static void handle_run_only(int allow_interactive) {
 
                         // If executable missing but we have a sensible build command, try to build
                         if ((!has_exe || (has_src && has_exe && difftime(sexe.st_mtime, ssrc.st_mtime) < 0)) && buildcmd[0]) {
-                            char bcmd[1024]; snprintf(bcmd, sizeof(bcmd), "__run_shell__:%s", buildcmd);
+                            char bcmd[4096]; snprintf(bcmd, sizeof(bcmd), "__run_shell__:%s", buildcmd);
                             int st = execute_command(bcmd);
                             if (st == 0) {
                                 // build succeeded; run

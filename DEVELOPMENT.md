@@ -111,6 +111,10 @@ Editor known issues / work in progress
 - Config option: `show_tab_bar` (true|false) to enable or disable the visual tab bar beneath the status line.
 - New feature: `:browse` command opens a keyboard-driven file browser overlay that lists directory entries with numeric selection; supports entering directories and opening files into the current window.
 
+Recent fixes
+-------------
+- **Rust build/run argv bug** ✅: Fixed an issue where the automatic single-file build path produced malformed compile commands like `rustc rustc -o main`. Root cause: wrong argument ordering when generating the build command from templates. Fix: corrected Rust build template argument ordering and added debug logging in `execute_command` / `run_command_in_pty` to capture exact commands when running builds. If this reappears, check `config/last_build.log` for lines starting with `DEBUG:` which show the executed command and shell string.
+
 File browser navigation notes
 ---------------------------
 - The `:browse` overlay is a single, in-place overlay and does not spawn additional windows or stack overlays.
@@ -137,4 +141,12 @@ Code Improvement Plans
    - Eliminating duplicates and redundant functions.
    - Optimizing performance where possible.
    - Ensuring consistent coding style and documentation.
-
+ISSUES
+------
+- Segmentation fault when opening a file from the `find` command into a new tab.
+- Clear the terminal when exiting the program (ensure terminal state is restored).
+- Fix the `run` command (investigate failing cases and command construction).
+- Add a `find` feature to the outlog to better filter and navigate errors.
+- Add build and run support for additional languages.
+- Once the codebase is ~95% complete, plan and perform a refactor pass.
+- Investigate freezing on large codebases — possible buffer sizing or memory issue.

@@ -355,17 +355,20 @@ static enum HLType compute_classify(const char *lang, const char *path, size_t l
     if (strcmp(lang, "go") == 0) {
         if (is_go_standard(path, len)) return HL_INCLUDE_SYSTEM;
         char mod[512]; size_t mlen2 = len < sizeof(mod)-1 ? len : sizeof(mod)-1; memcpy(mod, path, mlen2); mod[mlen2] = '\0';
-        char cmd[512]; snprintf(cmd, sizeof(cmd), "go list -f '{{.Standard}}' \"%s\" 2>/dev/null", mod);
+        char cmd[2048]; snprintf(cmd, sizeof(cmd), "go list -f '{{.Standard}}' \"%s\" 2>/dev/null", mod);
         FILE *fp = popen(cmd, "r"); if (!fp) return HL_INCLUDE_THIRD_PARTY;
         char out[128]; int ok = 0; if (fgets(out, sizeof(out), fp)) { if (strstr(out, "true")) ok = 1; }
         pclose(fp);
-        if (ok) return HL_INCLUDE_SYSTEM; return HL_INCLUDE_THIRD_PARTY;
+        if (ok) {
+            return HL_INCLUDE_SYSTEM;
+        }
+        return HL_INCLUDE_THIRD_PARTY;
     }
     if (strcmp(lang, "rust") == 0) {
         if (len == 3 && strncmp(path, "std", 3) == 0) return HL_INCLUDE_SYSTEM;
         if (len == 4 && strncmp(path, "core", 4) == 0) return HL_INCLUDE_SYSTEM;
         char mod[256]; size_t mlen2 = len < sizeof(mod)-1 ? len : sizeof(mod)-1; memcpy(mod, path, mlen2); mod[mlen2] = '\0';
-        char cmd[512]; snprintf(cmd, sizeof(cmd), "cargo search %s --limit 1 2>/dev/null", mod);
+        char cmd[2048]; snprintf(cmd, sizeof(cmd), "cargo search %s --limit 1 2>/dev/null", mod);
         FILE *fp = popen(cmd, "r"); if (!fp) return HL_INCLUDE_THIRD_PARTY;
         char out[512]; int found = 0; if (fgets(out, sizeof(out), fp)) { if (strstr(out, "=") && strstr(out, mod)) found = 1; }
         pclose(fp);
@@ -521,7 +524,7 @@ enum HLType classify_include(const char *lang, const char *path, size_t len) {
         if (is_go_standard(path, len)) { res = HL_INCLUDE_SYSTEM; goto done; }
         /* Go package: use `go list -f '{{.Standard}}' pkg` to detect stdlib */
         char mod[512]; size_t mlen2 = len < sizeof(mod)-1 ? len : sizeof(mod)-1; memcpy(mod, path, mlen2); mod[mlen2] = '\0';
-        char cmd[512]; snprintf(cmd, sizeof(cmd), "go list -f '{{.Standard}}' \"%s\" 2>/dev/null", mod);
+        char cmd[2048]; snprintf(cmd, sizeof(cmd), "go list -f '{{.Standard}}' \"%s\" 2>/dev/null", mod);
         FILE *fp = popen(cmd, "r");
         if (!fp) { res = HL_INCLUDE_THIRD_PARTY; goto done; }
         char out[128]; int ok = 0; if (fgets(out, sizeof(out), fp)) { if (strstr(out, "true")) ok = 1; }
@@ -534,7 +537,7 @@ enum HLType classify_include(const char *lang, const char *path, size_t len) {
         if (len == 3 && strncmp(path, "std", 3) == 0) { res = HL_INCLUDE_SYSTEM; goto done; }
         if (len == 4 && strncmp(path, "core", 4) == 0) { res = HL_INCLUDE_SYSTEM; goto done; }
         char mod[256]; size_t mlen2 = len < sizeof(mod)-1 ? len : sizeof(mod)-1; memcpy(mod, path, mlen2); mod[mlen2] = '\0';
-        char cmd[512]; snprintf(cmd, sizeof(cmd), "cargo search %s --limit 1 2>/dev/null", mod);
+        char cmd[2048]; snprintf(cmd, sizeof(cmd), "cargo search %s --limit 1 2>/dev/null", mod);
         FILE *fp = popen(cmd, "r"); if (!fp) { res = HL_INCLUDE_THIRD_PARTY; goto done; }
         char out[512]; int found = 0; if (fgets(out, sizeof(out), fp)) { if (strstr(out, "=") && strstr(out, mod)) found = 1; }
         pclose(fp);
@@ -557,7 +560,7 @@ enum HLType classify_include(const char *lang, const char *path, size_t len) {
     if (strcmp(lang, "r") == 0) {
         /* Try Rscript to determine whether a package is base/recommended */
         char mod[256]; size_t mlen2 = len < sizeof(mod)-1 ? len : sizeof(mod)-1; memcpy(mod, path, mlen2); mod[mlen2] = '\0';
-        char cmd[512]; snprintf(cmd, sizeof(cmd), "Rscript -e \"pkg='%s'; ip=installed.packages(priority='base'); if (pkg %%in%% rownames(ip)) cat('BASE') else if (requireNamespace(pkg, quietly=TRUE)) cat('INSTALLED') else cat('NONE')\" 2>/dev/null", mod);
+        char cmd[2048]; snprintf(cmd, sizeof(cmd), "Rscript -e \"pkg='%s'; ip=installed.packages(priority='base'); if (pkg %%in%% rownames(ip)) cat('BASE') else if (requireNamespace(pkg, quietly=TRUE)) cat('INSTALLED') else cat('NONE')\" 2>/dev/null", mod);
         FILE *fp = popen(cmd, "r"); if (!fp) { res = HL_INCLUDE_THIRD_PARTY; goto done; }
         char out[128]; if (!fgets(out, sizeof(out), fp)) { pclose(fp); res = HL_INCLUDE_THIRD_PARTY; goto done; }
         pclose(fp);
