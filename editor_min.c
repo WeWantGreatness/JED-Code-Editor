@@ -3421,6 +3421,7 @@ static char **run_search(const char *query, int max, int *out_n) {
 
     close(pfd[1]); FILE *f = fdopen(pfd[0], "r"); if (!f) { close(pfd[0]); waitpid(pid, NULL, 0); if (out_n) *out_n = 0; return NULL; }
     int capacity = (max > 0) ? (max + 1) : 64; char **results = malloc(sizeof(char*) * capacity); int n = 0;
+    if (!results) { fclose(f); waitpid(pid, NULL, 0); if (out_n) *out_n = 0; return NULL; }
     char buf[1024]; while (fgets(buf, sizeof(buf), f)) {
         if (n >= max) break;
         // trim newline
@@ -3493,7 +3494,8 @@ static char **run_search(const char *query, int max, int *out_n) {
                     }
                 }
                 /* include matches from all files (do not skip project source files) */
-                results[n++] = strdup(full);
+                char *dup = strdup(full);
+                if (dup) results[n++] = dup;
                 continue;
             }
         }
@@ -3502,7 +3504,8 @@ static char **run_search(const char *query, int max, int *out_n) {
         snprintf(out, sizeof(out), "%s", buf);
         /* sanitize fallback */
         for (char *p = out; *p; p++) { unsigned char uc = (unsigned char)*p; if (uc != '\t' && uc != '\n' && uc != '\r' && (uc < 32 || uc == 127)) *p = ' '; }
-        results[n++] = strdup(out);
+        char *dup = strdup(out);
+        if (dup) results[n++] = dup;
     }
     fclose(f); waitpid(pid, NULL, 0);
     if (n == 0) { free(results); if (out_n) *out_n = 0; return NULL; }
@@ -3680,6 +3683,7 @@ static void render_suggestions_overlay(void) {
         if (rn>0) write(STDOUT_FILENO, buf, (size_t)rn);
         int isSel = (idx == sel);
         if (isSel) write(STDOUT_FILENO, "\x1b[7m", 4);
+        if (!ActiveMatches[idx]) { if (isSel) write(STDOUT_FILENO, "\x1b[m", 3); continue; }
         /* If this is a search result (ActiveFilenameStart < 0) the entry is
            formatted as "path:lineno: snippet"; print path in green then snippet
            (which may contain ANSI highlighting already). */
@@ -5991,25 +5995,12 @@ static void editorProcessKeypress(void) {
             for (int i = 0; i < NumTabs; i++) {
                 if (!Tabs[i].name || !*Tabs[i].name) { new_idx = i; break; }
             }
-            if (new_idx == -1 && NumTabs < MAX_TABS) { new_idx = NumTabs++; }
+            if (new_idx == -1 && NumTabs < MAX_TABS) { new_idx = NumTabs; }
             if (new_idx != -1) {
-                // save current to home if needed
+                // Delegate to the standard helper which correctly appends and switches
+                // so that tab allocation, snapshotting and UI updates are consistent.
                 if (CurTab == -1) save_current_to_home();
-                // ensure the Tabs array has space and clear any reused slot so stale cursor data does not leak in
-                if (new_idx >= NumTabs) {
-                    struct Tab *tmp = realloc(Tabs, sizeof(struct Tab) * (new_idx + 1));
-                    if (!tmp) { snprintf(E.msg, sizeof(E.msg), "Cannot allocate tab slot"); E.msg_time = time(NULL); E.prompt_visible = 0; editorRefreshScreen(); return; }
-                    Tabs = tmp;
-                    // initialize any newly created slots up to new_idx
-                    for (int __i = NumTabs; __i <= new_idx; __i++) Tabs[__i] = (struct Tab){0};
-                    NumTabs = new_idx + 1;
-                } else {
-                    // reuse: free existing data and zero the slot to avoid restoring previous cursor/offsets
-                    free_tab(&Tabs[new_idx]); Tabs[new_idx] = (struct Tab){0};
-                }
-                // switch to new tab index and open file (which will now load into a clean slot)
-                CurTab = new_idx;
-                open_file_and_seek(E.pending_path, E.pending_lineno);
+                open_file_in_new_tab(E.pending_path);
             }
             E.prompt_visible = 0;
         } else if (c == 'c' || c == 'C' || c == 27) { // ESC or c
