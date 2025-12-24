@@ -2014,9 +2014,14 @@ static int execute_command(const char *cmd) {
             if (!f) {
                 // file doesn't exist: create it
                 free(E.filename); E.filename = strdup(fname); free(E.saved_snapshot); E.saved_snapshot = NULL; editorFreeRows(); editorAppendRow(""); save_snapshot(); snprintf(E.msg, sizeof(E.msg), "New file %s", fname); E.msg_time = time(NULL); E.welcome_visible = 0;
+                /* ensure new file opens at top */
+                E.cy = 0; E.cx = 0; E.row_offset = 0; E.col_offset = 0; editorScroll();
             } else {
                 fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
-                char *buf = malloc(sz + 1); if (buf) { fread(buf, 1, sz, f); buf[sz] = '\0'; load_buffer_from_string(buf); free(buf); free(E.filename); E.filename = strdup(fname); save_snapshot(); free(E.saved_snapshot); E.saved_snapshot = serialize_buffer(); snprintf(E.msg, sizeof(E.msg), "Opened %s", fname); E.msg_time = time(NULL); E.welcome_visible = 0; }
+                char *buf = malloc(sz + 1); if (buf) { fread(buf, 1, sz, f); buf[sz] = '\0'; load_buffer_from_string(buf); free(buf); free(E.filename); E.filename = strdup(fname); save_snapshot(); free(E.saved_snapshot); E.saved_snapshot = serialize_buffer(); snprintf(E.msg, sizeof(E.msg), "Opened %s", fname); E.msg_time = time(NULL); E.welcome_visible = 0;
+                    /* ensure opened file shows from the top */
+                    E.cy = 0; E.cx = 0; E.row_offset = 0; E.col_offset = 0; editorScroll();
+                }
                 fclose(f);
             }
             // debug: confirm push succeeded (num tabs)
@@ -2915,7 +2920,10 @@ static int readKey(void) {
 }
 
 static void editorScroll(void) {
-    int content_rows = E.screenrows - 1; // status reserved
+    // compute visible content rows consistently with editorRefreshScreen
+    // reserve 1 row for status; reserve an additional row if tab bar is shown
+    int content_rows = E.screenrows - 1;
+    if (conf.show_tab_bar) content_rows -= 1;
     if (content_rows < 1) content_rows = 1;
     if (E.cy < E.row_offset) {
         E.row_offset = E.cy;
@@ -3281,6 +3289,12 @@ static char **collect_dir_paths(const char *base, int max_depth, int *out_n) {
     return list;
 }
 
+static char *normalize_display_path(const char *p) {
+    if (!p) return NULL;
+    if (p[0] == '.' && p[1] == '/') return strdup(p + 2);
+    return strdup(p);
+}
+
 static char **get_fuzzy_matches(const char *dir, const char *pat, int max, int *out_n, int recursive, int executable_only, int search_directories) {
     if (search_directories) {
         // Try with max depth 6 first
@@ -3333,7 +3347,7 @@ static char **get_fuzzy_matches(const char *dir, const char *pat, int max, int *
         qsort(matches, mc, sizeof(struct match_item), match_cmp);
         int ret_n = (mc < max) ? mc : max;
         char **ret = malloc(sizeof(char*) * ret_n);
-        for (int i = 0; i < ret_n; i++) ret[i] = strdup(matches[i].name);
+        for (int i = 0; i < ret_n; i++) ret[i] = normalize_display_path(matches[i].name);
         for (int i = 0; i < mc; i++) free(matches[i].name);
         free(matches);
         if (out_n) *out_n = ret_n; return ret;
@@ -3359,7 +3373,7 @@ static char **get_fuzzy_matches(const char *dir, const char *pat, int max, int *
         qsort(matches, mc, sizeof(struct match_item), match_cmp);
         int ret_n = (mc < max) ? mc : max;
         char **ret = malloc(sizeof(char*) * ret_n);
-        for (int i = 0; i < ret_n; i++) ret[i] = strdup(matches[i].name);
+        for (int i = 0; i < ret_n; i++) ret[i] = normalize_display_path(matches[i].name);
         for (int i = 0; i < mc; i++) free(matches[i].name);
         free(matches);
         if (out_n) *out_n = ret_n; return ret;
@@ -3466,7 +3480,19 @@ static char **run_search(const char *query, int max, int *out_n) {
                     pos, snippet,
                     (int)strlen(qcopy), snippet + pos,
                     (int)(strlen(snippet) - pos - strlen(qcopy)), snippet + pos + strlen(qcopy));
-                char full[2048]; snprintf(full, sizeof(full), "%s:%d: %s", path, lineno, out);
+                char full[2048];
+                const char *display_path = path;
+                if (display_path[0] == '.' && display_path[1] == '/') display_path += 2;
+                snprintf(full, sizeof(full), "%s:%d: %s", display_path, lineno, out);
+                /* Sanitize snippet by removing control characters (non-printable except common whitespace) */
+                for (char *p = full; *p; p++) {
+                    unsigned char uc = (unsigned char)*p;
+                    if (uc != '\t' && uc != '\n' && uc != '\r' && (uc < 32 || uc == 127)) {
+                        /* replace with space to avoid rendering/terminal issues */
+                        *p = ' ';
+                    }
+                }
+                /* include matches from all files (do not skip project source files) */
                 results[n++] = strdup(full);
                 continue;
             }
@@ -3474,6 +3500,8 @@ static char **run_search(const char *query, int max, int *out_n) {
         // fallback: include trimmed rest
         char out[700]; if (L > 600) { buf[597] = '.'; buf[598] = '.'; buf[599] = '.'; buf[600] = '\0'; }
         snprintf(out, sizeof(out), "%s", buf);
+        /* sanitize fallback */
+        for (char *p = out; *p; p++) { unsigned char uc = (unsigned char)*p; if (uc != '\t' && uc != '\n' && uc != '\r' && (uc < 32 || uc == 127)) *p = ' '; }
         results[n++] = strdup(out);
     }
     fclose(f); waitpid(pid, NULL, 0);
@@ -3978,9 +4006,13 @@ static void open_file_in_current_window_no_push(const char *fname) {
         __tmpn = snprintf(__tmpbuf, sizeof(__tmpbuf), "\x1b[%d;1H\x1b[K", E.screenrows); if (__tmpn>0) write(STDOUT_FILENO, __tmpbuf, (size_t)__tmpn);
         if (resp != 'y') { snprintf(E.msg, sizeof(E.msg), "Open cancelled"); E.msg_time = time(NULL); return; }
         free(E.filename); E.filename = strdup(fname); free(E.saved_snapshot); E.saved_snapshot = NULL; editorFreeRows(); editorAppendRow(""); save_snapshot(); set_language_from_filename(fname); snprintf(E.msg, sizeof(E.msg), "New file %s", fname); E.msg_time = time(NULL);
+        /* Ensure new file opens at the top */
+        E.cy = 0; E.cx = 0; E.row_offset = 0; E.col_offset = 0; editorScroll();
     } else {
         fseek(f, 0, SEEK_END); long sz = ftell(f); fseek(f, 0, SEEK_SET);
-        char *buf = malloc(sz + 1); if (buf) { fread(buf, 1, sz, f); buf[sz] = '\0'; load_buffer_from_string(buf); free(buf); free(E.filename); E.filename = strdup(fname); save_snapshot(); free(E.saved_snapshot); E.saved_snapshot = serialize_buffer(); set_language_from_filename(fname); snprintf(E.msg, sizeof(E.msg), "Opened %s", fname); E.msg_time = time(NULL); }
+        char *buf = malloc(sz + 1); if (buf) { fread(buf, 1, sz, f); buf[sz] = '\0'; load_buffer_from_string(buf); free(buf); free(E.filename); E.filename = strdup(fname); save_snapshot(); free(E.saved_snapshot); E.saved_snapshot = serialize_buffer(); set_language_from_filename(fname); snprintf(E.msg, sizeof(E.msg), "Opened %s", fname); E.msg_time = time(NULL);
+            /* Ensure opened file shows from the top */
+            E.cy = 0; E.cx = 0; E.row_offset = 0; E.col_offset = 0; editorScroll(); }
         fclose(f);
     }
 }
@@ -4003,6 +4035,8 @@ static void open_file_in_new_tab(const char *fname) {
         fclose(f);
         t.saved_snapshot = t.snapshot ? strdup(t.snapshot) : NULL;
     }
+    /* Ensure new tab opens at the top (cursor and view) */
+    t.cx = 0; t.cy = 0; t.row_offset = 0; t.col_offset = 0;
     /* OPEN_TAB_IMPL */
     int idx = append_tab(t);
     if (idx >= 0) switch_to_tab(idx);
@@ -5128,6 +5162,11 @@ static void handle_run_only(int allow_interactive, const char *arg) {
 static void show_file_browser(void) {
     char **entries = NULL; int nentries = 0;
     char cwd[512]; getcwd(cwd, sizeof(cwd));
+    // remember whether we started the browser from the welcome page; use this
+    // to decide whether to restore the welcome page if the user cancels.
+    int started_from_welcome = (E.welcome_visible || E.browser_from_welcome);
+    /* clear browser_from_welcome to avoid stale state in later calls */
+    E.browser_from_welcome = 0;
     // ensure other overlays (help) are hidden while browser is active
     E.help_visible = 0;
     int file_opened = 0;
@@ -5171,8 +5210,8 @@ static void show_file_browser(void) {
         if (winch_received) { getWindowSize(); editorScroll(); editorRefreshScreen(); winch_received = 0; }
         int page_size = E.screenrows - 8; if (page_size < 3) page_size = 3;
 
-        // clear underlying editor region (lines below status/tab) to avoid leftover artifacts
-        for (int _ln = 3; _ln <= E.screenrows - 1; _ln++) {
+        // clear underlying editor region (clear full screen to avoid leftover artifacts from editor content)
+        for (int _ln = 1; _ln <= E.screenrows; _ln++) {
             char __tmp[64]; int __n = snprintf(__tmp, sizeof(__tmp), "\x1b[%d;1H\x1b[2K", _ln);
             if (__n > 0) write(STDOUT_FILENO, __tmp, (size_t)__n);
         }
@@ -5536,7 +5575,7 @@ static void show_file_browser(void) {
         for (int i = 0; i < dh_count; i++) { free(dir_history[i]); }
         free(dir_history); dir_history = NULL; dh_count = 0;
     }
-    if (E.browser_from_welcome && !file_opened) {
+    if (started_from_welcome && !file_opened) {
         E.welcome_visible = 1;
         E.browser_from_welcome = 0;
     }
@@ -5588,9 +5627,10 @@ static void editorRefreshScreen(void) {
             }
         }
         int tab_index = 1;
-        // render home
+        // render home (display-friendly)
         {
-            int namelen = (int)strlen(home_name);
+            char *home_display = normalize_display_path(home_name);
+            int namelen = (int)strlen(home_display ? home_display : home_name);
             int bracket_len = 4 + (home_unsaved ? 1 : 0); // [1] or [*1]
             int blen = bracket_len + namelen + 1; // + space
             if (blen > remaining) {
@@ -5600,7 +5640,7 @@ static void editorRefreshScreen(void) {
                 else {
                     write(STDOUT_FILENO, pfx, pn);
                     int can = remaining - pn;
-                    if (can > 0) write(STDOUT_FILENO, home_name, can);
+                    if (can > 0) write(STDOUT_FILENO, home_display ? home_display : "", can);
                 }
                 if (CurTab == -1) write(STDOUT_FILENO, "\x1b[m", 3);
                 remaining = 0;
@@ -5612,17 +5652,18 @@ static void editorRefreshScreen(void) {
                 write(STDOUT_FILENO, "1", 1);
                 write(STDOUT_FILENO, "\x1b[0m", 4);
                 write(STDOUT_FILENO, "]", 1);
-                write(STDOUT_FILENO, home_name, namelen);
+                write(STDOUT_FILENO, home_display ? home_display : "", namelen);
                 write(STDOUT_FILENO, " ", 1);
                 if (CurTab == -1) write(STDOUT_FILENO, "\x1b[m", 3);
                 remaining -= blen;
             }
-            tab_index++;
+            tab_index++; if (home_display) free(home_display);
         }
         // render stored tabs
         for (int t = 0; t < NumTabs && remaining > 0; t++) {
             const char *tname = (Tabs[t].name && *Tabs[t].name) ? Tabs[t].name : "(No Name)";
-            int namelen = (int)strlen(tname);
+            char *t_display = normalize_display_path(tname);
+            int namelen = (int)strlen(t_display ? t_display : tname);
             int unsaved = 0;
             if (t == CurTab) {
                 char *curss = serialize_buffer();
@@ -5649,7 +5690,7 @@ static void editorRefreshScreen(void) {
                 else {
                     write(STDOUT_FILENO, pfx, pn);
                     int can = remaining - pn;
-                    if (can > 0) write(STDOUT_FILENO, tname, can);
+                    if (can > 0) write(STDOUT_FILENO, t_display ? t_display : "", can);
                 }
                 if (t == CurTab) write(STDOUT_FILENO, "\x1b[m", 3);
                 remaining = 0;
@@ -5663,11 +5704,12 @@ static void editorRefreshScreen(void) {
             write(STDOUT_FILENO, numbuf, nn);
             write(STDOUT_FILENO, "\x1b[0m", 4);
             write(STDOUT_FILENO, "]", 1);
-            write(STDOUT_FILENO, tname, namelen);
+            write(STDOUT_FILENO, t_display ? t_display : "", namelen);
             write(STDOUT_FILENO, " ", 1);
             if (t == CurTab) write(STDOUT_FILENO, "\x1b[m", 3);
             remaining -= blen;
             tab_index++;
+            if (t_display) free(t_display);
         }
         // fill rest of line with spaces and newline
         for (int i = 0; i < remaining; i++) write(STDOUT_FILENO, " ", 1);
@@ -5678,6 +5720,8 @@ static void editorRefreshScreen(void) {
     char status[256];
     /* show filename (or No Name) and saved/unsaved marker */
     const char *name = E.filename ? E.filename : "No Name";
+    /* display-friendly name (strip leading './' if present) */
+    char *display_name = NULL; if (name && name[0]) display_name = normalize_display_path(name);
     char save_mark[16] = "";
     if (!E.saved_snapshot) {
         snprintf(save_mark, sizeof(save_mark), " (unsaved)");
@@ -5691,7 +5735,8 @@ static void editorRefreshScreen(void) {
             snprintf(save_mark, sizeof(save_mark), " (unsaved)");
         }
     }
-    int nleft = snprintf(status, sizeof(status), "%s%s - %d lines", name, save_mark, E.numrows);
+    int nleft = snprintf(status, sizeof(status), "%s%s - %d lines", display_name ? display_name : name, save_mark, E.numrows);
+    if (display_name) { free(display_name); display_name = NULL; }
     char rstatus[64];
     int visible = E.numrows - E.row_offset;
     if (visible > content_rows) visible = content_rows;
@@ -5950,9 +5995,20 @@ static void editorProcessKeypress(void) {
             if (new_idx != -1) {
                 // save current to home if needed
                 if (CurTab == -1) save_current_to_home();
-                // switch to new tab
+                // ensure the Tabs array has space and clear any reused slot so stale cursor data does not leak in
+                if (new_idx >= NumTabs) {
+                    struct Tab *tmp = realloc(Tabs, sizeof(struct Tab) * (new_idx + 1));
+                    if (!tmp) { snprintf(E.msg, sizeof(E.msg), "Cannot allocate tab slot"); E.msg_time = time(NULL); E.prompt_visible = 0; editorRefreshScreen(); return; }
+                    Tabs = tmp;
+                    // initialize any newly created slots up to new_idx
+                    for (int __i = NumTabs; __i <= new_idx; __i++) Tabs[__i] = (struct Tab){0};
+                    NumTabs = new_idx + 1;
+                } else {
+                    // reuse: free existing data and zero the slot to avoid restoring previous cursor/offsets
+                    free_tab(&Tabs[new_idx]); Tabs[new_idx] = (struct Tab){0};
+                }
+                // switch to new tab index and open file (which will now load into a clean slot)
                 CurTab = new_idx;
-                // open file
                 open_file_and_seek(E.pending_path, E.pending_lineno);
             }
             E.prompt_visible = 0;
@@ -6235,20 +6291,35 @@ static void editorProcessKeypress(void) {
 
     // Navigation keys - work in both modes
     if (c == ARROW_UP) {
+        /* defensive checks to prevent segfaults when buffer is empty or rows are missing */
+        if (!E.rows || E.numrows <= 0) { editorScroll(); return; }
         if (E.cy > 0) {
             E.cy--;
-            int rowlen = strlen(E.rows[E.cy]);
-            if (E.cx > rowlen) E.cx = rowlen;
+            if (E.cy < 0) E.cy = 0;
+            if (E.cy >= E.numrows) E.cy = E.numrows - 1;
+            if (E.rows[E.cy]) {
+                int rowlen = (int)strlen(E.rows[E.cy]);
+                if (E.cx > rowlen) E.cx = rowlen;
+            } else {
+                E.cx = 0;
+            }
         }
         E.last_edit_kind = EDIT_KIND_NONE;
         editorScroll();
         return;
     }
     if (c == ARROW_DOWN) {
+        if (!E.rows || E.numrows <= 0) { editorScroll(); return; }
         if (E.cy + 1 < E.numrows) {
             E.cy++;
-            int rowlen = strlen(E.rows[E.cy]);
-            if (E.cx > rowlen) E.cx = rowlen;
+            if (E.cy < 0) E.cy = 0;
+            if (E.cy >= E.numrows) E.cy = E.numrows - 1;
+            if (E.rows[E.cy]) {
+                int rowlen = (int)strlen(E.rows[E.cy]);
+                if (E.cx > rowlen) E.cx = rowlen;
+            } else {
+                E.cx = 0;
+            }
         }
         E.last_edit_kind = EDIT_KIND_NONE;
         editorScroll();
