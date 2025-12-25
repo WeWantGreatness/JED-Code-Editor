@@ -5029,13 +5029,8 @@ static int run_interactive(const char *fname) {
             snprintf(cmd, sizeof(cmd), "'%s'", exe);
         }
     } else {
-        /* No extension: if executable, run directly; otherwise try ./basename */
-        struct stat st;
-        if (stat(fname, &st) == 0 && (st.st_mode & S_IXUSR)) {
-            snprintf(cmd, sizeof(cmd), "'%s'", fname);
-        } else {
-            snprintf(cmd, sizeof(cmd), "'%s'", exe);
-        }
+        /* No extension: run ./basename (works for both executable and non-executable) */
+        snprintf(cmd, sizeof(cmd), "'%s'", exe);
     }
     char runcmd[8192];
     snprintf(runcmd, sizeof(runcmd), "__run_shell__:%s", cmd);
