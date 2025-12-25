@@ -110,10 +110,40 @@ Editor known issues / work in progress
 - Quit prompt & transient messages: ensure prompts (save on quit, swap recovery) are shown cleanly below the status bar and are cleared reliably; minor formatting tweaks may still be needed.
 - Config option: `show_tab_bar` (true|false) to enable or disable the visual tab bar beneath the status line.
 - New feature: `:browse` command opens a keyboard-driven file browser overlay that lists directory entries with numeric selection; supports entering directories and opening files into the current window.
+- **Find results formatting & highlighting**: Improve `find` command output so results are concise and readable (e.g., `path:lineno: snippet`) and do not include garbled or confusing lines. Add ANSI color highlighting of the matched search terms in the snippet (so matches stand out in the output pane) while **avoiding** introducing a heavy curses-based UI; make this behaviour toggleable via config (`show_find_highlight = true` by default). Acceptance criteria: (1) `find` results show one compact snippet per match without extraneous control characters, (2) matched terms are highlighted with ANSI color codes, (3) an option exists to show expanded context lines when requested.
 
 Recent fixes
 -------------
 - **Rust build/run argv bug** ✅: Fixed an issue where the automatic single-file build path produced malformed compile commands like `rustc rustc -o main`. Root cause: wrong argument ordering when generating the build command from templates. Fix: corrected Rust build template argument ordering and added debug logging in `execute_command` / `run_command_in_pty` to capture exact commands when running builds. If this reappears, check `config/last_build.log` for lines starting with `DEBUG:` which show the executed command and shell string.
+- **Run command executable file execution bug** ✅: Fixed an issue where selecting executable files (like "main") from the "run" command suggestions would fail with "sh: 1: main: not found". Root cause: The `run_interactive` function had separate logic for executable vs non-executable files without extensions, where executables were run as just the filename (e.g., "main") but non-executables used "./main". Since executable files in the current directory aren't in PATH, they need the "./" prefix too. Fix: Simplified the logic to always use "./basename" format for files without extensions, removing the executable check that was causing inconsistent behavior.
+
+Verified implementation status
+------------------------------
+This section records which items from the roadmap have been verified in source and which are still pending. Code references are included for quick verification.
+
+- Planned features (short)
+  - [ ] **Autosave** — *Not implemented.* `conf.auto_save_interval` exists but no autosave timer or write logic. (See `editor_min.c` L855–920 for config parsing.)
+  - [x] **Simple config file** — *Implemented.* `load_config()` reads `~/.jedrc` / `$XDG_CONFIG_HOME/jed/config` and parses keys. (`editor_min.c` L855–920)
+
+- Additional planned features
+  - [x] **Change Directory in Browser Menu** — *Implemented.* Browser supports entering directories and pushing history (`show_file_browser()` `editor_min.c` L5319–5760).
+  - [x] **Delete Folder** — *Implemented.* Directory delete exists in browser and suggestions flows (`show_file_browser()` L5536–5568; `accept_active_suggestion()` L3828–3855).
+  - [x] **File Rename (`fn`)** — *Implemented.* `fn`, `fn add`, `fn del` supported (`editor_min.c` L1745–1860).
+  - [x] **Create New File with Tab Options** — *Implemented.* Browser offers New Tab and `opent` exists (`show_file_browser()` L5588–5618; `opent` command parser).
+  - [ ] **Native Git Integration** — *Not implemented.* Only syntax highlight and search/use of `rg`/`grep` present; no `git` commands.
+  - [x] **Open Man Pages** — *Implemented.* `man <topic>` runs `man topic | col -b` and shows in output pane (`editor_min.c` L1940–1950, L4105–4135).
+  - [ ] **Move Files in Browser (`mv`)** — *Not implemented.* No `mv` action in browser or command parser.
+  - [x] **Delete All Lines (`dall`)** — *Implemented.* Clears buffer and snapshots for undo (`editor_min.c` L2068–2100).
+
+- Packaging & CI
+  - [x] **Makefile** with `install`/`install-man`/`package` — *Implemented.* (`Makefile`)
+  - [x] **Debian skeleton / postrm** — *Implemented / present.* (`debian/` and `debian/postrm`)
+  - [x] **GitHub Actions build workflow** — *Implemented.* `.github/workflows/build-deb.yml` builds `.deb`.
+  - [ ] **CI lint step (run `lintian`)** — *Missing.* Workflow installs `lintian` but does not run it nor fail on important warnings.
+
+Notes & suggested next steps
+---------------------------
+- I can implement any of the missing items (Autosave, `mv` command, CI lint step). Which would you like prioritized?
 
 File browser navigation notes
 ---------------------------
@@ -143,10 +173,10 @@ Code Improvement Plans
    - Ensuring consistent coding style and documentation.
 ISSUES
 ------
-- Segmentation fault when opening a file from the `find` command into a new tab.
+- Segmentation fault when opening a file from the `find` command into a new tab. ✅ Fixed.
 - Clear the terminal when exiting the program (ensure terminal state is restored).
 - Fix the `run` command (investigate failing cases and command construction).
 - Add a `find` feature to the outlog to better filter and navigate errors.
 - Add build and run support for additional languages.
 - Once the codebase is ~95% complete, plan and perform a refactor pass.
-- Investigate freezing on large codebases — possible buffer sizing or memory issue.
+- Investigate freezing on large codebases — possible buffer sizing or memory issue. ✅ Fixed.
