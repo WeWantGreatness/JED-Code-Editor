@@ -2987,6 +2987,9 @@ static void editorScroll(void) {
 
 static void draw_help_page(void) {
     // Full-screen help page with scrolling and selection
+    // Clear screen first
+    write(STDOUT_FILENO, "\x1b[2J", 4);
+    write(STDOUT_FILENO, "\x1b[H", 3);
     const char *lines[] = {
         "\x1b[96mCommand Cheat Sheet\x1b[0m",
         "",
