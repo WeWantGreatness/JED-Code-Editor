@@ -187,6 +187,7 @@ struct Editor {
     int command_len;
     int help_visible;   // help overlay flag
     int help_scroll;    // scroll offset for help overlay
+    int help_sel;       // selected line index within help overlay
     int help_from_welcome; // flag if help was opened from welcome
     int browser_from_welcome; // flag if browser was opened from welcome
     int welcome_visible; // welcome/title screen visible flag
@@ -2163,7 +2164,21 @@ static int execute_command(const char *cmd) {
             char next = (i + 2 < L) ? cmd[i+2] : '\0';
             if (!(next == '\0' || next == ' ' || isdigit((unsigned char)next))) { i++; continue; }
             i += 2; int starti = i; int num = parse_number_at(cmd, &i);
-            if (num >= 1 && num <= E.numrows) {
+            if (num == -1) {
+                /* No numeric argument: jump to front of current line */
+                int target = E.cy;
+                if (target < 0) target = 0;
+                if (target >= E.numrows) target = (E.numrows > 0) ? E.numrows - 1 : 0;
+                /* move to first non-whitespace on the target line */
+                {
+                    char *trow = E.rows[target];
+                    int first_non = 0; while (trow[first_non] && (trow[first_non] == ' ' || trow[first_non] == '\t')) first_non++;
+                    int rowlen = (int)strlen(trow);
+                    if (first_non > rowlen) first_non = rowlen;
+                    E.cy = target; E.cx = first_non;
+                }
+                editorScroll(); snprintf(E.msg, sizeof(E.msg), "Jumped to line %d", target + 1); E.msg_time = time(NULL);
+            } else if (num >= 1 && num <= E.numrows) {
                 /* ensure strict: after number must be end or space */
                 if (i == starti || cmd[i] == '\0' || cmd[i] == ' ') {
                         E.cy = num - 1;
@@ -2209,6 +2224,8 @@ static int execute_command(const char *cmd) {
         // log - show output pane
         if (i + 2 < L && strncmp(&cmd[i], "log", 3) == 0) {
             i += 3;
+            // ensure we view the build/run log (not the man log)
+            E.output_mode = 0; E.output_man_topic[0] = '\0';
             E.output_visible = 1;
             if (E.output_n > 0) { E.output_scroll = 0; E.output_sel = 0; }
             editorRefreshScreen();
@@ -2235,7 +2252,7 @@ static int execute_command(const char *cmd) {
         }
 
         // help - toggle help overlay
-        if (i + 3 < L && strncmp(&cmd[i], "help", 4) == 0) { i += 4; E.welcome_visible = 0; E.help_visible = 1; E.help_scroll = 0; continue; }
+        if (i + 3 < L && strncmp(&cmd[i], "help", 4) == 0) { i += 4; E.welcome_visible = 0; E.help_visible = 1; E.help_scroll = 0; E.help_sel = 0; continue; }
 
         // tabc <N> - close tab N (1-based). Allow compact forms like "tabc1" or "tabc 1" etc.
         // tabc all - close all tabs with prompts for unsaved changes
@@ -2972,22 +2989,27 @@ static void draw_help_overlay(void) {
     // hide cursor during help
     write(STDOUT_FILENO, "\x1b[?25l", 6);
     // build a more compact, nicely padded help box (similar look to the file browser)
+    /*ATTENTION! PAY ATTENTION TO HOW THE EVERYTHING IS ALIGNED HERE IS IT NOT DUDE TO ANY PADDING 
+    IT LITERALLY NEEDS TO WRITTEN WITH THE NESCESSAY SPACES TO MAKE SURE EVERYTHING ALIGNS*/
     const char *lines[] = {
         "\x1b[96mCommand Cheat Sheet\x1b[0m",
         "",
         "\x1b[96mFile & Tab Management\x1b[0m",
-        "\x1b[93mfn <file>\x1b[0m                Name/rename current file",
-        "\x1b[93mfn add <file>\x1b[0m            Create file on disk",
-        "\x1b[93mfn del <file>\x1b[0m            Delete file",
-        "\x1b[93mopen <file>\x1b[0m              Open in current window",
-        "\x1b[93mopent <file>\x1b[0m             Open in new tab",
+        "\x1b[93mfn <file>\x1b[0m                  Name/rename current file",
+        "\x1b[93mfn add <file>\x1b[0m              Create file on disk",
+        "\x1b[93mfn del <file>\x1b[0m              Delete file",
+        "\x1b[93mopen <file>\x1b[0m                Open in current window",
+        "\x1b[93mopent <file>\x1b[0m               Open in new tab",
         "\x1b[93mtabs\x1b[0m                       List tabs",
         "\x1b[93mtab<N>\x1b[0m                     Switch to tab N",
         "\x1b[93mtabc<N>\x1b[0m                    Close tab N",
         "\x1b[93mtabc all\x1b[0m                   Close all tabs (prompts to save)",
-        "\x1b[93mmd <dir>\x1b[0m                  Make directory",
-        "\x1b[93mmd -p <dir>\x1b[0m               Make directory (recursive)",
-        "\x1b[93mcd <path>\x1b[0m                Change directory",
+        "\x1b[93mmd <dir>\x1b[0m                   Make directory",
+        "\x1b[93mmd -p <dir>\x1b[0m                Make directory (recursive)",
+        "\x1b[93mcd <path>\x1b[0m                  Change directory",
+        "",
+        "\x1b[32mNote: 'N' = line number; omit N to apply the command\x1b[0m",
+        "\x1b[32mto the current line (cursor position)\x1b[0m",
         "",
         "\x1b[96mEditing\x1b[0m",
         "\x1b[93ms\x1b[0m                          Save",
@@ -3000,9 +3022,8 @@ static void draw_help_overlay(void) {
         "\x1b[93mpl<N>\x1b[0m                      Paste at line N",
         "\x1b[93mplf<N>\x1b[0m                     Paste at front of line N",
         "\x1b[93mdall\x1b[0m                       Delete all lines",
-        "\x1b[93mdl\x1b[0m                         Delete current line",
-        "\x1b[93mdl<Range>\x1b[0m                  Clear text on range (remove empty lines)",
         "\x1b[93mdl<N>\x1b[0m                      Clear text on line N (remove if empty)",
+        "\x1b[93mdl<Range>\x1b[0m                  Clear text on range (remove empty lines)",
         "\x1b[93mdl<N>w\x1b[0m                     Delete last N words",
         "\x1b[93mdf<N>w\x1b[0m                     Delete first N words",
         "",
@@ -3018,9 +3039,14 @@ static void draw_help_overlay(void) {
         "\x1b[93mot\x1b[0m                         Open Terminal",
         "Type \"\x1b[91mexit\x1b[0m\" into the terminal to close",
         "",
+        "\x1b[96mBuild & Run\x1b[0m",
+        "\x1b[93mB / BR\x1b[0m                     Build / Build & Run",
+        "\x1b[93mR / run <args>\x1b[0m             Run program (interactive)",
+        "\x1b[93mlog\x1b[0m                        Show output log (build/run)",
+        "",
         "\x1b[96mHelp\x1b[0m",
         "\x1b[93mhelp\x1b[0m                       Toggle help overlay",
-        "\x1b[93m?\x1b[0m                          Toggle help overlay",
+        "\x1b[93mman <topic>\x1b[0m                Open man page in output pane",
         "",
         ""
     };
@@ -3029,11 +3055,17 @@ static void draw_help_overlay(void) {
     // compute content height
     int content_h = E.screenrows - 6; // leave margin
     if (content_h > n) content_h = n;
+    // ensure help selection is valid and visible before drawing
+    if (E.help_sel < 0) E.help_sel = 0;
+    if (E.help_sel >= n) E.help_sel = (n > 0) ? n - 1 : 0;
     // clamp scroll
     if (E.help_scroll < 0) E.help_scroll = 0;
     int max_scroll = n - content_h;
     if (max_scroll < 0) max_scroll = 0;
     if (E.help_scroll > max_scroll) E.help_scroll = max_scroll;
+    // ensure selected line is visible
+    if (E.help_sel < E.help_scroll) E.help_scroll = E.help_sel;
+    else if (E.help_sel >= E.help_scroll + content_h) E.help_scroll = E.help_sel - content_h + 1;
 
     // compute required width based on longest line
     int maxlen = 0; for (int i = 0; i < n; i++) { int l = (int)strlen(lines[i]); if (l > maxlen) maxlen = l; }
@@ -3062,12 +3094,131 @@ static void draw_help_overlay(void) {
         int towrite = (len > avail) ? avail : len;
         // if this line looks like a section header (ends with ':' and not empty), color it cyan
         int is_header = (len > 0 && line[len-1] == ':');
+        int is_sel = (line_idx == E.help_sel);
+        if (is_sel) write(STDOUT_FILENO, "\x1b[7m", 4); // reverse video on selection
         if (is_header) write(STDOUT_FILENO, "\x1b[96m", 5);
         if (towrite > 0) write(STDOUT_FILENO, line, (size_t)towrite);
         if (is_header) write(STDOUT_FILENO, "\x1b[0m", 4);
+        if (is_sel) write(STDOUT_FILENO, "\x1b[0m", 4);
         // pad remainder of the line
         int pad = avail - towrite; for (int p = 0; p < pad; p++) write(STDOUT_FILENO, " ", 1);
     }
+}
+
+static void draw_help_page(void) {
+    // Full-screen help page with scrolling and selection
+    const char *lines[] = {
+        "\x1b[96mCommand Cheat Sheet\x1b[0m",
+        "",
+        "\x1b[96mFile & Tab Management\x1b[0m",
+        "\x1b[93mfn <file>\x1b[0m                  Name/rename current file",
+        "\x1b[93mfn add <file>\x1b[0m              Create file on disk",
+        "\x1b[93mfn del <file>\x1b[0m              Delete file",
+        "\x1b[93mopen <file>\x1b[0m                Open in current window",
+        "\x1b[93mopent <file>\x1b[0m               Open in new tab",
+        "\x1b[93mtabs\x1b[0m                       List tabs",
+        "\x1b[93mtab<N>\x1b[0m                     Switch to tab N",
+        "\x1b[93mtabc<N>\x1b[0m                    Close tab N",
+        "\x1b[93mtabc all\x1b[0m                   Close all tabs (prompts to save)",
+        "\x1b[93mmd <dir>\x1b[0m                   Make directory",
+        "\x1b[93mmd -p <dir>\x1b[0m                Make directory (recursive)",
+        "\x1b[93mcd <path>\x1b[0m                  Change directory",
+        "",
+        "\x1b[32mNote: 'N' = line number; omit N to apply the command\x1b[0m",
+        "\x1b[32mto the current line (cursor position)\x1b[0m",
+        "",
+        "\x1b[96mEditing\x1b[0m",
+        "\x1b[93ms\x1b[0m                          Save",
+        "\x1b[93mq\x1b[0m                          Quit (prompts to save)",
+        "\x1b[93mqs\x1b[0m                         Quit & Save",
+        "\x1b[93mu\x1b[0m                          Undo",
+        "\x1b[93mr\x1b[0m                          Redo",
+        "\x1b[93mcl<N>\x1b[0m                      Copy line(s) N or range",
+        "\x1b[93mp\x1b[0m                          Paste at cursor",
+        "\x1b[93mpl<N>\x1b[0m                      Paste at line N",
+        "\x1b[93mplf<N>\x1b[0m                     Paste at front of line N",
+        "\x1b[93mdall\x1b[0m                       Delete all lines",
+        "\x1b[93mdl<N>\x1b[0m                      Clear text on line N (remove if empty)",
+        "\x1b[93mdl<Range>\x1b[0m                  Clear text on range (remove empty lines)",
+        "\x1b[93mdl<N>w\x1b[0m                     Delete last N words",
+        "\x1b[93mdf<N>w\x1b[0m                     Delete first N words",
+        "",
+        "\x1b[96mNavigation\x1b[0m",
+        "\x1b[93mjl<N>\x1b[0m                      Jump to front of line N",
+        "\x1b[93mjml<N>\x1b[0m                     Jump to middle of line N",
+        "\x1b[93mjel<N>\x1b[0m                     Jump to end of line N",
+        "",
+        "\x1b[96mFile Browser\x1b[0m",
+        "\x1b[93mb\x1b[0m                          File browser",
+        "",
+        "\x1b[96mTerminal\x1b[0m",
+        "\x1b[93mot\x1b[0m                         Open Terminal",
+        "Type \"\x1b[91mexit\x1b[0m\" into the terminal to close",
+        "",
+        "\x1b[96mBuild & Run\x1b[0m",
+        "\x1b[93mB / BR\x1b[0m                     Build / Build & Run",
+        "\x1b[93mR / run <args>\x1b[0m             Run program (interactive)",
+        "\x1b[93mlog\x1b[0m                        Show output log (build/run)",
+        "",
+        "\x1b[96mHelp\x1b[0m",
+        "\x1b[93mhelp\x1b[0m                       Toggle help overlay",
+        "\x1b[93mman <topic>\x1b[0m                Open man page in output pane",
+        "",
+        ""
+    };
+    int n = sizeof(lines) / sizeof(lines[0]);
+
+    // compute content height (full screen minus some margin)
+    int content_h = E.screenrows - 4; // leave margin for title and footer
+    if (content_h > n) content_h = n;
+    // ensure help selection is valid and visible before drawing
+    if (E.help_sel < 0) E.help_sel = 0;
+    if (E.help_sel >= n) E.help_sel = (n > 0) ? n - 1 : 0;
+    // clamp scroll
+    if (E.help_scroll < 0) E.help_scroll = 0;
+    int max_scroll = n - content_h;
+    if (max_scroll < 0) max_scroll = 0;
+    if (E.help_scroll > max_scroll) E.help_scroll = max_scroll;
+    // ensure selected line is visible
+    if (E.help_sel < E.help_scroll) E.help_scroll = E.help_sel;
+    else if (E.help_sel >= E.help_scroll + content_h) E.help_scroll = E.help_sel - content_h + 1;
+
+    // compute required width based on longest line
+    int maxlen = 0; for (int i = 0; i < n; i++) { int l = (int)strlen(lines[i]); if (l > maxlen) maxlen = l; }
+    int boxw = maxlen + 4; if (boxw > E.screencols) boxw = E.screencols;
+
+    // draw title at top
+    int title_row = 1;
+    char title_buf[128]; int tn = snprintf(title_buf, sizeof(title_buf), "\x1b[%d;%dH\x1b[1;96mHelp - Use arrows to navigate, Enter/Esc to close\x1b[0m", title_row, (E.screencols - 50) / 2);
+    if (tn > 0) write(STDOUT_FILENO, title_buf, (size_t)tn);
+
+    // draw text lines
+    for (int i = 0; i < content_h; i++) {
+        int line_idx = E.help_scroll + i;
+        if (line_idx >= n) break;
+        int ln = title_row + 1 + i + 1;
+        int col = (E.screencols - boxw) / 2 + 2;
+        char buf[128]; int written = snprintf(buf, sizeof(buf), "\x1b[%d;%dH", ln, col);
+        if (written > 0) write(STDOUT_FILENO, buf, (size_t)written);
+        const char *line = lines[line_idx]; int len = (int)strlen(line);
+        int avail = boxw - 4; if (avail < 0) avail = 0;
+        int towrite = (len > avail) ? avail : len;
+        // if this line looks like a section header (ends with ':' and not empty), color it cyan
+        int is_header = (len > 0 && line[len-1] == ':');
+        int is_sel = (line_idx == E.help_sel);
+        if (is_sel) write(STDOUT_FILENO, "\x1b[7m", 4); // reverse video on selection
+        if (is_header) write(STDOUT_FILENO, "\x1b[96m", 5);
+        if (towrite > 0) write(STDOUT_FILENO, line, (size_t)towrite);
+        if (is_header) write(STDOUT_FILENO, "\x1b[0m", 4);
+        if (is_sel) write(STDOUT_FILENO, "\x1b[0m", 4);
+        // pad remainder of the line
+        int pad = avail - towrite; for (int p = 0; p < pad; p++) write(STDOUT_FILENO, " ", 1);
+    }
+
+    // draw footer
+    int footer_row = E.screenrows;
+    char footer_buf[128]; int fn = snprintf(footer_buf, sizeof(footer_buf), "\x1b[%d;1H\x1b[90mLine %d/%d - Press Enter or Esc to close\x1b[0m", footer_row, E.help_sel + 1, n);
+    if (fn > 0) write(STDOUT_FILENO, footer_buf, (size_t)fn);
 }
 
 static int visible_len(const char *s) {
@@ -6007,18 +6158,9 @@ static void editorRefreshScreen(void) {
         if (y < content_rows - 1) write(STDOUT_FILENO, "\r\n", 2);
     }
 
-    // If help overlay is visible, draw it on top and return
+    // If help is visible, draw it full-page and return
     if (E.help_visible) {
-        draw_help_overlay();
-        // draw help status at bottom
-        char buf[64];
-        int n = snprintf(buf, sizeof(buf), "\x1b[%d;1H\x1b[7m", E.screenrows);
-        if (n > 0) write(STDOUT_FILENO, buf, (size_t)n);
-        const char *status = "\x1b[7mHelp: \x1b[0m\x1b[1;32m(u)\x1b[7m scroll up, \x1b[0m\x1b[1;34m(d)\x1b[7m scroll down, \x1b[0m\x1b[1;91m(?/ESC)\x1b[7m close\x1b[m";
-        int len = (int)strlen(status);
-        write(STDOUT_FILENO, status, (size_t)len);
-        for (int i = len; i < E.screencols; i++) write(STDOUT_FILENO, " ", 1);
-        write(STDOUT_FILENO, "\x1b[m", 3);
+        draw_help_page();
         return;
     }
 
@@ -6139,6 +6281,96 @@ static void editorProcessKeypress(void) {
         return;
     }
 
+    // If help visible, handle it
+    if (E.help_visible) {
+        int c = readKey();
+        const char *lines[] = {
+            "\x1b[96mCommand Cheat Sheet\x1b[0m",
+            "",
+            "\x1b[96mFile & Tab Management\x1b[0m",
+            "\x1b[93mfn <file>\x1b[0m                  Name/rename current file",
+            "\x1b[93mfn add <file>\x1b[0m              Create file on disk",
+            "\x1b[93mfn del <file>\x1b[0m              Delete file",
+            "\x1b[93mopen <file>\x1b[0m                Open in current window",
+            "\x1b[93mopent <file>\x1b[0m               Open in new tab",
+            "\x1b[93mtabs\x1b[0m                       List tabs",
+            "\x1b[93mtab<N>\x1b[0m                     Switch to tab N",
+            "\x1b[93mtabc<N>\x1b[0m                    Close tab N",
+            "\x1b[93mtabc all\x1b[0m                   Close all tabs (prompts to save)",
+            "\x1b[93mmd <dir>\x1b[0m                   Make directory",
+            "\x1b[93mmd -p <dir>\x1b[0m                Make directory (recursive)",
+            "\x1b[93mcd <path>\x1b[0m                  Change directory",
+            "",
+            "\x1b[32mNote: 'N' = line number; omit N to apply the command\x1b[0m",
+            "\x1b[32mto the current line (cursor position)\x1b[0m",
+            "",
+            "\x1b[96mEditing\x1b[0m",
+            "\x1b[93ms\x1b[0m                          Save",
+            "\x1b[93mq\x1b[0m                          Quit (prompts to save)",
+            "\x1b[93mqs\x1b[0m                         Quit & Save",
+            "\x1b[93mu\x1b[0m                          Undo",
+            "\x1b[93mr\x1b[0m                          Redo",
+            "\x1b[93mcl<N>\x1b[0m                      Copy line(s) N or range",
+            "\x1b[93mp\x1b[0m                          Paste at cursor",
+            "\x1b[93mpl<N>\x1b[0m                      Paste at line N",
+            "\x1b[93mplf<N>\x1b[0m                     Paste at front of line N",
+            "\x1b[93mdall\x1b[0m                       Delete all lines",
+            "\x1b[93mdl<N>\x1b[0m                      Clear text on line N (remove if empty)",
+            "\x1b[93mdl<Range>\x1b[0m                  Clear text on range (remove empty lines)",
+            "\x1b[93mdl<N>w\x1b[0m                     Delete last N words",
+            "\x1b[93mdf<N>w\x1b[0m                     Delete first N words",
+            "",
+            "\x1b[96mNavigation\x1b[0m",
+            "\x1b[93mjl<N>\x1b[0m                      Jump to front of line N",
+            "\x1b[93mjml<N>\x1b[0m                     Jump to middle of line N",
+            "\x1b[93mjel<N>\x1b[0m                     Jump to end of line N",
+            "",
+            "\x1b[96mFile Browser\x1b[0m",
+            "\x1b[93mb\x1b[0m                          File browser",
+            "",
+            "\x1b[96mTerminal\x1b[0m",
+            "\x1b[93mot\x1b[0m                         Open Terminal",
+            "Type \"\x1b[91mexit\x1b[0m\" into the terminal to close",
+            "",
+            "\x1b[96mBuild & Run\x1b[0m",
+            "\x1b[93mB / BR\x1b[0m                     Build / Build & Run",
+            "\x1b[93mR / run <args>\x1b[0m             Run program (interactive)",
+            "\x1b[93mlog\x1b[0m                        Show output log (build/run)",
+            "",
+            "\x1b[96mHelp\x1b[0m",
+            "\x1b[93mhelp\x1b[0m                       Toggle help overlay",
+            "\x1b[93mman <topic>\x1b[0m                Open man page in output pane",
+            "",
+            ""
+        };
+        int n = sizeof(lines) / sizeof(lines[0]);
+        if (c == 27 || c == '?' || c == '\r' || c == '\n') { // ESC, ?, Enter
+            E.help_visible = 0;
+            if (E.help_from_welcome) {
+                E.welcome_visible = 1;
+                E.help_from_welcome = 0;
+            }
+        } else if (c == ARROW_UP) {
+            if (E.help_sel > 0) E.help_sel--;
+        } else if (c == ARROW_DOWN) {
+            if (E.help_sel < n - 1) E.help_sel++;
+        } else if (c == PAGE_UP) {
+            int pageSize = E.screenrows - 4;
+            E.help_sel -= pageSize;
+            if (E.help_sel < 0) E.help_sel = 0;
+        } else if (c == PAGE_DOWN) {
+            int pageSize = E.screenrows - 4;
+            E.help_sel += pageSize;
+            if (E.help_sel >= n) E.help_sel = n - 1;
+        }
+        // adjust scroll to keep selection visible
+        int content_h = E.screenrows - 4;
+        if (E.help_sel < E.help_scroll) E.help_scroll = E.help_sel;
+        else if (E.help_sel >= E.help_scroll + content_h) E.help_scroll = E.help_scroll + (E.help_sel - (E.help_scroll + content_h) + 1);
+        editorRefreshScreen();
+        return;
+    }
+
     // If terminal resized (SIGWINCH), refresh size and redraw immediately
     if (winch_received) { getWindowSize(); editorRefreshScreen(); winch_received = 0; return; }
 
@@ -6193,6 +6425,7 @@ static void editorProcessKeypress(void) {
                         E.welcome_visible = 0;
                         E.help_visible = 1;
                         E.help_scroll = 0;
+                        E.help_sel = 0;
                         E.help_from_welcome = 1;
                     } else if (strncmp(E.command_buf, "open ", 5) == 0) {
                         E.welcome_visible = 0;
@@ -6228,6 +6461,7 @@ static void editorProcessKeypress(void) {
                     E.welcome_visible = 0;
                     E.help_visible = 1;
                     E.help_scroll = 0;
+                    E.help_sel = 0;
                     E.help_from_welcome = 1;
                 } else if (strncmp(E.command_buf, "open ", 5) == 0) {
                     E.welcome_visible = 0;
@@ -6634,11 +6868,32 @@ static void editorProcessKeypress(void) {
         if (E.help_visible) {
             if (c == 27) {
                 E.help_visible = 0;
-            } else if (c == 'u') {
-                E.help_scroll -= (E.screenrows / 2);
-                if (E.help_scroll < 0) E.help_scroll = 0;
-            } else if (c == 'd') {
-                E.help_scroll += (E.screenrows / 2);
+                if (E.help_from_welcome) { E.welcome_visible = 1; E.help_from_welcome = 0; }
+                return;
+            }
+            int page = E.screenrows - 6; if (page < 1) page = 1;
+            if (c == ARROW_UP) {
+                if (E.help_sel > 0) E.help_sel--;
+                if (E.help_sel < E.help_scroll) E.help_scroll = E.help_sel;
+                return;
+            }
+            if (c == ARROW_DOWN) {
+                E.help_sel++;
+                if (E.help_sel >= E.help_scroll + page) E.help_scroll = E.help_sel - page + 1;
+                return;
+            }
+            if (c == PAGE_UP || c == 'u') {
+                E.help_sel -= page; if (E.help_sel < 0) E.help_sel = 0;
+                if (E.help_sel < E.help_scroll) E.help_scroll = E.help_sel;
+                return;
+            }
+            if (c == PAGE_DOWN || c == 'd') {
+                E.help_sel += page; if (E.help_sel < 0) E.help_sel = 0; // clamp in draw
+                if (E.help_sel >= E.help_scroll + page) E.help_scroll = E.help_sel - page + 1;
+                return;
+            }
+            if (c == '\r' || c == '\n') {
+                E.help_visible = 0; return;
             }
             return;
         }
@@ -6727,6 +6982,7 @@ static void initEditor(void) {
     E.command_buf[0] = '\0';
     E.help_visible = 0;
     E.help_scroll = 0;
+    E.help_sel = 0;
     E.history = NULL;
     E.history_count = 0;
     E.history_idx = -1;
