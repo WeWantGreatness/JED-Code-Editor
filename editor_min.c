@@ -185,6 +185,7 @@ struct Editor {
     EditorMode mode;    // view/edit
     char command_buf[256]; // command buffer for view mode
     int command_len;
+    char *current_highlight; // highlight pattern for current line
     int help_visible;   // help overlay flag
     int help_scroll;    // scroll offset for help overlay
     int help_sel;       // selected line index within help overlay
@@ -391,8 +392,10 @@ static void load_tab_snapshot(int idx) {
 }
 
 static void editorSeekLine(int lineno) {
-    if (lineno < 1) lineno = 1; if (lineno > E.numrows) lineno = E.numrows;
-    E.cy = lineno - 1; if (E.cy < 0) E.cy = 0; E.cx = 0; editorScroll();
+    if (lineno < 1) lineno = 1;
+    E.cy = lineno - 1;
+    E.cx = 0;
+    editorScroll();
 }
 static void save_snapshot(void);
 static int switch_to_home(void);
@@ -1089,6 +1092,16 @@ static void redo_cmd(void) {
 
 /* forward declarations for functions used by the executor */
 static int execute_command(const char *cmd);
+
+// Clear and free the current highlight (make it temporary)
+static void clear_current_highlight(void) {
+    if (E.current_highlight) {
+        free(E.current_highlight);
+        E.current_highlight = NULL;
+        snprintf(E.msg, sizeof(E.msg), "Highlight cleared");
+        E.msg_time = time(NULL);
+    }
+}
 static void editorInsertChar(int c);
 static void editorInsertNewline(void);
 static void editorScroll(void);
@@ -1572,6 +1585,8 @@ static void save_to_file(const char *fname) {
 
 static int execute_command(const char *cmd) {
     int i = 0; int L = strlen(cmd);
+    /* If the command is not a highlight command, clear any existing highlight so highlights are temporary. */
+    int k = 0; while (k < L && isspace((unsigned char)cmd[k])) k++; if (k >= L || cmd[k] != 'h') clear_current_highlight();
     // Defensive: if NumTabs > 0 but Tabs pointer is NULL, reset NumTabs to avoid dereferencing a null pointer in later loops
     if (NumTabs > 0 && !Tabs) NumTabs = 0;
     // allow quick build/run shim: "__run_shell__:<shell cmd>" will exec the shell cmd
@@ -2178,19 +2193,27 @@ static int execute_command(const char *cmd) {
                     E.cy = target; E.cx = first_non;
                 }
                 editorScroll(); snprintf(E.msg, sizeof(E.msg), "Jumped to line %d", target + 1); E.msg_time = time(NULL);
-            } else if (num >= 1 && num <= E.numrows) {
-                /* ensure strict: after number must be end or space */
-                if (i == starti || cmd[i] == '\0' || cmd[i] == ' ') {
+            } else if (num >= 1) {
+                /* allow jumping to visible blank lines beyond EOF */
+                int content_rows = E.screenrows - 1; if (conf.show_tab_bar) content_rows -= 1; if (content_rows < 1) content_rows = 1;
+                int max_line = (E.numrows > content_rows) ? E.numrows : content_rows;
+                if (num <= max_line) {
+                    /* ensure strict: after number must be end or space */
+                    if (i == starti || cmd[i] == '\0' || cmd[i] == ' ') {
                         E.cy = num - 1;
-                        // move to first non-whitespace on the target line (front of statement)
-                        {
+                        if (E.cy < E.numrows) {
+                            /* move to first non-whitespace on the target line (front of statement) */
                             char *trow = E.rows[E.cy];
                             int first_non = 0; while (trow[first_non] && (trow[first_non] == ' ' || trow[first_non] == '\t')) first_non++;
                             int rowlen = (int)strlen(trow);
                             if (first_non > rowlen) first_non = rowlen;
                             E.cx = first_non;
+                        } else {
+                            /* visual blank line beyond EOF */
+                            E.cx = 0;
                         }
                         editorScroll(); snprintf(E.msg, sizeof(E.msg), "Jumped to line %d", num); E.msg_time = time(NULL);
+                    }
                 }
             }
             continue;
@@ -2565,6 +2588,31 @@ static int execute_command(const char *cmd) {
         if (cmd[i] == 'p') {
             char next = (i + 1 < L) ? cmd[i+1] : '\0';
             if (next == '\0' || next == ' ') { paste_at_cursor(); i++; continue; } else { i++; continue; }
+        }
+        if (cmd[i] == 'h') {
+            /* Accept both forms: 'hPAT' (no space) and 'h PAT' */
+            int start = i + 1;
+            if (start < L && cmd[start] == ' ') {
+                while (start < L && cmd[start] == ' ') start++;
+            }
+            /* If there's no pattern after h, clear highlight */
+            if (start >= L) {
+                free(E.current_highlight);
+                E.current_highlight = NULL;
+                snprintf(E.msg, sizeof(E.msg), "Highlight cleared");
+                E.msg_time = time(NULL);
+                i = L; continue;
+            }
+            /* collect pattern: everything from 'start' to end or up to next space */
+            char pat[512]; int pidx = 0; int j = start;
+            while (j < L && pidx < (int)sizeof(pat)-1 && cmd[j] != ' ') { pat[pidx++] = cmd[j++]; }
+            pat[pidx] = '\0';
+            free(E.current_highlight);
+            E.current_highlight = strdup(pat);
+            snprintf(E.msg, sizeof(E.msg), "Highlight set to '%s'", pat);
+            E.msg_time = time(NULL);
+            /* advance i past the processed chunk */
+            i = j; continue;
         }
         if (cmd[i] == 'q') {
             char next = (i + 1 < L) ? cmd[i+1] : '\0';
@@ -3580,8 +3628,11 @@ static void open_file_and_seek(const char *fname, int lineno) {
     free(E.filename); E.filename = strdup(fname);
     save_snapshot(); free(E.saved_snapshot); E.saved_snapshot = serialize_buffer();
     set_language_from_filename(fname);
-    /* set cursor to line */
-    if (lineno < 1) lineno = 1; if (lineno > E.numrows) lineno = E.numrows;
+    /* set cursor to line (allow visual blank lines past EOF) */
+    if (lineno < 1) lineno = 1;
+    int content_rows = E.screenrows - 1; if (conf.show_tab_bar) content_rows -= 1; if (content_rows < 1) content_rows = 1;
+    int max_line = (E.numrows > content_rows) ? E.numrows : content_rows;
+    if (lineno > max_line) lineno = max_line;
     E.cy = lineno - 1; if (E.cy < 0) E.cy = 0; E.cx = 0; editorScroll();
     snprintf(E.msg, sizeof(E.msg), "Opened %s", fname); E.msg_time = time(NULL); E.welcome_visible = 0;
 }
@@ -5980,7 +6031,7 @@ static void editorRefreshScreen(void) {
     int total_lines = (E.numrows > content_rows) ? E.numrows : content_rows;
     int ln_width = snprintf(NULL, 0, "%d", total_lines);
     if (ln_width < 1) ln_width = 1;
-    int prefix_len = ln_width + 3; // "%*d | " -> number + space + '|' + space
+    int prefix_len = ln_width + 2; // "%*d) " -> number + ')' + space
 
     // make sure row_offset is valid
     if (E.row_offset < 0) E.row_offset = 0;
@@ -5990,8 +6041,16 @@ static void editorRefreshScreen(void) {
         int filerow = y + E.row_offset;
         char linebuf[64];
         if (filerow < E.numrows) {
-            // print line number prefix for existing rows
-            int n = snprintf(linebuf, sizeof(linebuf), "%*d | ", ln_width, filerow + 1);
+            // print compact colored line-number prefix (compact "NN) ")
+            int is_current = (filerow == E.cy);
+            int n = 0;
+            if (is_current) {
+                /* bold cyan for current line number */
+                n = snprintf(linebuf, sizeof(linebuf), "\x1b[1m\x1b[96m%*d)\x1b[0m ", ln_width, filerow + 1);
+            } else {
+                /* dim gray for other line numbers */
+                n = snprintf(linebuf, sizeof(linebuf), "\x1b[90m%*d)\x1b[0m ", ln_width, filerow + 1);
+            }
             if (n > 0) write(STDOUT_FILENO, linebuf, (size_t)n);
 
             int avail = E.screencols - prefix_len;
@@ -6017,19 +6076,109 @@ static void editorRefreshScreen(void) {
                     else { memcpy(render_ptr, E.rows[filerow] + start, len); render_ptr[len] = '\0'; }
                 }
                 if (render_ptr) {
-                    /* colorize_line is safe to call even if no language is set; it will emit plain text */
+                    /* Always emit syntax-colored output for the visible slice so
+                     * foreground colors are preserved. Overlays will then write a
+                     * background-wrapped, colorized substring on top of this output. */
                     colorize_line(render_ptr);
-                    /* ensure buffered stdio is flushed so mixed use of write() and
-                     * stdio doesn't hide output when using raw terminal writes */
                     fflush(stdout);
                 }
                 if (len >= (int)sizeof(tmpbuf) && render_ptr && render_ptr != E.rows[filerow] + start) free(render_ptr);
+                /* Apply highlight if on current line */
+                if (filerow == E.cy && E.current_highlight && *E.current_highlight) {
+                    const char *line = E.rows[filerow];
+                    const char *pat = E.current_highlight;
+                    size_t pat_len = strlen(pat);
+                    size_t line_len = strlen(line);
+                    int screen_row = (conf.show_tab_bar ? 3 : 2) + y;
+
+                    if (pat_len == 2) {
+                        char a = pat[0]; char b = pat[1];
+                        /* treat as a range: highlight from 'a' to next 'b' (inclusive), multiple matches allowed */
+                        const char *p = line;
+                        while ((p = strchr(p, a)) != NULL) {
+                            const char *q = strchr(p + 1, b);
+                            if (!q) break;
+                            size_t match_start = p - line;
+                            size_t match_len = (q - p) + 1;
+                            size_t visible_match_start = (match_start < (size_t)start) ? (size_t)start : match_start;
+                            size_t visible_match_end = (match_start + match_len > (size_t)(start + len)) ? (size_t)(start + len) : (match_start + match_len);
+                            if (visible_match_start < visible_match_end) {
+                                size_t vis_offset_in_match = visible_match_start - match_start;
+                                size_t vis_len = visible_match_end - visible_match_start;
+                                int col = prefix_len + 1 + (int)(visible_match_start - (size_t)start);
+                                char buf[64]; int n = snprintf(buf, sizeof(buf), "\x1b[%d;%dH", screen_row, col);
+                                write(STDOUT_FILENO, buf, n);
+                                char *seg = colorize_segment(line, match_start + vis_offset_in_match, vis_len);
+                                if (seg) {
+                                    write(STDOUT_FILENO, "\x1b[43m", 5);
+                                    write(STDOUT_FILENO, seg, strlen(seg));
+                                    write(STDOUT_FILENO, "\x1b[49m", 5);
+                                    free(seg);
+                                }
+                            }
+                            p = q + 1;
+                        }
+                    } else if (pat_len >= 3) {
+                        /* literal substring behavior (unchanged for longer patterns) */
+                        const char *pos = line;
+                        while ((pos = strstr(pos, pat)) != NULL) {
+                            size_t match_start = pos - line;
+                            size_t match_len = pat_len;
+                            size_t visible_match_start = (match_start < (size_t)start) ? (size_t)start : match_start;
+                            size_t visible_match_end = (match_start + match_len > (size_t)(start + len)) ? (size_t)(start + len) : (match_start + match_len);
+                            if (visible_match_start < visible_match_end) {
+                                size_t vis_offset_in_match = visible_match_start - match_start;
+                                size_t vis_len = visible_match_end - visible_match_start;
+                                int col = prefix_len + 1 + (int)(visible_match_start - (size_t)start);
+                                char buf[64]; int n = snprintf(buf, sizeof(buf), "\x1b[%d;%dH", screen_row, col);
+                                write(STDOUT_FILENO, buf, n);
+                                char *seg = colorize_segment(line, match_start + vis_offset_in_match, vis_len);
+                                if (seg) {
+                                    write(STDOUT_FILENO, "\x1b[43m", 5);
+                                    write(STDOUT_FILENO, seg, strlen(seg));
+                                    write(STDOUT_FILENO, "\x1b[49m", 5);
+                                    free(seg);
+                                }
+                            }
+                            pos += pat_len;
+                            if (pos >= line + line_len) break;
+                        }
+                    } else if (pat_len == 1) {
+                        /* single-char highlight: highlight occurrences of that char */
+                        char a = pat[0]; const char *p = line;
+                        while ((p = strchr(p, a)) != NULL) {
+                            size_t match_start = p - line;
+                            if (match_start >= (size_t)start && match_start < (size_t)(start + len)) {
+                                int col = prefix_len + 1 + (int)(match_start - (size_t)start);
+                                char buf[64]; int n = snprintf(buf, sizeof(buf), "\x1b[%d;%dH", screen_row, col);
+                                write(STDOUT_FILENO, buf, n);
+                                char *seg = colorize_segment(line, match_start, 1);
+                                if (seg) {
+                                    write(STDOUT_FILENO, "\x1b[43m", 5);
+                                    write(STDOUT_FILENO, seg, strlen(seg));
+                                    write(STDOUT_FILENO, "\x1b[49m", 5);
+                                    free(seg);
+                                }
+                            }
+                            p++;
+                        }
+                    }
+                    /* Do NOT reposition cursor here; final cursor placement happens after drawing. */
+                }
+                if (filerow == E.cy && E.current_highlight && *E.current_highlight) {
+                    // move cursor to end of line to prevent \x1b[K from clearing the rest after overlay
+                    int screen_row = (conf.show_tab_bar ? 3 : 2) + y;
+                    int end_col = prefix_len + 1 + len;
+                    // ensure attributes are reset before repositioning the cursor
+                    write(STDOUT_FILENO, "\x1b[0m", 4);
+                    char buf[64]; int n = snprintf(buf, sizeof(buf), "\x1b[%d;%dH", screen_row, end_col);
+                    if (n > 0) write(STDOUT_FILENO, buf, n);
+                }
             }
         } else {
-            // print blank gutter for non-existing rows, then a ~ marker
-            int n = snprintf(linebuf, sizeof(linebuf), "%*s | ", ln_width, "");
+            // print line number for blank rows
+            int n = snprintf(linebuf, sizeof(linebuf), "\x1b[90m%*d)\x1b[0m ", ln_width, filerow + 1);
             if (n > 0) write(STDOUT_FILENO, linebuf, (size_t)n);
-            write(STDOUT_FILENO, "~", 1);
         }
 
         write(STDOUT_FILENO, "\x1b[K", 3); // clear to end of line
@@ -6569,6 +6718,7 @@ static void editorProcessKeypress(void) {
                 E.cx = 0;
             }
         }
+        clear_current_highlight();
         E.last_edit_kind = EDIT_KIND_NONE;
         editorScroll();
         return;
@@ -6586,6 +6736,7 @@ static void editorProcessKeypress(void) {
                 E.cx = 0;
             }
         }
+        clear_current_highlight();
         E.last_edit_kind = EDIT_KIND_NONE;
         editorScroll();
         return;
@@ -6598,6 +6749,7 @@ static void editorProcessKeypress(void) {
             E.cx = strlen(E.rows[E.cy]);
             E.last_edit_kind = EDIT_KIND_NONE;
         }
+        clear_current_highlight();
         editorScroll();
         return;
     }
@@ -6611,6 +6763,7 @@ static void editorProcessKeypress(void) {
             E.cx = 0;
             E.last_edit_kind = EDIT_KIND_NONE;
         }
+        clear_current_highlight();
         editorScroll();
         return;
     }
@@ -6858,6 +7011,7 @@ static void initEditor(void) {
     E.mode = MODE_VIEW;
     E.command_len = 0;
     E.command_buf[0] = '\0';
+    E.current_highlight = NULL;
     E.help_visible = 0;
     E.help_scroll = 0;
     E.help_sel = 0;
@@ -6942,6 +7096,8 @@ int main(int argc, char **argv) {
                 free(buf);
                 free(E.filename);
                 E.filename = strdup(fn);
+                /* ensure cursor starts at the beginning after opening a file */
+                E.cy = 0; E.cx = 0; E.row_offset = 0; E.col_offset = 0; editorScroll();
                     /* detect language from filename extension and set highlighting */
                     const char *lang2 = NULL;
                     const char *ext2 = strrchr(fn, '.');

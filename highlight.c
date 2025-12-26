@@ -59,6 +59,8 @@ int set_language(const char *lang) {
 #define C_COMMENT "\x1b[90m"       /* bright black / gray */
 #define C_PREPROC "\x1b[94m"       /* bright blue */
 #define C_FUNCTION "\x1b[91m"      /* bright red */
+/* Reset foreground only (keep background intact) */
+#define C_FG_RESET "\x1b[39m"
 /* Include-specific colors */
 #define C_INCLUDE_STD "\x1b[94m"   /* bright blue */
 #define C_INCLUDE_THIRD "\x1b[95m" /* magenta */
@@ -395,4 +397,94 @@ void colorize_line_state(const char *line, struct HLState *state) {
             fwrite(line + pos, 1, llen2 - pos, stdout);
         }
     }
+}
+
+/* Produce a malloc'd string containing the ANSI-colored rendering of the
+ * substring [seg_start, seg_start+seg_len) from `line`. This mirrors the
+ * behavior of `colorize_line` but writes into a buffer instead of stdout.
+ * The returned buffer must be freed by the caller; NULL indicates OOM. */
+char *colorize_segment(const char *line, size_t seg_start, size_t seg_len) {
+    struct HLToken tokens[256];
+    int n = highlight_line(line, tokens, 256);
+    size_t seg_end = seg_start + seg_len;
+    size_t pos = seg_start;
+    size_t cap = seg_len * 6 + 128;
+    char *out = malloc(cap);
+    if (!out) return NULL;
+    size_t used = 0;
+
+    for (int i = 0; i < n; i++) {
+        size_t tstart = tokens[i].start;
+        size_t tend = tokens[i].start + tokens[i].len;
+        if (tend <= seg_start || tstart >= seg_end) continue;
+        /* append gap before token (unstyled text) */
+        if (tstart > pos) {
+            size_t gstart = pos;
+            size_t gend = (tstart < seg_end) ? tstart : seg_end;
+            size_t glen = gend - gstart;
+            if (used + glen + 1 > cap) {
+                cap = (cap * 2) + glen + 128;
+                char *tmp = realloc(out, cap);
+                if (!tmp) { free(out); return NULL; }
+                out = tmp;
+            }
+            memcpy(out + used, line + gstart, glen);
+            used += glen;
+        }
+        /* overlapping portion of token */
+        size_t ov_start = (tstart < seg_start) ? seg_start : tstart;
+        size_t ov_end = (tend > seg_end) ? seg_end : tend;
+        const char *col = C_RESET;
+        switch (tokens[i].type) {
+            case HL_KEYWORD: col = C_KEYWORD; break;
+            case HL_TYPE: col = C_TYPE; break;
+            case HL_STORAGE_CLASS: col = C_STORAGE; break;
+            case HL_CONSTANT: col = C_CONST; break;
+            case HL_NUMBER: col = C_NUMBER; break;
+            case HL_STRING: col = C_STRING; break;
+            case HL_COMMENT: col = C_COMMENT; break;
+            case HL_INCLUDE_SYSTEM: col = C_INCLUDE_STD; break;
+            case HL_INCLUDE_THIRD_PARTY: col = C_INCLUDE_THIRD; break;
+            case HL_INCLUDE_LOCAL: col = C_INCLUDE_LOCAL; break;
+            case HL_PREPROC: col = C_PREPROC; break;
+            case HL_FUNCTION: col = C_FUNCTION; break;
+            case HL_SYMBOL: col = C_SYMBOL; break;
+            case HL_ESCAPE: col = C_ESCAPE; break;
+            case HL_FORMAT: col = C_FORMAT; break;
+            default: col = C_RESET; break;
+        }
+        size_t piece_len = ov_end - ov_start;
+        size_t need = strlen(col) + piece_len + strlen(C_RESET) + 8;
+        if (used + need > cap) {
+            cap = (cap * 2) + need + 128;
+            char *tmp = realloc(out, cap);
+            if (!tmp) { free(out); return NULL; }
+            out = tmp;
+        }
+        memcpy(out + used, col, strlen(col)); used += strlen(col);
+        memcpy(out + used, line + ov_start, piece_len); used += piece_len;
+        memcpy(out + used, C_FG_RESET, strlen(C_FG_RESET)); used += strlen(C_FG_RESET);
+        pos = ov_end;
+    }
+    /* trailing gap */
+    if (pos < seg_end) {
+        size_t gstart = pos;
+        size_t glen = seg_end - gstart;
+        if (used + glen + 1 > cap) {
+            cap = (cap * 2) + glen + 128;
+            char *tmp = realloc(out, cap);
+            if (!tmp) { free(out); return NULL; }
+            out = tmp;
+        }
+        memcpy(out + used, line + gstart, glen);
+        used += glen;
+    }
+    /* null terminate */
+    if (used + 1 > cap) {
+        char *tmp = realloc(out, used + 1);
+        if (!tmp) { free(out); return NULL; }
+        out = tmp;
+    }
+    out[used] = '\0';
+    return out;
 }

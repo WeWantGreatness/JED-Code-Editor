@@ -50,7 +50,11 @@ int highlight_line_state(const char *line, struct HLToken *tokens, int max_token
 
 /* Utility to write a colorized version of a line to stdout */
 void colorize_line(const char *line);
-void colorize_line_state(const char *line, struct HLState *state);
+
+/* Return a malloc'd string containing the ANSI-colored rendering of the
+ * substring [seg_start, seg_start+seg_len) taken from `line`. The caller
+ * is responsible for freeing the returned buffer. Returns NULL on OOM. */
+char *colorize_segment(const char *line, size_t seg_start, size_t seg_len);
 
 /* Set current language for highlighting ("c", "python", "javascript", ...). Returns 0 on success. */
 int set_language(const char *lang);
